@@ -16,7 +16,11 @@
   -->
 
 <resources>
-    <style name="Theme.SettingsBase.Expressive">
+    <style name="Theme.SettingsBase.Expressive" parent="Theme.SettingsBase">
+        <!-- Material AppBarLayout ThemeEnforcement requires AppCompat colorPrimary. -->
+        <item name="colorPrimary">@color/settingslib_materialColorPrimary</item>
+        <item name="colorAccent">@color/settingslib_materialColorPrimary</item>
+
         <!-- Set up background color -->
         <item name="android:colorBackground">@color/settingslib_materialColorSurfaceContainer</item>
 
