@@ -25,7 +25,9 @@
         android:fitsSystemWindows="true"
         android:outlineAmbientShadowColor="@android:color/transparent"
         android:outlineSpotShadowColor="@android:color/transparent"
-        android:background="@android:color/transparent"
+        android:stateListAnimator="@null"
+        android:elevation="8dp"
+        android:background="@color/settingslib_materialColorSurfaceContainer"
         android:touchscreenBlocksFocus="false"
         app:expanded="false"
         android:theme="@style/SettingsLibTheme.CollapsingToolbar.Expressive">
@@ -61,6 +63,9 @@
         android:id="@+id/content_frame"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:elevation="0dp"
+        android:clipChildren="true"
+        android:clipToPadding="true"
         app:layout_behavior="@string/appbar_scrolling_view_behavior"/>
 
     <include layout="@layout/settingslib_expressive_floating_toolbar_layout"/>
