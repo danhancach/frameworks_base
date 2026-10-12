@@ -186,6 +186,9 @@ public class NavigationBarControllerImpl implements
                 + " mTaskbarDelegate initialized=" + mTaskbarDelegate.isInitialized()
                 + " willApplyConfigToNavbars=" + willApplyConfig
                 + " navBarCount=" + mNavigationBars.size());
+        if (mNavigationBars.size() == 0 && !supportsTaskbar()) {
+            updateNavbarForTaskbar();
+        }
         // If we folded/unfolded while in 3 button, show navbar in folded state, hide in unfolded
         if (largeScreenChanged && updateNavbarForTaskbar()) {
             return;
@@ -231,6 +234,12 @@ public class NavigationBarControllerImpl implements
      */
     @Override
     public boolean canCreateNavBarOrTaskBar(int displayId) {
+        // Default display always gets a navbar on handhelds. With display-content-mode-management
+        // + sys-decors-via-WM, IWindowManager.hasNavigationBar(0) can stay false and the
+        // decorations callback never fires, so SystemUI never creates NavigationBar.
+        if (displayId == Display.DEFAULT_DISPLAY) {
+            return true;
+        }
         if (mHasNavBarOrTaskbar.indexOfKey(displayId) > -1) {
             return mHasNavBarOrTaskbar.get(displayId);
         }
@@ -247,6 +256,12 @@ public class NavigationBarControllerImpl implements
 
         try {
             boolean hasNavigationBarOrTaskbar = wms.hasNavigationBar(displayId);
+            if (!hasNavigationBarOrTaskbar && displayId == Display.DEFAULT_DISPLAY
+                    && com.android.internal.util.evolution.Utils.hasNavbarByDefault(
+                            mContext)) {
+                Log.w(TAG, "WMS reports no navigation bar; using device config fallback");
+                hasNavigationBarOrTaskbar = true;
+            }
             mHasNavBarOrTaskbar.put(displayId, hasNavigationBarOrTaskbar);
             return hasNavigationBarOrTaskbar;
         } catch (RemoteException e) {
@@ -289,10 +304,10 @@ public class NavigationBarControllerImpl implements
 
     @VisibleForTesting
     boolean supportsTaskbar() {
-        // Enable for tablets, unfolded state on a foldable device, (non handheld AND flag is set),
-        // or handheld when enableTaskbarOnPhones() returns true.
-        boolean foldedOrPhone = !mIsPhone || enableTaskbarOnPhones();
-        return mIsLargeScreen || foldedOrPhone;
+        // Large screens always use Taskbar. On phones, when enable_taskbar_on_phones is set
+        // (READ_ONLY=true on Evolution cnb + Pixel Launcher), Launcher owns TYPE_NAVIGATION_BAR
+        // as Taskbar — SystemUI must not also create NavigationBar (BadTokenException crash loop).
+        return mIsLargeScreen || enableTaskbarOnPhones();
     }
 
     // TODO: b/408503553 - Remove system decor callbacks once the flag is cleaned up.
