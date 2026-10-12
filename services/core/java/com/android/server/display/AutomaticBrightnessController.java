@@ -752,6 +752,14 @@ public class AutomaticBrightnessController {
                 registerForegroundAppUpdater();
                 mSensorManager.registerListener(mLightSensorListener, mLightSensor,
                         mCurrentLightSensorRate * 1000, mHandler);
+                // On-change ALS sensors may not report until lux changes after screen on.
+                // Seed the ring buffer from the last reading so auto-brightness is not stuck
+                // with an empty buffer after display power-off.
+                if (mLastObservedLuxTime > 0) {
+                    final long now = mClock.getSensorEventScaleTime();
+                    applyLightSensorMeasurement(now, mLastObservedLux);
+                    updateAmbientLux(now);
+                }
                 return true;
             }
         } else if (mLightSensorEnabled) {
