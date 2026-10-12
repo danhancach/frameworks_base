@@ -56,6 +56,7 @@ public abstract class AcquisitionClient<T> extends HalClientMonitor<T> implement
     protected final boolean mShouldVibrate;
     private boolean mShouldSendErrorToClient = true;
     private boolean mAlreadyCancelled;
+    private boolean mClientFinishRequested;
 
     public AcquisitionClient(@NonNull Context context, @NonNull Supplier<T> lazyDaemon,
             @NonNull IBinder token, @NonNull ClientMonitorCallbackConverter listener, int userId,
@@ -122,6 +123,11 @@ public abstract class AcquisitionClient<T> extends HalClientMonitor<T> implement
         }
 
         if (finish) {
+            if (mClientFinishRequested) {
+                Slog.w(TAG, "Ignoring duplicate finish for error " + errorCode);
+                return;
+            }
+            mClientFinishRequested = true;
             if (mCallback == null) {
                 Slog.e(TAG, "Callback is null, perhaps the client hasn't been started yet?");
             } else {
