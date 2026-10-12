@@ -70,6 +70,10 @@ public abstract class BrightnessMappingStrategy {
     private static final float LUX_GRAD_SMOOTHING = 0.25f;
     private static final float MAX_GRAD = 1.0f;
     private static final float SHORT_TERM_MODEL_THRESHOLD_RATIO = 0.6f;
+    // Relative lux thresholds break when the anchor is 0 (dark room): the valid range
+    // collapses to a single point. Use an absolute tolerance instead.
+    private static final float SHORT_TERM_MODEL_NEAR_ZERO_ANCHOR_LUX = 1.0f;
+    private static final float SHORT_TERM_MODEL_NEAR_ZERO_TOLERANCE_LUX = 30.0f;
 
     // Constant that ensures that each step of the curve can increase by up to at least
     // MIN_PERMISSABLE_INCREASE. Otherwise when the brightness is set to 0, the curve will never
@@ -416,6 +420,14 @@ public abstract class BrightnessMappingStrategy {
      * brightness change was made at and the current ambient lux.
      */
     public boolean shouldResetShortTermModel(float ambientLux, float shortTermModelAnchor) {
+        if (shortTermModelAnchor <= SHORT_TERM_MODEL_NEAR_ZERO_ANCHOR_LUX) {
+            final boolean reset = ambientLux > SHORT_TERM_MODEL_NEAR_ZERO_TOLERANCE_LUX;
+            if (mLoggingEnabled) {
+                Slog.d(TAG, "ShortTermModel: near-zero anchor=" + shortTermModelAnchor
+                        + ", ambient lux=" + ambientLux + ", reset=" + reset);
+            }
+            return reset;
+        }
         BrightnessConfiguration config = getBrightnessConfiguration();
         float minThresholdRatio = SHORT_TERM_MODEL_THRESHOLD_RATIO;
         float maxThresholdRatio = SHORT_TERM_MODEL_THRESHOLD_RATIO;
