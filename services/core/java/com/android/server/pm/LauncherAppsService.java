@@ -214,6 +214,12 @@ public class LauncherAppsService extends SystemService {
         public abstract boolean startShortcut(int callerUid, int callerPid, String callingPackage,
                 String packageName, String featureId, String shortcutId, Rect sourceBounds,
                 Bundle startActivityOptions, int targetUserId);
+
+        /**
+         * Bao launcher cap nhat danh sach app (vd. AxSandbox an/hien khoi launcher).
+         * Goi onPackageChanged cho moi listener.
+         */
+        public abstract void notifyPackageChanged(String packageName, int userId);
     }
 
     @VisibleForTesting
@@ -712,6 +718,10 @@ public class LauncherAppsService extends SystemService {
                     if (result.size() > 0) {
                         return launcherActivities;
                     }
+                    // AxSandbox: khong inject synthetic icon cho app da an khoi launcher.
+                    if (isAxSandboxHiddenFromLauncher(packageName, user.getIdentifier())) {
+                        return launcherActivities;
+                    }
                     final ApplicationInfo appInfo = mPackageManagerInternal.getApplicationInfo(
                             packageName, getAppLockInfoFlag(callingPid, callingUid), callingUid,
                             user.getIdentifier());
@@ -734,6 +744,11 @@ public class LauncherAppsService extends SystemService {
                                 callingUid);
                 for (ApplicationInfo applicationInfo : installedPackages) {
                     if (!visiblePackages.contains(applicationInfo.packageName)) {
+                        // AxSandbox: bo qua synthetic — neu khong, game da an se hien lai.
+                        if (isAxSandboxHiddenFromLauncher(applicationInfo.packageName,
+                                user.getIdentifier())) {
+                            continue;
+                        }
                         if (!shouldShowSyntheticActivity(user, applicationInfo)) {
                             continue;
                         }
@@ -766,6 +781,20 @@ public class LauncherAppsService extends SystemService {
             List<LauncherActivityInfoInternal> result = launcherActivities.getList();
             result.addAll(archivedActivities);
             return new ParceledListSlice(result);
+        }
+
+        /** true neu AxSandbox an app khoi launcher (full hide hoac launcher-only). */
+        private boolean isAxSandboxHiddenFromLauncher(String packageName, int userId) {
+            if (packageName == null) return false;
+            try {
+                final AxSandboxService sandbox = AxSandboxService.get();
+                if (sandbox == null) return false;
+                return sandbox.isPackageHidden(packageName, userId)
+                        || sandbox.isPackageHiddenFromLauncher(packageName, userId);
+            } catch (Exception e) {
+                Slog.w(TAG, "AxSandbox hide check failed for " + packageName, e);
+                return false;
+            }
         }
 
         private boolean shouldShowSyntheticActivity(UserHandle user, ApplicationInfo appInfo) {
@@ -3012,6 +3041,35 @@ public class LauncherAppsService extends SystemService {
                         null /* callingActivityToken */, callerUid, callerPid,
                         UserHandle.getUserId(callerUid), callingPackage, packageName, featureId,
                         shortcutId, sourceBounds, startActivityOptions, targetUserId);
+            }
+
+            @Override
+            public void notifyPackageChanged(String packageName, int userId) {
+                LauncherAppsImpl.this.notifyPackageChangedToListeners(packageName, userId);
+            }
+        }
+
+        /** Goi IOnAppsChangedListener.onPackageChanged — dung cho AxSandbox an/hien icon. */
+        void notifyPackageChangedToListeners(String packageName, int userId) {
+            if (packageName == null) return;
+            final UserHandle user = UserHandle.of(userId);
+            final int n = mListeners.beginBroadcast();
+            try {
+                for (int i = 0; i < n; i++) {
+                    final IOnAppsChangedListener listener = mListeners.getBroadcastItem(i);
+                    final BroadcastCookie cookie =
+                            (BroadcastCookie) mListeners.getBroadcastCookie(i);
+                    if (!isEnabledProfileOf(cookie, user, "onPackageChanged")) {
+                        continue;
+                    }
+                    try {
+                        listener.onPackageChanged(user, packageName);
+                    } catch (RemoteException re) {
+                        Slog.d(TAG, "notifyPackageChangedToListeners failed", re);
+                    }
+                }
+            } finally {
+                mListeners.finishBroadcast();
             }
         }
 
