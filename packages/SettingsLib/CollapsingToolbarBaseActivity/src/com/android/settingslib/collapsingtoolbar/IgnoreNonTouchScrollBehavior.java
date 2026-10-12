@@ -26,6 +26,10 @@ import androidx.core.view.ViewCompat;
 
 import com.google.android.material.appbar.AppBarLayout;
 
+/**
+ * AppBar behavior: ignore non-touch nested pre-scroll (keyboard flicker + fling
+ * mid-list expand), but still expand when fling reaches the top (dyUnconsumed &lt; 0).
+ */
 public class IgnoreNonTouchScrollBehavior extends AppBarLayout.Behavior {
 
     public IgnoreNonTouchScrollBehavior() {
@@ -44,11 +48,26 @@ public class IgnoreNonTouchScrollBehavior extends AppBarLayout.Behavior {
             @NonNull View target,
             int nestedScrollAxes,
             int type) {
-        if (type == ViewCompat.TYPE_TOUCH) {
-            return super.onStartNestedScroll(
-                    parent, child, directTargetChild, target, nestedScrollAxes, type);
+        // Can ca NON_TOUCH de nhan onNestedScroll khi fling cham dinh list
+        return super.onStartNestedScroll(
+                parent, child, directTargetChild, target, nestedScrollAxes, type);
+    }
+
+    @Override
+    public void onNestedPreScroll(
+            @NonNull CoordinatorLayout coordinatorLayout,
+            @NonNull AppBarLayout child,
+            @NonNull View target,
+            int dx,
+            int dy,
+            @NonNull int[] consumed,
+            int type) {
+        // Chi TOUCH: tranh fling giua list expand AppBar som (de len tieu de)
+        // va tranh collapse tu scroll ban phim / focus
+        if (type != ViewCompat.TYPE_TOUCH) {
+            return;
         }
-        return false;
+        super.onNestedPreScroll(coordinatorLayout, child, target, dx, dy, consumed, type);
     }
 
     @Override
@@ -62,7 +81,8 @@ public class IgnoreNonTouchScrollBehavior extends AppBarLayout.Behavior {
             int dyUnconsumed,
             int type,
             @NonNull int[] consumed) {
-        if (type == ViewCompat.TYPE_TOUCH) {
+        // Expand khi con dy chua tieu thu huong len (list da o top), ca fling
+        if (type == ViewCompat.TYPE_TOUCH || dyUnconsumed < 0) {
             super.onNestedScroll(
                     coordinatorLayout,
                     child,
