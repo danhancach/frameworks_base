@@ -10515,6 +10515,11 @@ public class AudioService extends IAudioService.Stub
                         mIsMuted = isMuted;
                     }
                 }
+                // Seed SPEAKER_SAFE tu SPEAKER cho volume group
+                final int speakerIndex = mIndexMap.get(AudioSystem.DEVICE_OUT_SPEAKER, -1);
+                if (speakerIndex >= 0) {
+                    mIndexMap.put(AudioSystem.DEVICE_OUT_SPEAKER_SAFE, speakerIndex);
+                }
             }
         }
 
@@ -11044,7 +11049,18 @@ public class AudioService extends IAudioService.Stub
                         mIsMuted = isMuted;
                     }
                 }
+                // Seed SPEAKER_SAFE tu SPEAKER (tranh SAFE mac dinh max khi UI chi ghi SPEAKER)
+                seedSpeakerSafeVolumeFromSpeaker_syncVSS();
             }
+        }
+
+        @GuardedBy("mVolumeStateLock")
+        private void seedSpeakerSafeVolumeFromSpeaker_syncVSS() {
+            final int speakerIndex = mIndexMap.get(AudioSystem.DEVICE_OUT_SPEAKER, -1);
+            if (speakerIndex < 0) {
+                return;
+            }
+            mIndexMap.put(AudioSystem.DEVICE_OUT_SPEAKER_SAFE, speakerIndex);
         }
 
         /**
@@ -11210,6 +11226,14 @@ public class AudioService extends IAudioService.Stub
                             mIndexMap.put(AudioSystem.DEVICE_OUT_BLE_HEADSET, index);
                         }
 
+                        // Dong bo SPEAKER <-> SPEAKER_SAFE: UI forVolume alias sang SPEAKER
+                        // nhung playback sonification dung index SAFE rieng (mac dinh max).
+                        if (device == AudioSystem.DEVICE_OUT_SPEAKER) {
+                            mIndexMap.put(AudioSystem.DEVICE_OUT_SPEAKER_SAFE, index);
+                        } else if (device == AudioSystem.DEVICE_OUT_SPEAKER_SAFE) {
+                            mIndexMap.put(AudioSystem.DEVICE_OUT_SPEAKER, index);
+                        }
+
                         if (mStreamType == AudioSystem.STREAM_ASSISTANT && sStreamVolumeAlias.get(
                                 mStreamType) == mStreamType) {
                             // Mirror STREAM_ASSISTANT on A2DP and SCO
@@ -11230,6 +11254,13 @@ public class AudioService extends IAudioService.Stub
 
                         // If associated to volume group, update group cache
                         updateVolumeGroupIndex(device, /* forceMuteState= */ false);
+                        if (device == AudioSystem.DEVICE_OUT_SPEAKER) {
+                            updateVolumeGroupIndex(AudioSystem.DEVICE_OUT_SPEAKER_SAFE,
+                                    /* forceMuteState= */ false);
+                        } else if (device == AudioSystem.DEVICE_OUT_SPEAKER_SAFE) {
+                            updateVolumeGroupIndex(AudioSystem.DEVICE_OUT_SPEAKER,
+                                    /* forceMuteState= */ false);
+                        }
 
                         oldIndex = (oldIndex + 5) / 10;
                         index = (index + 5) / 10;
@@ -11753,6 +11784,11 @@ public class AudioService extends IAudioService.Stub
                     streamState, /*delay=*/0);
             // Apply volume
             streamState.applyDeviceVolume_syncVSS(device);
+            // Ap dung ca device alias SPEAKER <-> SPEAKER_SAFE xuong APM/HAL
+            final int mirrorDevice = getSpeakerSafeVolumeMirrorDevice(device);
+            if (mirrorDevice != AudioSystem.DEVICE_NONE) {
+                streamState.applyDeviceVolume_syncVSS(mirrorDevice);
+            }
 
             // Apply change to all streams using this one as alias
             int numStreamTypes = AudioSystem.getNumStreamTypes();
@@ -11768,6 +11804,9 @@ public class AudioService extends IAudioService.Stub
                         vss.applyDeviceVolume_syncVSS(device);
                     }
                     vss.applyDeviceVolume_syncVSS(streamDevice);
+                    if (mirrorDevice != AudioSystem.DEVICE_NONE) {
+                        vss.applyDeviceVolume_syncVSS(mirrorDevice);
+                    }
                 }
             }
         }
@@ -11779,7 +11818,28 @@ public class AudioService extends IAudioService.Stub
                 0,
                 streamState,
                 PERSIST_DELAY);
+        final int mirrorDevice = getSpeakerSafeVolumeMirrorDevice(device);
+        if (mirrorDevice != AudioSystem.DEVICE_NONE) {
+            sendMsg(mAudioHandler,
+                    MSG_PERSIST_VOLUME,
+                    SENDMSG_QUEUE,
+                    mirrorDevice,
+                    0,
+                    streamState,
+                    PERSIST_DELAY);
+        }
 
+    }
+
+    /** SPEAKER <-> SPEAKER_SAFE doi ung volume; DEVICE_NONE neu khong phai cap nay. */
+    private static int getSpeakerSafeVolumeMirrorDevice(int device) {
+        if (device == AudioSystem.DEVICE_OUT_SPEAKER) {
+            return AudioSystem.DEVICE_OUT_SPEAKER_SAFE;
+        }
+        if (device == AudioSystem.DEVICE_OUT_SPEAKER_SAFE) {
+            return AudioSystem.DEVICE_OUT_SPEAKER;
+        }
+        return AudioSystem.DEVICE_NONE;
     }
 
     /** Handles internal volume messages in separate volume thread. */
