@@ -1533,6 +1533,9 @@ public class AudioService extends IAudioService.Stub
         mSettings = settings;
 
         mAudioPolicy = audioPolicy;
+        if (SystemProperties.getBoolean("ro.config.disable_audio_hardening", false)) {
+            mHardeningOverride.set(HardeningOverride.DISABLE);
+        }
         mAudioPolicy.registerOnStartTask(() -> {
             mAudioPolicy.setHardeningOverride((byte) mHardeningOverride.get());
         });
