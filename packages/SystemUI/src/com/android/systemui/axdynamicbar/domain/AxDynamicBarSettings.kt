@@ -32,32 +32,63 @@ class AxDynamicBarSettings @Inject constructor(
         const val KEY_KEYGUARD_BATTERY_CHIP_MODE = "ax_dynamic_bar_keyguard_battery_chip_mode"
         const val KEY_COMPACT_NOTIFICATIONS = "ax_dynamic_bar_compact_notifications"
         const val KEY_CHIP_STYLE = "ax_dynamic_bar_chip_style"
+
+        // Mac dinh ROM = thiet lap pdx237 (Secure settings tren may)
+        const val DEFAULT_ENABLED = 1
+        const val DEFAULT_KEYGUARD_ENABLED = 1
+        const val DEFAULT_KEYGUARD_MUSIC_PILL = 1
+        const val DEFAULT_KEYGUARD_BATTERY_CHIP_MODE = 2 // Always show
+        const val DEFAULT_COMPACT_NOTIFICATIONS = 1
+        const val DEFAULT_CHIP_STYLE = 0
+        // JSON danh sach event bi tat (khop ax_dynamic_bar_events)
+        const val DEFAULT_DISABLED_EVENTS_JSON =
+            """["biometric_unlock","app_switch","torch","clipboard","vpn","ringer","hotspot","bluetooth","charging","sports"]"""
+
+        /** null = chua ghi Secure → mac dinh ROM; "" = user bat het event. */
+        fun parseDisabledEventsJson(json: String?): Set<String> {
+            if (json == null) {
+                return try {
+                    val arr = JSONArray(DEFAULT_DISABLED_EVENTS_JSON)
+                    (0 until arr.length()).mapNotNull { arr.optString(it) }.toSet()
+                } catch (_: Exception) {
+                    emptySet()
+                }
+            }
+            if (json.isBlank()) return emptySet()
+            return try {
+                val arr = JSONArray(json)
+                (0 until arr.length()).mapNotNull { arr.optString(it) }.toSet()
+            } catch (_: Exception) {
+                emptySet()
+            }
+        }
     }
 
     private val contentResolver = context.contentResolver
 
-    private val _isEnabled = MutableStateFlow(false)
+    private val _isEnabled = MutableStateFlow(DEFAULT_ENABLED == 1)
     @get:JvmName("getIsEnabled") val isEnabled: StateFlow<Boolean> = _isEnabled.asStateFlow()
 
-    private val _isKeyguardEnabled = MutableStateFlow(true)
+    private val _isKeyguardEnabled = MutableStateFlow(DEFAULT_KEYGUARD_ENABLED == 1)
     val isKeyguardEnabled: StateFlow<Boolean> = _isKeyguardEnabled.asStateFlow()
 
-    private val _isKeyguardMusicPillEnabled = MutableStateFlow(false)
+    private val _isKeyguardMusicPillEnabled = MutableStateFlow(DEFAULT_KEYGUARD_MUSIC_PILL == 1)
     val isKeyguardMusicPillEnabled: StateFlow<Boolean> = _isKeyguardMusicPillEnabled.asStateFlow()
 
-    private val _keyguardBatteryChipMode = MutableStateFlow(1)
+    private val _keyguardBatteryChipMode = MutableStateFlow(DEFAULT_KEYGUARD_BATTERY_CHIP_MODE)
     val keyguardBatteryChipMode: StateFlow<Int> = _keyguardBatteryChipMode.asStateFlow()
 
     private val _useWaveformSeekBar = MutableStateFlow(false)
     val useWaveformSeekBar: StateFlow<Boolean> = _useWaveformSeekBar.asStateFlow()
     
-    private val _compactNotifications = MutableStateFlow(true)
+    private val _compactNotifications = MutableStateFlow(DEFAULT_COMPACT_NOTIFICATIONS == 1)
     val compactNotifications: StateFlow<Boolean> = _compactNotifications.asStateFlow()
 
-    private val _chipStyle = MutableStateFlow(0)
+    private val _chipStyle = MutableStateFlow(DEFAULT_CHIP_STYLE)
     val chipStyle: StateFlow<Int> = _chipStyle.asStateFlow()
 
-    private val _disabledEventTypes = MutableStateFlow<Set<String>>(emptySet())
+    private val _disabledEventTypes =
+        MutableStateFlow(parseDisabledEventsJson(null))
     val disabledEventTypes: StateFlow<Set<String>> = _disabledEventTypes.asStateFlow()
 
     init {
@@ -137,36 +168,56 @@ class AxDynamicBarSettings @Inject constructor(
 
     private fun refresh() {
         _isEnabled.value =
-            secureSettings.getIntForUser(KEY_ENABLED, 0, UserHandle.USER_CURRENT) == 1
+            secureSettings.getIntForUser(
+                KEY_ENABLED, DEFAULT_ENABLED, UserHandle.USER_CURRENT) == 1
         _isKeyguardEnabled.value =
-            secureSettings.getIntForUser(KEY_KEYGUARD_ENABLED, 1, UserHandle.USER_CURRENT) == 1
+            secureSettings.getIntForUser(
+                KEY_KEYGUARD_ENABLED, DEFAULT_KEYGUARD_ENABLED, UserHandle.USER_CURRENT) == 1
         _keyguardBatteryChipMode.value =
-            secureSettings.getIntForUser(KEY_KEYGUARD_BATTERY_CHIP_MODE, 1, UserHandle.USER_CURRENT)
+            secureSettings.getIntForUser(
+                KEY_KEYGUARD_BATTERY_CHIP_MODE,
+                DEFAULT_KEYGUARD_BATTERY_CHIP_MODE,
+                UserHandle.USER_CURRENT,
+            )
         _isKeyguardMusicPillEnabled.value =
-            secureSettings.getIntForUser(KEY_KEYGUARD_MUSIC_PILL_ENABLED, 0, UserHandle.USER_CURRENT) == 1
+            secureSettings.getIntForUser(
+                KEY_KEYGUARD_MUSIC_PILL_ENABLED,
+                DEFAULT_KEYGUARD_MUSIC_PILL,
+                UserHandle.USER_CURRENT,
+            ) == 1
         _chipStyle.value =
-            secureSettings.getIntForUser(KEY_CHIP_STYLE, 0, UserHandle.USER_CURRENT)
+            secureSettings.getIntForUser(
+                KEY_CHIP_STYLE, DEFAULT_CHIP_STYLE, UserHandle.USER_CURRENT)
         _useWaveformSeekBar.value =
             Settings.System.getIntForUser(
                 contentResolver, Settings.System.MEDIA_WAVEFORM_SEEKBAR, 0, UserHandle.USER_CURRENT,) == 1
         _compactNotifications.value =
-            secureSettings.getIntForUser(KEY_COMPACT_NOTIFICATIONS, 1, UserHandle.USER_CURRENT) == 1
+            secureSettings.getIntForUser(
+                KEY_COMPACT_NOTIFICATIONS,
+                DEFAULT_COMPACT_NOTIFICATIONS,
+                UserHandle.USER_CURRENT,
+            ) == 1
 
-        val json = secureSettings.getStringForUser(KEY_EVENTS, UserHandle.USER_CURRENT) ?: ""
         _disabledEventTypes.value =
-            try {
-                if (json.isBlank()) emptySet()
-                else {
-                    val arr = JSONArray(json)
-                    (0 until arr.length()).mapNotNull { arr.optString(it) }.toSet()
-                }
-            } catch (_: Exception) {
-                emptySet()
-            }
+            parseDisabledEventsJson(
+                secureSettings.getStringForUser(KEY_EVENTS, UserHandle.USER_CURRENT)
+            )
     }
 
     fun isEventEnabled(event: IslandEvent): Boolean {
-        val typeId = EVENT_TYPE_IDS[event::class.java] ?: return true
+        // AospChip dung key AOSP — map sang id toggle Evolver (screen_recording/casting/call)
+        val typeId =
+            when (event) {
+                is IslandEvent.AospChip ->
+                    when (val key = event.active.key) {
+                        "ScreenRecord" -> "screen_recording"
+                        "CastToOtherDevice",
+                        "ShareToApp" -> "casting"
+                        else ->
+                            if (key.startsWith("callChip-")) "call" else "promoted_ongoing"
+                    }
+                else -> EVENT_TYPE_IDS[event::class.java] ?: return true
+            }
         return typeId !in _disabledEventTypes.value
     }
 
