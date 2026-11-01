@@ -45,6 +45,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
@@ -68,11 +69,12 @@ import com.android.compose.animation.Expandable
 import com.android.compose.animation.rememberExpandableController
 import com.android.compose.animation.scene.ElementContentScope
 import com.android.compose.animation.scene.ElementKey
-import com.android.compose.theme.LocalAndroidColorScheme
 import com.android.compose.ui.graphics.painter.rememberDrawablePainter
 import com.android.keyguard.logging.KeyguardQuickAffordancesLogger
 import com.android.systemui.Flags.enableLockscreenBlur
 import com.android.systemui.animation.Expandable
+import com.android.systemui.blur.AxSystemFrost
+import com.android.systemui.blur.rememberSystemBlurRadiusEpoch
 import com.android.systemui.common.shared.model.ContentDescription.Companion.loadContentDescription
 import com.android.systemui.common.shared.model.Icon as SysUiIcon
 import com.android.systemui.dagger.SysUISingleton
@@ -291,19 +293,35 @@ constructor(
     ): Modifier {
         if (enableLockscreenBlur()) {
             val viewRootImpl = LocalView.current.viewRootImpl
+            val context = LocalContext.current
             val drawable = remember {
                 viewRootImpl.createBackgroundBlurDrawable().apply { setBlurRadius(0) }
             }
             val cornerRadius = dimensionResource(R.dimen.keyguard_affordance_fixed_height)
-            val blurRadius = dimensionResource(R.dimen.keyguard_shortcuts_blur_radius)
             val isBlurSupported by
                 windowRootViewBlurInteractor.isBlurCurrentlySupported.collectAsStateWithLifecycle()
+            val radiusEpoch = rememberSystemBlurRadiusEpoch()
+            // Kinh idle (!activated); strength 0% / blur off → khong gui region.
+            val showFrost =
+                remember(radiusEpoch, isBlurSupported, viewModel.isActivated) {
+                    AxSystemFrost.isFrostRenderable(context, isBlurSupported) &&
+                        !viewModel.isActivated
+                }
+            val blurRadiusPx =
+                remember(radiusEpoch, isBlurSupported, viewModel.isActivated) {
+                    AxSystemFrost.appliedBlurRadiusPx(
+                        context,
+                        isBlurSupported && !viewModel.isActivated,
+                    )
+                }
 
-            if (isBlurSupported) {
+            if (showFrost) {
                 return drawBehind {
                     drawable.apply {
-                        setBlurRadius(blurRadius.roundToPx())
+                        setVisible(true, false)
+                        setBlurRadius(blurRadiusPx)
                         setCornerRadius(cornerRadius.toPx())
+                        setColor(AxSystemFrost.tintColor(context))
                         val backgroundAlpha = if (viewModel.isDimmed) DIM_ALPHA else alpha
                         setAlpha((backgroundAlpha * 255).toInt())
                     }
@@ -315,9 +333,10 @@ constructor(
             } else {
                 SideEffect {
                     drawable.apply {
-                        // Stop BackgroundBlurDrawable from dispatching blur regions
-                        // to SF since now blur radius is set to 0.
+                        // Don region SF — tranh ghost blur khi 0% / activated / blur off.
                         setBlurRadius(0)
+                        setColor(AxSystemFrost.fallbackColor(context))
+                        setVisible(false, false)
                     }
                 }
             }
@@ -330,14 +349,26 @@ constructor(
         if (!viewModel.isSelected) {
             val isBlurSupported by
                 windowRootViewBlurInteractor.isBlurCurrentlySupported.collectAsStateWithLifecycle()
+            val context = LocalContext.current
+            val radiusEpoch = rememberSystemBlurRadiusEpoch()
+            val showFrost =
+                remember(radiusEpoch, isBlurSupported, viewModel.isActivated) {
+                    enableLockscreenBlur() &&
+                        AxSystemFrost.isFrostRenderable(context, isBlurSupported) &&
+                        !viewModel.isActivated
+                }
+            // Frost dang ve blur+tint → khong ve background Compose (tranh double tint).
+            if (showFrost) {
+                return this
+            }
             return this.background(
                 color =
                     if (viewModel.isActivated) {
                         MaterialTheme.colorScheme.primaryFixed
-                    } else if (enableLockscreenBlur() && isBlurSupported) {
-                        LocalAndroidColorScheme.current.surfaceEffect1
+                    } else if (enableLockscreenBlur()) {
+                        Color(AxSystemFrost.surfaceColor(context, isBlurSupported))
                     } else {
-                        MaterialTheme.colorScheme.surfaceContainerHigh
+                        Color(AxSystemFrost.fallbackColor(context))
                     },
                 shape = CircleShape,
             )

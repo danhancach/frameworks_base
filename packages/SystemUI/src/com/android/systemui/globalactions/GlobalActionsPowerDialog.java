@@ -28,6 +28,7 @@ import android.widget.ListAdapter;
 
 import androidx.constraintlayout.helper.widget.Flow;
 
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.statusbar.BlurUtils;
 
 /**
@@ -77,15 +78,8 @@ public class GlobalActionsPowerDialog {
                 context.getTheme()));
         window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        if (blurUtils.supportsBlursOnWindows()) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
-            int blurBehindRadius = context.getResources()
-                    .getDimensionPixelSize(com.android.systemui.res.R.dimen.max_window_blur_radius);
-            window.getAttributes().setBlurBehindRadius(blurBehindRadius);
-            window.setDimAmount(0.54f);
-        } else {
-            window.setDimAmount(0.88f);
-        }
+        // Radius/mau theo PrimaryCard (system_blur_radius_pct); 0% = nen dac.
+        AxSystemFrost.applyWindowBlurBehind(window, blurUtils.supportsBlursOnWindows());
 
         return dialog;
     }

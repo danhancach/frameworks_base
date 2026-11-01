@@ -151,6 +151,7 @@ import com.android.systemui.deviceentry.domain.interactor.DeviceEntryInteractor;
 import com.android.systemui.plugins.GlobalActions.GlobalActionsManager;
 import com.android.systemui.plugins.GlobalActionsPanelPlugin;
 import com.android.systemui.scene.shared.flag.SceneContainerFlag;
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.scrim.ScrimDrawable;
 import com.android.systemui.settings.UserTracker;
 import com.android.systemui.shade.ShadeController;
@@ -3383,18 +3384,8 @@ public class GlobalActionsDialogLite implements DialogInterface.OnDismissListene
             window.setTitle(""); // prevent Talkback from speaking first item name twice
             window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
             window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-            if (mBlurUtils.supportsBlursOnWindows()) {
-                // Enable blur behind
-                // Enable dim behind since we are setting some amount dim for the blur.
-                window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
-                // Set blur behind radius
-                int blurBehindRadius = mContext.getResources()
-                        .getDimensionPixelSize(com.android.systemui.res.R.dimen.max_window_blur_radius);
-                window.getAttributes().setBlurBehindRadius(blurBehindRadius);
-                window.setDimAmount(0.54f);
-            } else {
-                window.setDimAmount(0.88f);
-            }
+            // Blur behind theo strength PrimaryCard; 0% = dim day, khong blur.
+            AxSystemFrost.applyWindowBlurBehind(window, mBlurUtils.supportsBlursOnWindows());
             // If user entered from the lock screen and smart lock was enabled, disable it
             int user = mSelectedUserInteractor.getSelectedUserId();
             boolean userHasTrust = mKeyguardUpdateMonitor.getUserHasTrust(user);

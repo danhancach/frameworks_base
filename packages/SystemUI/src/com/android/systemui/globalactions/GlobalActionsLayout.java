@@ -19,6 +19,7 @@ package com.android.systemui.globalactions;
 import static com.android.systemui.shared.system.BlurUtils.isVolumeAndPowerBlurEnabled;
 
 import android.content.Context;
+import android.database.ContentObserver;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.text.TextUtils;
@@ -26,9 +27,12 @@ import android.util.AttributeSet;
 import android.view.View;
 import android.view.ViewGroup;
 
+import androidx.annotation.Nullable;
+
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.systemui.HardwareBgDrawable;
 import com.android.systemui.MultiListLayout;
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.res.R;
 import com.android.systemui.util.leak.RotationUtils;
 
@@ -42,11 +46,29 @@ public abstract class GlobalActionsLayout extends MultiListLayout {
 
     private Boolean mIsBlurSupported = null;
     private final boolean mTranslucentPowerMenu;
+    @Nullable private ContentObserver mRadiusObserver;
 
     public GlobalActionsLayout(Context context, AttributeSet attrs) {
         super(context, attrs);
         mTranslucentPowerMenu =
                 context.getResources().getBoolean(R.bool.config_translucentStandalonePowerMenu);
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        if (mRadiusObserver == null) {
+            mRadiusObserver = AxSystemFrost.registerRadiusObserver(
+                    getContext(), this::updateIsBlurSupported);
+        }
+        updateIsBlurSupported();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        AxSystemFrost.unregisterRadiusObserver(getContext(), mRadiusObserver);
+        mRadiusObserver = null;
+        super.onDetachedFromWindow();
     }
 
     public void setIsBlurSupported(boolean isBlurSupported) {
@@ -83,10 +105,9 @@ public abstract class GlobalActionsLayout extends MultiListLayout {
 
     private void updateIsBlurSupported() {
         if (isVolumeAndPowerBlurEnabled() && mBackgroundsSet && mIsBlurSupported != null) {
-            updateBackground(mContext.getColor(
-                    mIsBlurSupported && mTranslucentPowerMenu
-                            ? R.color.global_actions_grid_background_blur
-                            : R.color.global_actions_grid_background_blur_fallback));
+            // Tint/CardBg giong PrimaryCard; strength 0% = fallback dac.
+            boolean frostOn = mIsBlurSupported && mTranslucentPowerMenu;
+            updateBackground(AxSystemFrost.surfaceColor(mContext, frostOn));
         }
     }
 

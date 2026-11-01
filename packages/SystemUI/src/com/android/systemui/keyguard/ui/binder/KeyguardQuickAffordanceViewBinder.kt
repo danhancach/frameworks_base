@@ -39,6 +39,7 @@ import com.android.keyguard.logging.KeyguardQuickAffordancesLogger
 import com.android.systemui.Flags.enableLockscreenBlur
 import com.android.systemui.animation.Expandable
 import com.android.systemui.animation.view.LaunchableImageView
+import com.android.systemui.blur.AxSystemFrost
 import com.android.systemui.common.shared.model.Icon
 import com.android.systemui.common.ui.binder.IconViewBinder
 import com.android.systemui.common.ui.view.BackgroundBlurAlphaSync
@@ -98,16 +99,16 @@ constructor(
         val configurationBasedDimensions = MutableStateFlow(loadFromResources(view))
         val hapticsViewModel = hapticsViewModelFactory.create()
         val cornerRadius = view.resources.getDimension(R.dimen.keyguard_affordance_fixed_radius)
-        val blurRadius =
-            view.resources.getDimensionPixelSize(R.dimen.keyguard_shortcuts_blur_radius)
 
         val disposableHandle =
             view.repeatWhenAttached {
                 if (enableLockscreenBlur() && view.background !is LayerDrawable) {
+                    // Radius/tint cap nhat trong updateBackground theo window blur + pct.
                     val blurDrawable =
                         view.viewRootImpl.createBackgroundBlurDrawable().apply {
                             setCornerRadius(cornerRadius)
-                            setBlurRadius(blurRadius)
+                            setBlurRadius(0)
+                            setColor(AxSystemFrost.fallbackColor(view.context))
                             setVisible(false, false)
                         }
                     val surfaceDrawable = view.background
@@ -124,6 +125,17 @@ constructor(
                             }
                             .start()
                     view.doOnDetach { blurAlphaSync.dispose() }
+                }
+                // Tick khi keo strength — combine voi blurSupported/viewModel de setBlurRadius lai.
+                val radiusTick = MutableStateFlow(0)
+                val radiusObserver =
+                    if (enableLockscreenBlur()) {
+                        AxSystemFrost.registerRadiusObserver(view.context) {
+                            radiusTick.value = radiusTick.value + 1
+                        }
+                    } else null
+                view.doOnDetach {
+                    AxSystemFrost.unregisterRadiusObserver(view.context, radiusObserver)
                 }
                 repeatOnLifecycle(Lifecycle.State.STARTED) {
                     launch {
@@ -155,10 +167,10 @@ constructor(
                             combine(
                                     windowRootViewBlurInteractor.isBlurCurrentlySupported,
                                     viewModel,
-                                    { isSupported, viewModel ->
-                                        updateBackground(viewModel, view, isSupported)
-                                    },
-                                )
+                                    radiusTick,
+                                ) { isSupported, buttonModel, _ ->
+                                    updateBackground(buttonModel, view, isSupported)
+                                }
                                 .collect {}
                         }
                     }
@@ -185,15 +197,32 @@ constructor(
         if (enableLockscreenBlur() && view.background is LayerDrawable) {
             val blurDrawable =
                 (view.background as LayerDrawable).getDrawable(0) as BackgroundBlurDrawable
-            blurDrawable.setVisible(
-                isBlurSupported && viewModel.isSelected && !viewModel.isActivated,
-                false,
+            // Kinh binh thuong tren lockscreen (!activated); bo gate isSelected (chi preview).
+            val showFrost =
+                AxSystemFrost.isFrostRenderable(view.context, isBlurSupported) &&
+                    !viewModel.isActivated
+            blurDrawable.setBlurRadius(
+                AxSystemFrost.appliedBlurRadiusPx(view.context, isBlurSupported && !viewModel.isActivated)
             )
+            blurDrawable.setColor(
+                if (showFrost) {
+                    AxSystemFrost.tintColor(view.context)
+                } else {
+                    AxSystemFrost.fallbackColor(view.context)
+                }
+            )
+            blurDrawable.setVisible(showFrost, false)
             (view.background as LayerDrawable)
                 .getDrawable(1)
-                .setTintList(getBackgroundTintList(viewModel, view, isBlurSupported))
+                .setTintList(getBackgroundTintList(viewModel, view, isBlurSupported, showFrost))
         } else {
-            view.backgroundTintList = getBackgroundTintList(viewModel, view, isBlurSupported)
+            view.backgroundTintList =
+                getBackgroundTintList(
+                    viewModel,
+                    view,
+                    isBlurSupported,
+                    showFrost = false,
+                )
         }
     }
 
@@ -330,20 +359,27 @@ constructor(
         viewModel: KeyguardQuickAffordanceViewModel,
         view: View,
         isBlurSupported: Boolean,
+        showFrost: Boolean,
     ): ColorStateList? {
+        // Khi dang ve kinh: surface layer trong suot — tranh double tint len blur.
+        if (showFrost) {
+            return ColorStateList.valueOf(android.graphics.Color.TRANSPARENT)
+        }
         return if (!viewModel.isSelected) {
             ColorStateList.valueOf(
-                view.context.getColor(
-                    if (viewModel.isActivated) {
+                if (viewModel.isActivated) {
+                    view.context.getColor(
                         com.android.internal.R.color.materialColorPrimaryFixed
-                    } else if (enableLockscreenBlur() && isBlurSupported) {
-                        com.android.internal.R.color.customColorSurfaceEffect1
-                    } else {
-                        com.android.internal.R.color.materialColorSurfaceContainerHigh
-                    }
-                )
+                    )
+                } else if (enableLockscreenBlur()) {
+                    // Strength 0% / blur off = CardBg dac.
+                    AxSystemFrost.surfaceColor(view.context, isBlurSupported)
+                } else {
+                    AxSystemFrost.fallbackColor(view.context)
+                }
             )
         } else {
+            // Preview selected + khong frost: bo tint de hien border/foreground.
             null
         }
     }

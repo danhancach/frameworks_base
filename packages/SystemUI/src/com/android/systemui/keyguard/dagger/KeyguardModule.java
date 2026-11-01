@@ -64,6 +64,7 @@ import com.android.systemui.keyguard.domain.interactor.KeyguardEnabledInteractor
 import com.android.systemui.keyguard.domain.interactor.KeyguardInteractor;
 import com.android.systemui.keyguard.domain.interactor.KeyguardTransitionBootInteractor;
 import com.android.systemui.keyguard.domain.interactor.StartKeyguardTransitionModule;
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.keyguard.ui.binder.KeyguardChipbarViewBinder;
 import com.android.systemui.keyguard.ui.binder.SideFpsProgressBarViewBinder;
 import com.android.systemui.keyguard.ui.transitions.BlurConfig;
@@ -260,8 +261,10 @@ public interface KeyguardModule {
     /** */
     @Provides
     @SysUISingleton
-    static BlurConfig provideBlurConfig(SecureSettings secureSettings) {
-        return new BlurConfig(0.0f, BlurConfig.MAX_BLUR_RADIUS_PX, secureSettings);
+    static BlurConfig provideBlurConfig(
+            @ShadeDisplayAware Context context, SecureSettings secureSettings) {
+        // Max radius AxBlur / PrimaryCard — % van qua system_blur_radius_pct trong BlurConfig.
+        return new BlurConfig(0.0f, AxSystemFrost.maxBlurRadiusPx(context), secureSettings);
     }
 
     /** */
