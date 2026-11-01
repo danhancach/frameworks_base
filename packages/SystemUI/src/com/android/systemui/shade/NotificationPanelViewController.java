@@ -4446,7 +4446,9 @@ public final class NotificationPanelViewController implements
             }
             if (mBrightnessControl) {
                 final int action = event.getActionMasked();
-                if (mBrightnessControlEngaged) {
+                final boolean brightnessActive =
+                        mBrightnessControlEngaged || mCentralSurfaces.isBrightnessControlActive();
+                if (brightnessActive) {
                     mCentralSurfaces.brightnessControl(event);
                     if (action == MotionEvent.ACTION_DOWN
                             || action == MotionEvent.ACTION_UP
@@ -4454,7 +4456,13 @@ public final class NotificationPanelViewController implements
                         mBrightnessControlEngaged = false;
                         mCentralSurfaces.onBrightnessChanged(true);
                         mCentralSurfaces.cancelBrightnessControl();
-                     }
+                        if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
+                                && !isFullyCollapsed()) {
+                            // Brightness nuot UP — bat buoc dong shade neu con mo le
+                            fling(0 /* vel */, false /* expand */,
+                                    false /* expandBecauseOfFalsing */);
+                        }
+                    }
                     return true;
                 }
                 if (!handled) {
