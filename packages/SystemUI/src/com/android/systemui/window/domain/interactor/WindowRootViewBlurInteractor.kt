@@ -108,6 +108,23 @@ constructor(
     /** Whether lockscreen notification translucency is enabled via user setting. */
     val isLockscreenTranslucentSupported: StateFlow<Boolean> = repository.isLockscreenTranslucentSupported
 
+    /**
+     * Frost hang notif / shelf: can translucent **va** cross-window blur (PrimaryCard / AxBlur).
+     * Chi translucent → van ve BackgroundBlurDrawable khi tat "window blurs".
+     */
+    val isNotificationRowFrostSupported: StateFlow<Boolean> =
+        combine(isBlurCurrentlySupported, isTranslucentSupported) { blurOn, translucent ->
+                blurOn && translucent
+            }
+            .stateIn(applicationScope, SharingStarted.Eagerly, false)
+
+    /** Frost hang notif tren khoa: translucent lockscreen **va** cross-window blur. */
+    val isLockscreenNotificationRowFrostSupported: StateFlow<Boolean> =
+        combine(isBlurCurrentlySupported, isLockscreenTranslucentSupported) { blurOn, translucent ->
+                blurOn && translucent
+            }
+            .stateIn(applicationScope, SharingStarted.Eagerly, false)
+
     /** Whether the blurred wallpaper is supported. This feature is disabled on desktop. */
     val isBlurredWallpaperOnShadeSupported: Boolean =
         resources.getBoolean(R.bool.config_supportBlurredWallpaper)
