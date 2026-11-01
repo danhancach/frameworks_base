@@ -30,6 +30,7 @@ import android.os.UserHandle
 import android.provider.Settings
 import com.android.internal.graphics.ColorUtils
 import com.android.internal.graphics.cam.Cam
+import com.android.systemui.blur.AxSystemFrost
 import com.android.systemui.common.shared.colors.SurfaceEffectColors
 import com.android.systemui.qs.shared.style.LiquidGlass
 import com.android.systemui.qs.shared.style.LiquidGlassTune
@@ -106,8 +107,7 @@ object ShadeColors {
     fun notificationScrim(context: Context, blurSupported: Boolean): Int {
         if (isNothingFlatPanel(context)) return context.getColor(R.color.nothing_os_surface)
         val s = spec(style(context), isNight(context))
-            ?: return if (blurSupported) notificationScrimStandard(context)
-            else notificationScrimFallback(context)
+            ?: return AxSystemFrost.surfaceColor(context, blurSupported)
 
         val tone = (if (blurSupported) s.panelTone else s.fallbackTone) + s.cardToneDelta
         val chroma = if (blurSupported) s.panelChroma else s.fallbackChroma
@@ -130,12 +130,19 @@ object ShadeColors {
         composited: Boolean,
     ): Int {
         val s = spec(style(context), isNight(context))
-        val card = if (s == null && !isNothingFlatPanel(context)) {
-            context.resources.getColor(
-                com.android.internal.R.color.customColorSurfaceEffect0, context.theme)
-        } else {
-            notificationScrim(context, blurSupported)
+        if (s == null && !isNothingFlatPanel(context)) {
+            if (!blurSupported || !AxSystemFrost.isFrostActive(context)) {
+                return AxSystemFrost.fallbackColor(context)
+            }
+            val frostTint = AxSystemFrost.tintColor(context)
+            if (!composited) {
+                // SplitShade (avoid adding the shade panel with scrim)
+                return frostTint
+            }
+            val shadePanelWithScrim = shadePanel(context, blurSupported, withScrim = true)
+            return ColorUtils.compositeColors(frostTint, shadePanelWithScrim)
         }
+        val card = notificationScrim(context, blurSupported)
         if (!composited) return card
         val panel = shadePanel(context, blurSupported, true)
         if (blurSupported && glassDualTone(context)) {
@@ -282,25 +289,21 @@ object ShadeColors {
         observingStyle = true
     }
 
-    private fun aospShadePanel(context: Context, blurSupported: Boolean, withScrim: Boolean): Int =
-        if (blurSupported) {
-            if (withScrim) ColorUtils.compositeColors(
-                shadePanelStandard(context), shadePanelScrimBehind(context))
-            else shadePanelStandard(context)
-        } else {
-            context.getColor(R.color.shade_panel_fallback)
+    private fun aospShadePanel(context: Context, blurSupported: Boolean, withScrim: Boolean): Int {
+        // Frost chi khi radius > 0; strength 0% = CardBg dac (giong PrimaryCard).
+        if (!blurSupported || !AxSystemFrost.isFrostActive(context)) {
+            return shadePanelFallback(context)
         }
-
-    private fun shadePanelStandard(context: Context): Int {
-        val above = context.resources.getColor(
-            com.android.internal.R.color.shade_panel_fg, context.theme)
-        val below = context.resources.getColor(
-            com.android.internal.R.color.shade_panel_bg, context.theme)
-        return ColorUtils.compositeColors(above, below)
+        val frost = AxSystemFrost.tintColor(context)
+        return if (withScrim) {
+            ColorUtils.compositeColors(frost, shadePanelScrimBehind(context))
+        } else {
+            frost
+        }
     }
 
     @JvmStatic
-     private fun shadePanelFallback(context: Context): Int {
+    private fun shadePanelFallback(context: Context): Int {
         val isNightMode = (context.resources.configuration.uiMode and
                 Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
         val useBlackTheme = Settings.Secure.getIntForUser(
@@ -309,14 +312,8 @@ object ShadeColors {
         return if (useBlackTheme && isNightMode) {
             Color.BLACK
         } else {
-            context.getColor(R.color.shade_panel_fallback)
+            // Gan CardBg / surfaceBright (AxBlur fallback).
+            AxSystemFrost.fallbackColor(context)
         }
     }
-
-    private fun notificationScrimStandard(context: Context): Int =
-        ColorUtils.setAlphaComponent(
-            context.getColor(R.color.notification_scrim_base), (0.5f * 255).toInt())
-
-    private fun notificationScrimFallback(context: Context): Int =
-        context.getColor(R.color.notification_scrim_fallback)
 }

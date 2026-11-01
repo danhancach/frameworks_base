@@ -80,7 +80,8 @@ public final class NotificationPanelView extends FrameLayout {
         }
     }
 
-    float getCurrentPanelAlpha() {
+    /** Alpha applied to the panel's contents, including separately composited blur regions. */
+    public float getCurrentPanelAlpha() {
         return mCurrentPanelAlpha;
     }
 
