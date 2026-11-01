@@ -1544,6 +1544,13 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
     private void adjustBrightness(int x) {
         mBrightnessChanged = true;
         if (mBrightnessAtTouchStart < 0f) {
+            // Doc lai brightness thatuc luc bat dau gesture. mCurrentBrightness chi
+            // duoc cap nhat khi chinh bang status bar; neu doi qua QS/auto/Settings
+            // se bi stale -> man toi dot ngot roi tang dan khi truot.
+            final float actual = mDisplayManager.getBrightness(mDisplayId);
+            if (!Float.isNaN(actual) && actual >= PowerManager.BRIGHTNESS_MIN) {
+                mCurrentBrightness = actual;
+            }
             mBrightnessAtTouchStart = mCurrentBrightness;
             mInitialTouchX = x;
             return;
@@ -1629,6 +1636,11 @@ public class CentralSurfacesImpl implements CoreStartable, CentralSurfaces,
         mLinger = 0;
         mBrightnessChanged = false;
         mBrightnessAtTouchStart = -1f;
+    }
+
+    @Override
+    public boolean isBrightnessControlActive() {
+        return mBrightnessChanged || mLinger > BRIGHTNESS_CONTROL_LINGER_THRESHOLD;
     }
 
     void onLongPressBrightnessChange() {

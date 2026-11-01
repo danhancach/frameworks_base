@@ -4382,13 +4382,31 @@ public final class NotificationPanelViewController implements
                 final float swipeY = event.getY(actionIndex);
                 if (swipeY < mStatusBarMinHeight &&
                         (mBarState != KEYGUARD || mBrightnessControlLockscreen)) {
+                    // Chi nuot touch khi brightness gesture thuc su active. Neu luon
+                    // return true khi ngon trong status bar, ACTION_UP bi nuot → shade
+                    // ket mExpanding + blur (expansion ~vài %) sau keo chap chon.
+                    final boolean brightnessWasActive =
+                            mCentralSurfaces.isBrightnessControlActive();
                     mCentralSurfaces.brightnessControl(event);
                     final int action = event.getActionMasked();
+                    final boolean brightnessActive =
+                            brightnessWasActive
+                                    || mCentralSurfaces.isBrightnessControlActive();
                     if (action == MotionEvent.ACTION_UP
                             || action == MotionEvent.ACTION_CANCEL) {
                         mCentralSurfaces.onBrightnessChanged(true);
+                        if (brightnessActive) {
+                            // Brightness nuot UP — bat buoc dong shade neu con mo le
+                            if (!isFullyCollapsed()) {
+                                fling(0 /* vel */, false /* expand */,
+                                        false /* expandBecauseOfFalsing */);
+                            }
+                            return true;
+                        }
+                        // Chua active: de shade nhan UP de fling/notifyExpandingFinished
+                    } else if (brightnessActive) {
+                        return true;
                     }
-                    return true;
                 }
             }
             if (!mHeadsUpTouchHelper.isTrackingHeadsUp() && mQsController.handleTouch(

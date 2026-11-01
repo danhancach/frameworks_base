@@ -103,6 +103,9 @@ constructor(
 
         private const val PUSHBACK_SCALE_FOR_APP = 0.025f
 
+        /** Expansion ket duoi nguong nay + !tracking → coi nhu dong de clear blur. */
+        private const val STUCK_EXPANSION_BLUR_CLEAR = 0.05f
+
         private const val TAG = "DepthController"
     }
 
@@ -635,8 +638,14 @@ constructor(
                     animateBlur(true, 0f)
                 }
 
-                // If shade is being closed and the user isn't interacting with it, un-blur.
-                if (!tracking && direction < 0 && isBlurred) {
+                // Un-blur khi dong shade, hoac khi expansion ket o muc rat nho ma
+                // khong con tracking (vd. gesture status bar chap chon / brightness
+                // nuot UP → shadeExpansion ~0.03, blur khong bao gio ve 0).
+                if (
+                    !tracking &&
+                        isBlurred &&
+                        (direction < 0 || expansion < STUCK_EXPANSION_BLUR_CLEAR)
+                ) {
                     animateBlur(false, velocity)
                 }
 

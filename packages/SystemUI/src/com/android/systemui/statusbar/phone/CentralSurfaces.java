@@ -264,4 +264,7 @@ public interface CentralSurfaces extends Dumpable, LifecycleOwner, CoreStartable
     void onBrightnessChanged(boolean upOrCancel);
 
     void cancelBrightnessControl();
+
+    /** True khi gesture chinh sang status bar da active (long-press / linger). */
+    boolean isBrightnessControlActive();
 }
