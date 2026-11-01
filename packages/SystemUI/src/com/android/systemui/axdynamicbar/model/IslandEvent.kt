@@ -1,6 +1,7 @@
 package com.android.systemui.axdynamicbar.model
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.app.RemoteInput
 import android.graphics.drawable.Drawable
 import android.net.Uri
@@ -61,6 +62,7 @@ sealed class IslandEvent(open val priority: Int, val id: String) : Comparable<Is
     }
 
     data class Media(
+        val mediaKey: String = "",
         val track: String,
         val artist: String,
         val isPlaying: Boolean,
@@ -74,7 +76,7 @@ sealed class IslandEvent(open val priority: Int, val id: String) : Comparable<Is
         val customActions: List<MediaCustomAction> = emptyList(),
         val appIcon: Drawable? = null,
         val packageName: String = "",
-    ) : IslandEvent(priority = MEDIA_PLAYING_PRIORITY, id = "media") {
+    ) : IslandEvent(priority = MEDIA_PLAYING_PRIORITY, id = "media_" + mediaKey) {
         override val priority: Int
             get() = if (isPlaying) MEDIA_PLAYING_PRIORITY else MEDIA_PAUSED_PRIORITY
         override fun withoutDrawables() = copy(albumArt = null, appIcon = null)
@@ -212,19 +214,107 @@ sealed class IslandEvent(open val priority: Int, val id: String) : Comparable<Is
         val originalDurationMs: Long = 0L,
         val appIcon: Drawable? = null,
         val isPaused: Boolean = false,
+        /**
+         * Khi paused: remaining dong bang (ms). Khong tinh endTimeMs - now — moi lan
+         * recomposition/doi pill se bi tru thoi gian wall-clock da troi.
+         */
+        val pausedRemainingMs: Long = 0L,
+        /**
+         * Moc het gio theo elapsedRealtime khi dang chay (0 = dung endTimeMs wall).
+         * Giong Chronometer.Running (QS chip) — tranh lech khi wall-clock nhay.
+         */
+        val endElapsedRealtimeMs: Long = 0L,
         val actions: List<NotificationAction> = emptyList(),
-    ) : IslandEvent(priority = 45, id = "timer") {
+        /** Key notification — moi timer mot id rieng (ho tro nhieu dong ho). */
+        val notificationKey: String = "",
+        /** Mo Clock khi tap noi dung panel (khong phai nut action). */
+        val contentIntent: PendingIntent? = null,
+        val packageName: String = "",
+        val sbn: StatusBarNotification? = null,
+        /**
+         * Id timer trong Google/AOSP Clock (`TIMER_ID`). Dung de tong hop PAUSE/START
+         * khi notif nhom chi con action "Dat lai ca hai…" (khong co nut tung timer).
+         * -1 = chua biet.
+         */
+        val deskClockTimerId: Int = -1,
+        /**
+         * PendingIntent do Clock tao (PAUSE/START + TIMER_ID). Uu tien PI nay;
+         * fallback sendBroadcast can AMS BroadcastSkipPolicy (TimerReceiver exported=false).
+         */
+        val pausePendingIntent: PendingIntent? = null,
+        val startPendingIntent: PendingIntent? = null,
+    ) : IslandEvent(
+        priority = 45,
+        id = if (notificationKey.isNotEmpty()) "timer_$notificationKey" else "timer",
+    ) {
+        // Ongoing countdown — khong autoDismiss (chip phai con khi timer chay)
+        override val behavior = EventBehavior(autoDismissMs = null)
         override fun withoutDrawables() = copy(appIcon = null)
+
+        /**
+         * Remaining hien thi (SSOT). Paused: chi pausedRemainingMs — khong ± now.
+         * Dang chay: uu tien endElapsedRealtimeMs, fallback endTimeMs wall.
+         */
+        fun displayedRemainingMs(
+            nowWallMs: Long = System.currentTimeMillis(),
+            nowElapsedMs: Long = android.os.SystemClock.elapsedRealtime(),
+        ): Long =
+            when {
+                isPaused -> pausedRemainingMs.coerceAtLeast(0L)
+                endElapsedRealtimeMs > 0L ->
+                    (endElapsedRealtimeMs - nowElapsedMs).coerceAtLeast(0L)
+                endTimeMs > 0L -> (endTimeMs - nowWallMs).coerceAtLeast(0L)
+                else -> 0L
+            }
     }
 
     data class Stopwatch(
         val label: String = "",
         val startTimeMs: Long = System.currentTimeMillis(),
+        /** Moc bat dau elapsedRealtime khi dang chay (0 = dung startTimeMs wall). */
+        val startElapsedRealtimeMs: Long = 0L,
         val isRunning: Boolean = true,
+        /**
+         * Khi paused: elapsed dong bang (ms). Khong tinh now - start — doi pill se cong
+         * them thoi gian wall-clock da troi.
+         */
+        val pausedElapsedMs: Long = 0L,
+        /**
+         * Cac moc vong (lap) theo elapsed tuyet doi (ms tu luc start).
+         * Parse tu EXTRA_TEXT_LINES / BigText cua Clock — rong neu khong co.
+         */
+        val laps: List<Long> = emptyList(),
         val appIcon: Drawable? = null,
         val actions: List<NotificationAction> = emptyList(),
+        val contentIntent: PendingIntent? = null,
+        val packageName: String = "",
+        val notificationKey: String = "",
+        val sbn: StatusBarNotification? = null,
     ) : IslandEvent(priority = 44, id = "stopwatch") {
+        // Ongoing stopwatch — khong autoDismiss
+        override val behavior = EventBehavior(autoDismissMs = null)
         override fun withoutDrawables() = copy(appIcon = null)
+
+        /**
+         * Elapsed hien thi (SSOT) — cung cong thuc Chronometer.Running/Paused (QS chip).
+         * Paused: chi pausedElapsedMs. Dang chay: ER base neu co; Instant wall → doi sang ER
+         * (elapsedRealtime + (zeroWall - nowWall)) de khong lech khi wall-clock nhay.
+         */
+        fun displayedElapsedMs(
+            nowWallMs: Long = System.currentTimeMillis(),
+            nowElapsedMs: Long = android.os.SystemClock.elapsedRealtime(),
+        ): Long =
+            when {
+                !isRunning -> pausedElapsedMs.coerceAtLeast(0L)
+                startElapsedRealtimeMs != 0L ->
+                    (nowElapsedMs - startElapsedRealtimeMs).coerceAtLeast(0L)
+                startTimeMs > 0L -> {
+                    // EventTime.ClockTime.asElapsedRealtime
+                    val zeroEr = nowElapsedMs + (startTimeMs - nowWallMs)
+                    (nowElapsedMs - zeroEr).coerceAtLeast(0L)
+                }
+                else -> 0L
+            }
     }
 
     data class Alarm(

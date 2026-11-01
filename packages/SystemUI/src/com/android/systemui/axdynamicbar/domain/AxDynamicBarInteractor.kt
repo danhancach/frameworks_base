@@ -1,15 +1,21 @@
 package com.android.systemui.axdynamicbar.domain
 
 import android.app.Notification
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.Settings.Global
+import android.util.Log
 import com.android.systemui.axdynamicbar.data.IslandEventRepository
 import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.model.IslandState
 import com.android.systemui.axdynamicbar.model.IslandUiState
 import com.android.systemui.axdynamicbar.model.RecordingState
 import com.android.systemui.axdynamicbar.shared.IslandActions
+import com.android.systemui.axdynamicbar.shared.sendWithBal
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.haptics.slider.compose.ui.SliderHapticsViewModel
@@ -27,19 +33,19 @@ import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 @SysUISingleton
 class AxDynamicBarInteractor
 @Inject
 constructor(
+    @Application private val context: Context,
     @Application private val applicationScope: CoroutineScope,
     private val repository: IslandEventRepository,
     val settings: AxDynamicBarSettings,
@@ -62,6 +68,7 @@ constructor(
     @Volatile private var alertHeld = false
     @Volatile private var alertReplyActive = false
     @Volatile private var overlayImeVisible = false
+    @Volatile private var lastOutsideDismissElapsedMs = 0L
 
     private val dismissedEventIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
@@ -70,6 +77,10 @@ constructor(
     var onCollapseRequested: (() -> Unit)? = null
 
     var onAlertReplyCaptureRequested: ((Boolean) -> Unit)? = null
+
+    /** Compact: timeout + touchable dung the; Expanded: soft-max + tap ngoai dismiss. */
+    private val _alertCompactMode = MutableStateFlow(true)
+    val alertCompactMode: StateFlow<Boolean> = _alertCompactMode.asStateFlow()
 
     private var isInitialized = false
 
@@ -100,7 +111,9 @@ constructor(
 
     companion object {
         private const val TAG = "AxDynamicBarInteractor"
-        private const val NOTIF_ALERT_DURATION_MS = 4500L
+        private const val NOTIF_ALERT_DURATION_MS = 5500L
+        /** Tran tap ngoai / ACTION_OUTSIDE — tranh 1 gesture nuot ca stack. */
+        private const val OUTSIDE_DISMISS_DEBOUNCE_MS = 480L
 
         private fun IslandEvent.Notification.isActiveCall(): Boolean {
             val extras = sbn.notification?.extras ?: return false
@@ -120,12 +133,10 @@ constructor(
         repository.system.onRingerChanged = { scheduleAutoDismiss(it) }
         repository.system.onClipboardCopied = { scheduleAutoDismiss(it) }
 
-        repository.notification.activeMediaPackageProvider = { repository.media.activeMediaPackage }
+        repository.notification.activeMediaPackageProvider = { repository.media.activeMediaPackages }
         repository.notification.onAlarmEvent = {
             scheduleAutoDismiss(it, if (it.isRinging) 30_000L else 5_000L)
         }
-
-        repository.media.onMediaSessionLost = { repository.media.clear() }
 
         repository.biometric.onBiometricUnlock = { scheduleAutoDismiss(it) }
 
@@ -146,8 +157,7 @@ constructor(
 
         applicationScope.launch {
             repository.notification.notificationRemovedFlow.collect { key ->
-                val alert = _uiState.value.notificationAlert ?: return@collect
-                if (alert.sbn.key == key) dismissNotificationAlert()
+                removeNotificationAlertByKey(key)
             }
         }
 
@@ -253,23 +263,24 @@ constructor(
                 repository.events,
                 settings.disabledEventTypes,
                 _isOnKeyguard,
-            ) { raw, _, kg ->
-                raw.filter { settings.isEventEnabled(it) } to kg
-            }.collect { (rawEvents, onKeyguard) ->
+                repository.appTracking.foregroundPackage,
+            ) { raw, _, kg, foregroundPkg ->
+                Triple(raw.filter { settings.isEventEnabled(it) }, kg, foregroundPkg)
+            }.collect { (rawEvents, onKeyguard, foregroundPkg) ->
                 if (!settings.isEnabled.value) return@collect
                 dismissedEventIds.removeAll { id -> rawEvents.none { it.id == id } }
+                // An media chi khi app so huu dang foreground.
+                // NowPlaying Quick Look khong gan owner thi khong an theo foreground.
+                val hideMediaForApp = !onKeyguard && !foregroundPkg.isNullOrEmpty()
                 val events = rawEvents.filter { e ->
                     e.id !in dismissedEventIds &&
-                        
                         !(onKeyguard && e is IslandEvent.Notification) &&
-                        
                         !(onKeyguard && e is IslandEvent.Charging) &&
-                        
                         !(onKeyguard && e is IslandEvent.AppSwitch) &&
-                        
                         !(onKeyguard && e is IslandEvent.Clipboard) &&
-
-                        !(!onKeyguard && e is IslandEvent.KeyguardIndication)
+                        !(!onKeyguard && e is IslandEvent.KeyguardIndication) &&
+                        !(hideMediaForApp && e is IslandEvent.Media &&
+                            e.packageName.isNotEmpty() && e.packageName == foregroundPkg)
                 }
 
                 val current = _uiState.value
@@ -337,8 +348,10 @@ constructor(
                         pinnedEventIndex = pinnedIndex,
                         manuallyHidden = if (shouldReset) false else current.manuallyHidden,
                         forceVisible = false,
-                        notificationAlert = current.notificationAlert,
+                        notificationAlerts = current.notificationAlerts,
+                        pinnedAlertIndex = current.pinnedAlertIndex,
                     )
+
             }
         }
     }
@@ -361,6 +374,22 @@ constructor(
         val current = _uiState.value
         if (index < 0 || index >= current.events.size) return
         _uiState.value = current.copy(pinnedEventIndex = index)
+    }
+
+    override fun pinEventById(eventId: String) {
+        val idx = _uiState.value.events.indexOfFirst { it.id == eventId }
+        if (idx >= 0) pinEventAt(idx)
+    }
+
+    override fun pinNotificationAlertByKey(key: String) {
+        val current = _uiState.value
+        val idx = current.notificationAlerts.indexOfFirst { it.sbn.key == key }
+        if (idx < 0) return
+        _uiState.value = current.copy(pinnedAlertIndex = idx)
+        // Doi the stack → top moi Expanded, khong timeout.
+        _alertCompactMode.value = false
+        notifAlertJob?.cancel()
+        notifAlertJob = null
     }
 
     override fun dismissEvent(event: IslandEvent) {
@@ -397,13 +426,14 @@ constructor(
             is IslandEvent.NowPlaying -> repository.smartspace.dismissNowPlaying()
             is IslandEvent.PromotedOngoing ->
                 repository.notification.clearPromotedOngoing(event.sbn.key)
-            is IslandEvent.Media -> repository.media.clear()
+            is IslandEvent.Media -> repository.media.clear(event.mediaKey)
             is IslandEvent.Bluetooth -> repository.connectivity.clearBluetooth()
             is IslandEvent.Hotspot -> repository.connectivity.clearHotspot()
             is IslandEvent.Charging -> repository.system.clearCharging()
             is IslandEvent.Alarm -> repository.notification.clearAlarm()
             is IslandEvent.Call -> repository.notification.clearCall(event.sbn.key)
-            is IslandEvent.Timer -> repository.notification.clearTimer()
+            is IslandEvent.Timer ->
+                repository.notification.clearTimer(event.notificationKey)
             is IslandEvent.Stopwatch -> repository.notification.clearStopwatch()
             is IslandEvent.RingerMode -> repository.system.clearRinger()
             is IslandEvent.Vpn -> repository.connectivity.clearVpn()
@@ -446,13 +476,33 @@ constructor(
 
     override fun onNotificationAlertInteractionEnd() {
         alertHeld = false
-        val current = _uiState.value
-        val alert = current.notificationAlert ?: return
-        if (alert.isActiveCall()) return
-        notifAlertJob = applicationScope.launch {
-            delay(NOTIF_ALERT_DURATION_MS)
-            dismissNotificationAlert()
+        // Chi Compact moi auto-timeout sau khi tha tay.
+        scheduleCompactAlertTimeout()
+    }
+
+    override fun onNotificationAlertCompactChanged(compact: Boolean) {
+        if (_alertCompactMode.value == compact) return
+        _alertCompactMode.value = compact
+        if (!compact) {
+            // Mo rong: huy timeout — chi an khi user dismiss.
+            notifAlertJob?.cancel()
+            notifAlertJob = null
+            return
         }
+        // Quay Compact: schedule lai neu dang hien alert.
+        if (alertHeld) return
+        scheduleCompactAlertTimeout()
+    }
+
+    private fun scheduleCompactAlertTimeout() {
+        val alert = _uiState.value.notificationAlert ?: return
+        if (alert.isActiveCall() || !_alertCompactMode.value) return
+        notifAlertJob?.cancel()
+        notifAlertJob =
+            applicationScope.launch {
+                delay(NOTIF_ALERT_DURATION_MS)
+                dismissNotificationAlert()
+            }
     }
 
     override fun onAlertReplyActiveChanged(active: Boolean) {
@@ -481,6 +531,17 @@ constructor(
         dismissNotificationAlert()
     }
 
+    /**
+     * Tap / ACTION_OUTSIDE ngoai the — chi an **top** 1 lan / debounce.
+     * Tranh 1 cu cham (clickable + OUTSIDE hoac region doi) nuot ca hang doi.
+     */
+    fun dismissNotificationAlertFromOutside() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastOutsideDismissElapsedMs < OUTSIDE_DISMISS_DEBOUNCE_MS) return
+        lastOutsideDismissElapsedMs = now
+        dismissNotificationAlert()
+    }
+
     fun dismissNotificationAlert() {
         alertHeld = false
         if (alertReplyActive) {
@@ -491,9 +552,79 @@ constructor(
         notifAlertJob?.cancel()
         notifAlertJob = null
         val current = _uiState.value
-        if (current.notificationAlert != null) {
-            _uiState.value = current.copy(notificationAlert = null)
+        val alerts = current.notificationAlerts
+        if (alerts.isEmpty()) {
+            _alertCompactMode.value = true
+            return
         }
+        val pinned = current.pinnedAlertIndex.coerceIn(0, alerts.lastIndex)
+        val remaining = alerts.toMutableList().also { it.removeAt(pinned) }
+        if (remaining.isEmpty()) {
+            _alertCompactMode.value = true
+            _uiState.value =
+                current.copy(notificationAlerts = emptyList(), pinnedAlertIndex = 0)
+            return
+        }
+        // Promote under → top Expanded, khong ep timeout.
+        val newPinned = pinned.coerceAtMost(remaining.lastIndex)
+        _alertCompactMode.value = false
+        _uiState.value =
+            current.copy(notificationAlerts = remaining, pinnedAlertIndex = newPinned)
+    }
+
+    /** Xoa dung key trong hang doi; neu xoa top → promote under. */
+    private fun removeNotificationAlertByKey(key: String) {
+        val current = _uiState.value
+        val alerts = current.notificationAlerts
+        val idx = alerts.indexOfFirst { it.sbn.key == key }
+        if (idx < 0) return
+        val wasTop = idx == current.pinnedAlertIndex.coerceIn(0, alerts.lastIndex)
+        val remaining = alerts.filter { it.sbn.key != key }
+        if (remaining.isEmpty()) {
+            alertHeld = false
+            _alertCompactMode.value = true
+            notifAlertJob?.cancel()
+            notifAlertJob = null
+            if (alertReplyActive) {
+                alertReplyActive = false
+                onFocusableRequested?.invoke(false)
+                onAlertReplyCaptureRequested?.invoke(false)
+            }
+            _uiState.value =
+                current.copy(notificationAlerts = emptyList(), pinnedAlertIndex = 0)
+            return
+        }
+        var newPinned = current.pinnedAlertIndex
+        when {
+            idx < newPinned -> newPinned--
+            idx == newPinned -> newPinned = newPinned.coerceAtMost(remaining.lastIndex)
+        }
+        _uiState.value =
+            current.copy(
+                notificationAlerts = remaining,
+                pinnedAlertIndex = newPinned.coerceIn(0, remaining.lastIndex),
+            )
+        if (wasTop) {
+            alertHeld = false
+            _alertCompactMode.value = false
+            notifAlertJob?.cancel()
+            notifAlertJob = null
+            if (alertReplyActive) {
+                alertReplyActive = false
+                onFocusableRequested?.invoke(false)
+                onAlertReplyCaptureRequested?.invoke(false)
+            }
+        }
+    }
+
+    private fun updateAlertInQueue(
+        current: IslandUiState,
+        index: Int,
+        notification: IslandEvent.Notification,
+    ) {
+        val updated = current.notificationAlerts.toMutableList()
+        updated[index] = notification
+        _uiState.value = current.copy(notificationAlerts = updated)
     }
 
     private fun shouldSuppressForDndOrRinger(notification: IslandEvent.Notification): Boolean {
@@ -513,57 +644,154 @@ constructor(
         if (panelBlocking || statusBlocking || _isOnKeyguard.value) return
         if (shouldSuppressForDndOrRinger(notification)) return
         val current = _uiState.value
-        val existingAlert = current.notificationAlert
-        if (existingAlert != null &&
-            existingAlert.isActiveCall() &&
+        val alerts = current.notificationAlerts
+        val pinnedIdx =
+            if (alerts.isEmpty()) 0
+            else current.pinnedAlertIndex.coerceIn(0, alerts.lastIndex)
+        val topAlert = alerts.getOrNull(pinnedIdx)
+        if (topAlert != null &&
+            topAlert.isActiveCall() &&
             !notification.isActiveCall()
         ) return
 
+        val sameKeyIdx = alerts.indexOfFirst { it.sbn.key == notification.sbn.key }
         val hasProgress = notification.progress >= 0 || notification.isProgressIndeterminate
-        val isSameKey = existingAlert != null && existingAlert.sbn.key == notification.sbn.key
+        val isExpandedTop = topAlert != null && !_alertCompactMode.value
 
-        if (alertHeld && existingAlert != null) {
-            if (isSameKey) _uiState.value = current.copy(notificationAlert = notification)
+        // Same-key: cap nhat dung entry, khong nhay de entry khac.
+        if (sameKeyIdx >= 0) {
+            updateAlertInQueue(current, sameKeyIdx, notification)
+            if (alertHeld) return
+            if (hasProgress) return
+            if (sameKeyIdx == pinnedIdx && _alertCompactMode.value) {
+                scheduleCompactAlertTimeout()
+            }
             return
         }
 
-        if (isSameKey && hasProgress) {
-            _uiState.value = current.copy(notificationAlert = notification)
+        if (alertHeld && topAlert != null) {
+            // Compact + dang giu: bo qua notif khac key. Expanded: append under.
+            if (isExpandedTop) {
+                _uiState.value =
+                    current.copy(notificationAlerts = alerts + notification)
+            }
             return
         }
 
+        // Call active: len top, giu cac alert khac under.
+        if (notification.isActiveCall()) {
+            notifAlertJob?.cancel()
+            notifAlertJob = null
+            _alertCompactMode.value = false
+            _uiState.value =
+                current.copy(
+                    notificationAlerts = listOf(notification) + alerts,
+                    pinnedAlertIndex = 0,
+                )
+            return
+        }
+
+        // Expanded + notif moi → append under, khong thay top, khong timeout.
+        if (isExpandedTop) {
+            notifAlertJob?.cancel()
+            notifAlertJob = null
+            _uiState.value = current.copy(notificationAlerts = alerts + notification)
+            return
+        }
+
+        // Compact / chua co alert: notif moi = top (HUN), restart timeout.
         notifAlertJob?.cancel()
-        _uiState.value = current.copy(notificationAlert = notification)
+        notifAlertJob = null
+        _alertCompactMode.value =
+            settings.compactNotifications.value && !notification.isActiveCall()
+        _uiState.value =
+            current.copy(
+                notificationAlerts = listOf(notification),
+                pinnedAlertIndex = 0,
+            )
 
         if (hasProgress) return
-
-        val duration =
-            if (!notification.isActiveCall()) NOTIF_ALERT_DURATION_MS else null
-        if (duration != null) {
-            notifAlertJob = applicationScope.launch {
-                delay(duration)
-                dismissNotificationAlert()
-            }
-        }
+        scheduleCompactAlertTimeout()
     }
 
-    override fun togglePlayPause() = repository.media.togglePlayPause()
+    override fun togglePlayPause(mediaKey: String) = repository.media.togglePlayPause(mediaKey)
 
-    override fun skipNext() = repository.media.skipNext()
+    override fun skipNext(mediaKey: String) = repository.media.skipNext(mediaKey)
 
-    override fun skipPrev() = repository.media.skipPrev()
+    override fun skipPrev(mediaKey: String) = repository.media.skipPrev(mediaKey)
 
-    override fun sendCustomAction(action: String) = repository.media.sendCustomAction(action)
+    override fun sendCustomAction(mediaKey: String, action: String) = repository.media.sendCustomAction(mediaKey, action)
 
-    override fun openMediaOutputSwitcher() = repository.media.openMediaOutputSwitcher()
+    override fun openMediaOutputSwitcher(mediaKey: String) = repository.media.openMediaOutputSwitcher(mediaKey)
 
     override fun disconnectBluetooth(address: String) = repository.connectivity.disconnectBluetooth(address)
 
     override fun openUrl(url: String) = repository.system.openUrl(url)
 
-    override fun openMediaApp() = repository.media.openMediaApp()
+    override fun openMediaApp(mediaKey: String) = repository.media.openMediaApp(mediaKey)
 
-    override fun seekTo(position: Long) = repository.media.seekTo(position)
+    override fun openChronometerApp(contentIntent: PendingIntent?, packageName: String) {
+        if (contentIntent != null) {
+            try {
+                activityStarter.postStartActivityDismissingKeyguard(contentIntent)
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to open chronometer contentIntent", e)
+            }
+        }
+        if (packageName.isEmpty()) return
+        val intent =
+            context.packageManager.getLaunchIntentForPackage(packageName) ?: return
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            activityStarter.postStartActivityDismissingKeyguard(intent, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to open chronometer package=$packageName", e)
+        }
+    }
+
+    override fun sendDeskClockTimerAction(
+        packageName: String,
+        timerId: Int,
+        pause: Boolean,
+        actionIntent: PendingIntent?,
+    ) {
+        // 1) PI Clock tao (notif 1-timer / cache) — tin cay nhat.
+        val cachedPi =
+            actionIntent
+                ?: repository.notification.getDeskClockTogglePendingIntent(timerId, pause)
+        if (cachedPi != null) {
+            try {
+                cachedPi.sendWithBal(context)
+                Log.i(TAG, "sendDeskClockTimerAction via PI pause=$pause id=$timerId")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "sendDeskClockTimerAction PI failed", e)
+            }
+        }
+        if (packageName.isEmpty() || timerId < 0) {
+            Log.w(TAG, "sendDeskClockTimerAction skip pkg=$packageName id=$timerId")
+            return
+        }
+        val action =
+            if (pause) "com.android.deskclock.action.PAUSE_TIMER"
+            else "com.android.deskclock.action.START_TIMER"
+        // 2) sendBroadcast — AMS BroadcastSkipPolicy cho SystemUI → TimerReceiver.
+        try {
+            val intent =
+                Intent(action).apply {
+                    setClassName(packageName, "com.android.deskclock.timer.TimerReceiver")
+                    putExtra("com.android.deskclock.extra.TIMER_ID", timerId)
+                    addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+                }
+            context.sendBroadcast(intent)
+            Log.i(TAG, "sendDeskClockTimerAction via sendBroadcast pause=$pause id=$timerId")
+        } catch (e: Exception) {
+            Log.w(TAG, "sendDeskClockTimerAction broadcast failed", e)
+        }
+    }
+
+    override fun seekTo(mediaKey: String, position: Long) = repository.media.seekTo(mediaKey, position)
 
     override fun setRingerMode(mode: Int) = repository.system.setRingerMode(mode)
 

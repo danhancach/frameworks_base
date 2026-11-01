@@ -3,6 +3,7 @@ package com.android.systemui.axdynamicbar.data.source
 import android.app.Notification
 import android.app.Person
 import android.content.Context
+import android.content.Intent
 import com.android.systemui.res.R
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
@@ -21,8 +22,12 @@ import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.model.RecordingState
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
+import com.android.systemui.statusbar.notification.collection.NotificationEntry
+import com.android.systemui.statusbar.notification.collection.notifcollection.CommonNotifCollection
+import com.android.systemui.statusbar.notification.collection.notifcollection.NotifCollectionListener
 import com.android.systemui.util.ScrimUtils
 import java.util.Objects
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +37,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -46,6 +52,7 @@ class NotificationIslandManager
 constructor(
     @Application private val context: Context,
     @Application private val applicationScope: CoroutineScope,
+    private val notifCollectionLazy: dagger.Lazy<CommonNotifCollection>,
 ) {
     companion object {
         private const val TAG = "NotificationIslandManager"
@@ -80,6 +87,27 @@ constructor(
             Regex("""(.+?)\s+(\d+)\s*[-–—:]\s*(\d+)\s+(.+)""")
         private val VS_PATTERN =
             Regex("""(.+?)\s+(?:vs\.?|v\.?|at)\s+(.+)""", RegexOption.IGNORE_CASE)
+        /** mm:ss hoac h:mm:ss trong text / sortKey timer notification. */
+        private val TIMER_REMAINING_PATTERN =
+            Regex("""(?<![\d:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?![\d:])""")
+        /** Google Clock MetricStyle sortKey: ⏳H:MM:SS / ⏳M:SS remaining. */
+        private val SORTKEY_REMAINING_PATTERN =
+            Regex("""[⏳⏱🕐]?(\d{1,2}):(\d{2})(?::(\d{2}))?""")
+        /** Lap stopwatch: H:MM:SS(.d)? / M:SS(.dd)? trong TEXT_LINES. */
+        private val STOPWATCH_LAP_PATTERN =
+            Regex("""(?<![\d:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?:[.,](\d{1,3}))?(?![\d:])""")
+        private const val EXTRA_TIMER_ID = "com.android.deskclock.extra.TIMER_ID"
+        private const val EXTRA_TIMER_IDS = "com.android.deskclock.extra.TIMER_IDS"
+        /** clock-app://…/timer/4/view */
+        private val TIMER_URI_ID_PATTERN = Regex("""/timer/(\d+)(?:/|$)""")
+        /** groupKey …|g:4 hoac group g:4 — khong bat so uid/prefix. */
+        private val TIMER_GROUP_ID_PATTERN = Regex("""(?:\|g:|^g:)(\d+)$""")
+        /** Prefs: TIMER_ID da thay + remaining gan nhat (survive SystemUI restart). */
+        private const val PREFS_DESKCLOCK = "axdb_deskclock_timers"
+        private const val PREFS_KNOWN_IDS = "known_ids"
+        private const val PREFS_REMAINING_PREFIX = "rem_"
+        /** Sai so khop remaining khi pause/resume / tick. */
+        private const val TIMER_REMAINING_MATCH_MS = 3_000L
 
         private const val NOW_PLAYING_PACKAGE = "com.google.android.as"
         private const val NOW_PLAYING_CHANNEL = "ambientmusic"
@@ -101,8 +129,8 @@ constructor(
         }
     }
 
-    private val _timerEvent = MutableStateFlow<IslandEvent.Timer?>(null)
-    val timerEvent: StateFlow<IslandEvent.Timer?> = _timerEvent.asStateFlow()
+    private val _timerEvents = MutableStateFlow<List<IslandEvent.Timer>>(emptyList())
+    val timerEvents: StateFlow<List<IslandEvent.Timer>> = _timerEvents.asStateFlow()
 
     private val _stopwatchEvent = MutableStateFlow<IslandEvent.Stopwatch?>(null)
     val stopwatchEvent: StateFlow<IslandEvent.Stopwatch?> = _stopwatchEvent.asStateFlow()
@@ -145,8 +173,6 @@ constructor(
     private var recorderGraceJob: Job? = null
     private var recording: IslandEvent.AudioRecording? = null
     private var recordingDismissed = false
-    private var lastTimer: IslandEvent.Timer? = null
-    private var timerDismissedKey: String? = null
     private var stopwatchDismissedKey: String? = null
     private val dismissedPromotedKeys = mutableSetOf<String>()
     private val dismissedSportsKeys = mutableSetOf<String>()
@@ -155,7 +181,7 @@ constructor(
     val notificationFlow = MutableSharedFlow<IslandEvent.Notification>(extraBufferCapacity = 16)
     val notificationRemovedFlow = MutableSharedFlow<String>(extraBufferCapacity = 16)
 
-    var activeMediaPackageProvider: (() -> String?)? = null
+    var activeMediaPackageProvider: (() -> Set<String>)? = null
 
     private val seenSignatures = mutableMapOf<String, Long>()
 
@@ -164,23 +190,51 @@ constructor(
     var onNotificationPosted: ((IslandEvent.Notification) -> Unit)? = null
 
     @Volatile private var listening = false
-    @Volatile private var timerJob: Job? = null
-
-    private var timerNotificationKey: String? = null
-    private var timerOriginalDurationMs: Long = 0L
+    /** Job het han theo tung notification key. */
+    private val timerJobs = mutableMapOf<String, Job>()
+    /** originalDurationMs theo key — giu khi update cung timer. */
+    private val timerOriginalDurations = mutableMapOf<String, Long>()
+    /** TIMER_ID da thay theo notification key (giu khi doi 1→nhieu timer). */
+    private val deskClockTimerIdsByNotif = mutableMapOf<String, LinkedHashSet<Int>>()
+    /**
+     * Remaining ms gan nhat theo TIMER_ID — khop metric khi thu tu metrics doi
+     * (critical / dang chay len dau) sau Pause→Resume.
+     */
+    private val deskClockLastRemainingById = ConcurrentHashMap<Int, Long>()
+    /**
+     * PendingIntent PAUSE/START do Clock tao theo TIMER_ID — giu khi notif doi sang multi
+     * (chi con RESET nhom). SystemUI khong tu tao PI cho receiver exported=false.
+     */
+    private val deskClockPausePiById = ConcurrentHashMap<Int, android.app.PendingIntent>()
+    private val deskClockStartPiById = ConcurrentHashMap<Int, android.app.PendingIntent>()
     private var stopwatchNotificationKey: String? = null
+    private val deskClockPrefs by lazy {
+        context.getSharedPreferences(PREFS_DESKCLOCK, Context.MODE_PRIVATE)
+    }
+
+    /** Bo nho dem SBN theo notification key de the mo rong co the inflate layout goc. */
+    private val activeSbns = ConcurrentHashMap<String, StatusBarNotification>()
+    private val _activeNotifications = MutableStateFlow<Map<String, StatusBarNotification>>(emptyMap())
+    val activeNotifications: StateFlow<Map<String, StatusBarNotification>> = _activeNotifications.asStateFlow()
+
+    fun getSbn(key: String): StatusBarNotification? {
+        return try {
+            notifCollectionLazy.get().getEntry(key)?.sbn ?: activeSbns[key]
+        } catch (_: Exception) {
+            activeSbns[key]
+        }
+    }
 
     private val scrimListener =
         object : ScrimUtils.ScrimEventListener {
             override fun onNotificationRemoved(sbn: StatusBarNotification) {
+                activeSbns.remove(sbn.key)
+                _activeNotifications.update { it - sbn.key }
                 val pkg = sbn.packageName ?: return
                 seenSignatures.remove(sbn.key)
 
-                if (sbn.key == timerNotificationKey) {
-                    timerNotificationKey = null
-                    timerJob?.cancel()
-                    timerJob = null
-                    resetTimerState()
+                if (_timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbn.key) }) {
+                    removeTimersForNotificationKey(sbn.key)
                 }
                 if (sbn.key == stopwatchNotificationKey) {
                     stopwatchNotificationKey = null
@@ -234,10 +288,16 @@ constructor(
             }
 
             override fun onNotificationPosted(sbn: StatusBarNotification) {
+                activeSbns[sbn.key] = sbn
+                _activeNotifications.update { it + (sbn.key to sbn) }
                 val pkg = sbn.packageName ?: return
                 val extras = sbn.notification?.extras ?: return
 
                 if (pkg in CLOCK_PACKAGES) {
+                    // Autogroup summary (Timers+Stopwatch) channel=Timers — khong tao timer gia.
+                    val clockFlags = sbn.notification?.flags ?: 0
+                    if (clockFlags and Notification.FLAG_GROUP_SUMMARY != 0) return
+
                     val channelId = sbn.notification?.channelId?.lowercase() ?: ""
                     val actionLabels =
                         sbn.notification?.actions?.map { it.title?.toString()?.lowercase() ?: "" }
@@ -246,20 +306,16 @@ constructor(
                         sbn.notification?.actions?.map { actionIntentString(it) ?: "" }
                             ?: emptyList()
                     val hasStopwatchIntent = actionIntents.any {
-                        it == DeskClockActions.START_STOPWATCH ||
-                            it == DeskClockActions.PAUSE_STOPWATCH ||
-                            it == DeskClockActions.RESET_STOPWATCH ||
-                            it == DeskClockActions.LAP_STOPWATCH ||
-                            it == DeskClockActions.SHOW_STOPWATCH
+                        DeskClockActions.isStopwatchAction(it)
                     }
                     val hasTimerIntent = actionIntents.any {
-                        it == DeskClockActions.START_TIMER ||
-                            it == DeskClockActions.PAUSE_TIMER ||
-                            it == DeskClockActions.RESET_TIMER ||
-                            it == DeskClockActions.ADD_MINUTE_TIMER ||
-                            it == DeskClockActions.SHOW_TIMER
+                        DeskClockActions.isTimerAction(it)
                     }
-                    val hasLap = actionLabels.any { it.contains("lap") }
+                    // EN + VI: Lap / Vòng — PendingIntent action thuong null tren Clock moi
+                    val hasLap =
+                        actionLabels.any {
+                            it.contains("lap") || it.contains("vòng") || it.contains("vong")
+                        }
                     val isCountDown = extras.getBoolean("android.chronometerCountDown", false)
 
                     val isStopwatch = hasStopwatchIntent || channelId.contains("stopwatch") || hasLap
@@ -452,7 +508,7 @@ constructor(
                 val category = sbn.notification?.category
                 if (category == Notification.CATEGORY_TRANSPORT) return
                 if (category == Notification.CATEGORY_SERVICE && !hasProgress) return
-                if (sbn.packageName == activeMediaPackageProvider?.invoke()) return
+                if (sbn.packageName in activeMediaPackageProvider?.invoke().orEmpty()) return
 
                 val notifFlags = sbn.notification?.flags ?: 0
                 if (notifFlags and Notification.FLAG_GROUP_SUMMARY != 0) return
@@ -624,21 +680,56 @@ constructor(
             }
         }
 
+    private val notifCollectionListener =
+        object : NotifCollectionListener {
+            override fun onEntryAdded(entry: NotificationEntry) {
+                entry.sbn?.let { scrimListener.onNotificationPosted(it) }
+            }
+
+            override fun onEntryUpdated(entry: NotificationEntry) {
+                entry.sbn?.let { scrimListener.onNotificationPosted(it) }
+            }
+
+            override fun onEntryRemoved(entry: NotificationEntry, reason: Int) {
+                entry.sbn?.let { scrimListener.onNotificationRemoved(it) }
+            }
+        }
+
     fun startListening() {
         if (listening) return
         listening = true
         ScrimUtils.get().addListener(scrimListener)
+        applicationScope.launch(Dispatchers.Main) {
+            try {
+                val collection = notifCollectionLazy.get()
+                collection.addCollectionListener(notifCollectionListener)
+                collection.allNotifs.forEach { entry ->
+                    entry.sbn?.let { scrimListener.onNotificationPosted(it) }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Loi khi dang ky collection listener hoac replay thong bao", e)
+            }
+        }
     }
 
     fun stopListening() {
         if (!listening) return
         listening = false
         ScrimUtils.get().removeListener(scrimListener)
+        applicationScope.launch(Dispatchers.Main) {
+            try {
+                notifCollectionLazy.get().removeCollectionListener(notifCollectionListener)
+            } catch (e: Exception) {
+                Log.w(TAG, "Loi khi huy collection listener", e)
+            }
+        }
         seenSignatures.clear()
-        timerJob?.cancel()
-        timerJob = null
-        timerNotificationKey = null
-        resetTimerState()
+        activeSbns.clear()
+        _activeNotifications.value = emptyMap()
+        timerJobs.values.forEach { it.cancel() }
+        timerJobs.clear()
+        timerOriginalDurations.clear()
+        _timerEvents.value = emptyList()
         stopwatchNotificationKey = null
         stopwatchDismissedKey = null
         _stopwatchEvent.value = null
@@ -688,16 +779,45 @@ constructor(
         _audioRecordingEvent.value = if (recordingDismissed) null else event
     }
 
-    fun clearTimer() {
-        timerDismissedKey = timerNotificationKey
-        _timerEvent.value = null
+    fun clearTimer(notificationKey: String? = null) {
+        if (notificationKey.isNullOrEmpty()) {
+            timerJobs.values.forEach { it.cancel() }
+            timerJobs.clear()
+            timerOriginalDurations.clear()
+            _timerEvents.value = emptyList()
+        } else {
+            removeTimer(notificationKey)
+        }
     }
 
-    private fun resetTimerState() {
-        timerDismissedKey = null
-        lastTimer = null
-        timerOriginalDurationMs = 0L
-        _timerEvent.value = null
+    private fun isTimerKeyForNotification(timerKey: String, notificationKey: String): Boolean =
+        timerKey == notificationKey || timerKey.startsWith("$notificationKey#")
+
+    private fun cancelTimerJobsForNotificationKey(
+        notificationKey: String,
+        clearDurations: Boolean = true,
+    ) {
+        timerJobs.keys
+            .filter { isTimerKeyForNotification(it, notificationKey) }
+            .forEach { k ->
+                timerJobs.remove(k)?.cancel()
+                if (clearDurations) timerOriginalDurations.remove(k)
+            }
+    }
+
+    private fun removeTimersForNotificationKey(
+        notificationKey: String,
+        clearDurations: Boolean = true,
+    ) {
+        cancelTimerJobsForNotificationKey(notificationKey, clearDurations)
+        _timerEvents.value =
+            _timerEvents.value.filter { !isTimerKeyForNotification(it.notificationKey, notificationKey) }
+    }
+
+    private fun removeTimer(notificationKey: String) {
+        timerJobs.remove(notificationKey)?.cancel()
+        timerOriginalDurations.remove(notificationKey)
+        _timerEvents.value = _timerEvents.value.filter { it.notificationKey != notificationKey }
     }
 
     fun clearStopwatch() {
@@ -713,87 +833,894 @@ constructor(
         _callEvents.value = _callEvents.value.filter { it.sbn.key != key }
     }
 
+    /**
+     * Chronometer trong android.metrics (TYPE_TIME_DIFFERENCE).
+     * countDown=true → wallAnchorMs = end (timer); false → wallAnchorMs = start (stopwatch).
+     */
+    private data class ParsedChronometerMetric(
+        val label: String,
+        val countDown: Boolean,
+        val wallAnchorMs: Long,
+        val isPaused: Boolean,
+        /** pausedDuration goc (ms): timer = remaining; stopwatch = elapsed — dong bang UI. */
+        val frozenDurationMs: Long = 0L,
+        /** zeroElapsedRealtime goc (timer = end ER; stopwatch = start ER). 0 = khong co. */
+        val elapsedAnchorMs: Long = 0L,
+    )
+
+    /** Doc title/text an toan — Clock dung SpannableString, getString() tra null + log Bundle. */
+    private fun extrasCharSequence(extras: Bundle, key: String): String? =
+        extras.getCharSequence(key)?.toString()?.takeIf { it.isNotBlank() }
+
     private fun handleTimer(
         sbn: StatusBarNotification,
         extras: Bundle,
         actionLabels: List<String> = emptyList(),
         actionIntents: List<String> = emptyList(),
     ) {
-        val label = extras.getString("android.title") ?: context.getString(R.string.ax_dynamic_bar_timer)
+        val defaultLabel =
+            extrasCharSequence(extras, Notification.EXTRA_TITLE)
+                ?: context.getString(R.string.ax_dynamic_bar_timer)
         val icon =
             try {
-                context.packageManager.getApplicationIcon(sbn.packageName)
+                sbn.notification.smallIcon?.loadDrawable(context)
+                    ?: context.packageManager.getApplicationIcon(sbn.packageName)
             } catch (_: Exception) {
                 null
             }
+        val notifPaused = detectTimerPausedFromActions(actionLabels, actionIntents)
+        val rawActions = extractNotificationActions(sbn)
+        // Cache PI PAUSE/START truoc khi loc (multi mat action tung timer).
+        cacheDeskClockTogglePendingIntents(rawActions)
+        // Bo action nhom ("Dat lai ca hai…") — moi the chi 1 timer, khong hien nut cho ca nhom.
+        val actions = rawActions.filterNot { isSharedMultiTimerAction(it.label) }
+        val key = sbn.key
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val metrics =
+            parseChronometerMetricsFromExtras(extras, nowWall, nowElapsed).filter { it.countDown }
+        // Giu endTime/duration cu truoc khi cap nhat (tranh nhap nhay bo nho).
+        val existing =
+            _timerEvents.value.find { isTimerKeyForNotification(it.notificationKey, key) }
 
-        val hasPauseIntent = actionIntents.any { it == DeskClockActions.PAUSE_TIMER }
-        val hasStartIntent = actionIntents.any { it == DeskClockActions.START_TIMER }
-        val isPaused = when {
-            hasStartIntent -> true
-            hasPauseIntent -> false
-            else -> {
-                val hasPauseLabel = actionLabels.any { it.contains("pause") }
-                val hasResumeLabel = actionLabels.any {
-                    it.contains("resume") || it.contains("play") ||
-                        (it.contains("start") && !it.contains("stop"))
+        cancelTimerJobsForNotificationKey(key, clearDurations = false)
+
+        val contentIntent = sbn.notification?.contentIntent
+        val packageName = sbn.packageName.orEmpty()
+        val currentList = _timerEvents.value
+        val firstIdx = currentList.indexOfFirst { isTimerKeyForNotification(it.notificationKey, key) }
+        val remaining = currentList.filter { !isTimerKeyForNotification(it.notificationKey, key) }
+        val extractedIds = extractDeskClockTimerIds(sbn)
+        val idCache = deskClockTimerIdsByNotif.getOrPut(key) { linkedSetOf() }
+        extractedIds.forEach { idCache.add(it) }
+        rememberDeskClockTimerIds(extractedIds)
+        currentList
+            .filter { isTimerKeyForNotification(it.notificationKey, key) }
+            .map { it.deskClockTimerId }
+            .filter { it >= 0 }
+            .forEach { idCache.add(it) }
+        // Nap rem_* tu prefs cho fingerprint (khong do known_ids vao pool idCache).
+        loadPersistedDeskClockRemainings()
+        val criticalIndex =
+            extras.getInt("android.metrics.criticalIndex", 0).let { raw ->
+                if (metrics.isEmpty()) 0 else raw.coerceIn(0, metrics.lastIndex)
+            }
+
+        if (metrics.isNotEmpty()) {
+            val useSplitKeys = metrics.size > 1
+            // Multi: groupKey "g:4" khong phai TIMER_ID — chi lay id tu URI/extra.
+            val idsForResolve =
+                if (metrics.size > 1) {
+                    extractedIds.filter { it >= 0 }.distinct()
+                } else {
+                    extractedIds
                 }
-                hasResumeLabel || (actionLabels.isNotEmpty() && !hasPauseLabel)
+            val existingForKey =
+                currentList.filter { isTimerKeyForNotification(it.notificationKey, key) }
+            // Seed remaining tu event hien co (truoc khi remap).
+            existingForKey.forEach { ev ->
+                val id = ev.deskClockTimerId
+                if (id < 0) return@forEach
+                val rem = eventRemainingMs(ev, nowWall)
+                if (rem > 0L) deskClockLastRemainingById[id] = rem
             }
+            val assignedIds =
+                assignDeskClockTimerIds(
+                    metrics = metrics,
+                    criticalIndex = criticalIndex,
+                    extractedIds = idsForResolve,
+                    cachedIds = idCache.toList(),
+                    existingForKey = existingForKey,
+                    notifKey = key,
+                    useSplitKeys = useSplitKeys,
+                    nowWall = nowWall,
+                    nowElapsed = nowElapsed,
+                )
+            assignedIds.filter { it >= 0 }.forEach { idCache.add(it) }
+            rememberDeskClockTimerIds(assignedIds)
+            pruneDeskClockRemainings(assignedIds)
+            val newEvents =
+                metrics.mapIndexed { index, metric ->
+                    val timerKey = if (useSplitKeys) "$key#$index" else key
+                    val deskClockTimerId = assignedIds.getOrElse(index) { -1 }
+                    val rem = metricRemainingMs(metric, nowWall, nowElapsed)
+                    if (deskClockTimerId >= 0 && rem > 0L) {
+                        deskClockLastRemainingById[deskClockTimerId] = rem
+                        persistDeskClockRemaining(deskClockTimerId, rem)
+                    }
+                    upsertTimerEvent(
+                        timerKey = timerKey,
+                        label = metric.label.ifEmpty { defaultLabel },
+                        endTimeMs = metric.wallAnchorMs,
+                        isPaused = metric.isPaused || notifPaused,
+                        pausedRemainingMs = metric.frozenDurationMs,
+                        endElapsedRealtimeMs =
+                            if (metric.isPaused || notifPaused) 0L else metric.elapsedAnchorMs,
+                        appIcon = icon,
+                        actions = actions,
+                        contentIntent = contentIntent,
+                        packageName = packageName,
+                        sbn = sbn,
+                        deskClockTimerId = deskClockTimerId,
+                        pausePendingIntent = deskClockPausePiById[deskClockTimerId],
+                        startPendingIntent = deskClockStartPiById[deskClockTimerId],
+                    )
+                }
+            val insertAt = if (firstIdx >= 0) firstIdx.coerceAtMost(remaining.size) else 0
+            _timerEvents.value = remaining.take(insertAt) + newEvents + remaining.drop(insertAt)
+            newEvents.forEach {
+                Log.i(
+                    TAG,
+                    "handleTimer metrics label=${it.label} endTimeMs=${it.endTimeMs} " +
+                        "paused=${it.isPaused} timerId=${it.deskClockTimerId}",
+                )
+                onTimerEvent?.invoke(it)
+            }
+            return
         }
 
-        var endTimeMs = sbn.notification.`when`
-        if (endTimeMs <= System.currentTimeMillis()) {
-            val chronoBase = extractChronometerBase(sbn)
-            if (chronoBase > 0L) {
-                val remaining = chronoBase - SystemClock.elapsedRealtime()
-                endTimeMs = if (remaining > 0L) System.currentTimeMillis() + remaining else 0L
-            } else {
-                endTimeMs = 0L
-            }
+        // Fallback: notification khong co android.metrics (DeskClock cu / app khac)
+        var endTimeMs = resolveTimerEndTimeMs(sbn, extras)
+        if (endTimeMs <= 0L && existing != null && existing.endTimeMs > nowWall) {
+            endTimeMs = existing.endTimeMs
         }
-
-        if (isPaused && endTimeMs > System.currentTimeMillis()) {
-            val existing = lastTimer
-            if (existing != null && existing.endTimeMs > 0L) {
-                endTimeMs = existing.endTimeMs
-            }
-        }
-
-        val actions = extractNotificationActions(sbn)
-        val isNewTimer = timerNotificationKey != sbn.key
-        if (isNewTimer && endTimeMs > 0L) {
-            timerOriginalDurationMs = (endTimeMs - System.currentTimeMillis()).coerceAtLeast(1000L)
-        }
+        val fallbackId =
+            extractedIds.firstOrNull()
+                ?: existing?.deskClockTimerId?.takeIf { it >= 0 }
+                ?: -1
+        if (fallbackId >= 0) idCache.add(fallbackId)
         val event =
-            IslandEvent.Timer(
-                label = label,
+            upsertTimerEvent(
+                timerKey = key,
+                label = defaultLabel,
                 endTimeMs = endTimeMs,
-                originalDurationMs = timerOriginalDurationMs,
+                isPaused = notifPaused,
                 appIcon = icon,
-                isPaused = isPaused,
                 actions = actions,
+                contentIntent = contentIntent,
+                packageName = packageName,
+                sbn = sbn,
+                deskClockTimerId = fallbackId,
+                pausePendingIntent = deskClockPausePiById[fallbackId],
+                startPendingIntent = deskClockStartPiById[fallbackId],
             )
-        timerNotificationKey = sbn.key
-        lastTimer = event
-        val isFiring = sbn.notification?.channelId?.contains("firing", ignoreCase = true) == true
-        if (isFiring) timerDismissedKey = null
-        if (sbn.key != timerDismissedKey) {
-            _timerEvent.value = event
-            onTimerEvent?.invoke(event)
+        val insertAt = if (firstIdx >= 0) firstIdx.coerceAtMost(remaining.size) else 0
+        _timerEvents.value = remaining.take(insertAt) + listOf(event) + remaining.drop(insertAt)
+        Log.i(
+            TAG,
+            "handleTimer fallback label=${event.label} endTimeMs=${event.endTimeMs} paused=${event.isPaused}",
+        )
+        onTimerEvent?.invoke(event)
+    }
+
+    /**
+     * Google Clock MetricStyle: android.metrics TYPE_TIME_DIFFERENCE (chronometer).
+     * countDown=true (timer): wallAnchor = end. countDown=false (stopwatch): wallAnchor = start.
+     * Thu tu: pausedDuration → zeroTime → zeroElapsedRealtime.
+     */
+    private fun parseChronometerMetricsFromExtras(
+        extras: Bundle,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): List<ParsedChronometerMetric> {
+        val bundles =
+            try {
+                extras.getParcelableArrayList("android.metrics", Bundle::class.java)
+            } catch (_: Exception) {
+                @Suppress("DEPRECATION")
+                extras.getParcelableArrayList<Bundle>("android.metrics")
+            } ?: return emptyList()
+
+        val result = mutableListOf<ParsedChronometerMetric>()
+        for (metricBundle in bundles) {
+            val value = metricBundle?.getBundle("value") ?: continue
+            if (value.getInt("_type", -1) != 1) continue
+
+            val countDown = value.getBoolean("countDown", false)
+            val metricLabel = metricBundle.getCharSequence("label")?.toString().orEmpty()
+            var wallAnchorMs = 0L
+            var isPaused = false
+            var frozenDurationMs = 0L
+            var elapsedAnchorMs = 0L
+
+            if (value.containsKey("pausedDuration")) {
+                val duration = value.getLong("pausedDuration")
+                if (countDown) {
+                    // Timer paused: remaining dong bang (Chronometer.Paused)
+                    if (duration > 0L) {
+                        wallAnchorMs = nowWall + duration
+                        isPaused = true
+                        frozenDurationMs = duration
+                    }
+                } else {
+                    // Stopwatch paused: elapsed dong bang
+                    if (duration >= 0L) {
+                        wallAnchorMs = nowWall - duration
+                        isPaused = true
+                        frozenDurationMs = duration
+                    }
+                }
+            }
+            if (wallAnchorMs <= 0L && value.containsKey("zeroTime")) {
+                val zero = value.getLong("zeroTime")
+                if (zero > 0L) wallAnchorMs = zero
+            }
+            if (!isPaused && value.containsKey("zeroElapsedRealtime")) {
+                val zeroER = value.getLong("zeroElapsedRealtime")
+                elapsedAnchorMs = zeroER
+                if (countDown) {
+                    // Timer: zeroER = thoi diem het gio (elapsedRealtime)
+                    val remaining = zeroER - nowElapsed
+                    if (remaining > 0L || wallAnchorMs <= 0L) {
+                        wallAnchorMs = nowWall + remaining.coerceAtLeast(0L)
+                    }
+                } else {
+                    // Stopwatch: zeroER = moc bat dau (co the am sau reboot)
+                    val elapsed = (nowElapsed - zeroER).coerceAtLeast(0L)
+                    if (wallAnchorMs <= 0L) wallAnchorMs = nowWall - elapsed
+                }
+            }
+            if (wallAnchorMs > 0L || frozenDurationMs > 0L || elapsedAnchorMs != 0L) {
+                result.add(
+                    ParsedChronometerMetric(
+                        metricLabel,
+                        countDown,
+                        wallAnchorMs,
+                        isPaused,
+                        frozenDurationMs,
+                        elapsedAnchorMs,
+                    ),
+                )
+            }
+        }
+        return result
+    }
+
+    private fun detectTimerPausedFromActions(
+        actionLabels: List<String>,
+        actionIntents: List<String>,
+    ): Boolean {
+        val hasPauseIntent = actionIntents.any { DeskClockActions.matches(it, "PAUSE_TIMER") }
+        val hasStartIntent = actionIntents.any { DeskClockActions.matches(it, "START_TIMER") }
+        val hasAddMinuteIntent = actionIntents.any { DeskClockActions.matches(it, "ADD_MINUTE_TIMER") }
+        return when {
+            hasStartIntent -> true
+            hasPauseIntent || hasAddMinuteIntent -> false
+            actionLabels.any {
+                it.contains("+1") || it.contains("add") || it.contains("+ 1")
+            } -> false
+            else ->
+                actionLabels.any {
+                    it.contains("resume") ||
+                        (it.contains("play") && !it.contains("display")) ||
+                        it.contains("tiếp") ||
+                        it.contains("tiep") ||
+                        (it.contains("start") &&
+                            !it.contains("stop") &&
+                            !it.contains("reset") &&
+                            !it.contains("đặt") &&
+                            !it.contains("dat"))
+                }
+        }
+    }
+
+    private fun upsertTimerEvent(
+        timerKey: String,
+        label: String,
+        endTimeMs: Long,
+        isPaused: Boolean,
+        pausedRemainingMs: Long = 0L,
+        endElapsedRealtimeMs: Long = 0L,
+        appIcon: Drawable?,
+        actions: List<IslandEvent.NotificationAction>,
+        contentIntent: android.app.PendingIntent? = null,
+        packageName: String = "",
+        sbn: StatusBarNotification? = null,
+        deskClockTimerId: Int = -1,
+        pausePendingIntent: android.app.PendingIntent? = null,
+        startPendingIntent: android.app.PendingIntent? = null,
+    ): IslandEvent.Timer {
+        val existing = _timerEvents.value.find { it.notificationKey == timerKey }
+        val nowMs = System.currentTimeMillis()
+        val nowEr = SystemClock.elapsedRealtime()
+        val originalDurationMs =
+            when {
+                existing != null && existing.originalDurationMs > 0L -> existing.originalDurationMs
+                timerOriginalDurations[timerKey] != null -> timerOriginalDurations[timerKey]!!
+                endTimeMs > 0L ->
+                    (endTimeMs - nowMs).coerceAtLeast(1000L).also {
+                        timerOriginalDurations[timerKey] = it
+                    }
+                else -> timerOriginalDurations[timerKey] ?: 0L
+            }
+        if (originalDurationMs > 0L) {
+            timerOriginalDurations[timerKey] = originalDurationMs
         }
 
-        timerJob?.cancel()
-        if (endTimeMs > 0L && !isPaused) {
-            val remainingMs = endTimeMs - System.currentTimeMillis()
-            timerJob =
-                applicationScope.launch {
-                    delay((remainingMs + 3_000L).coerceAtLeast(3_000L))
-                    // Expired: the dismissal ends with this run of the timer.
-                    timerDismissedKey = null
-                    lastTimer = null
-                    _timerEvent.value = null
+        // Dong bang remaining khi paused — tranh UI tru wall-clock khi doi pill / recomposition.
+        val frozenRemaining =
+            when {
+                !isPaused -> 0L
+                pausedRemainingMs > 0L -> pausedRemainingMs
+                existing?.isPaused == true && existing.pausedRemainingMs > 0L ->
+                    existing.pausedRemainingMs
+                endElapsedRealtimeMs > 0L -> (endElapsedRealtimeMs - nowEr).coerceAtLeast(0L)
+                endTimeMs > 0L -> (endTimeMs - nowMs).coerceAtLeast(0L)
+                else -> 0L
+            }
+        val endEr = if (isPaused) 0L else endElapsedRealtimeMs
+
+        timerJobs.remove(timerKey)?.cancel()
+        if (!isPaused) {
+            val remainingMs =
+                when {
+                    endEr > 0L -> endEr - nowEr
+                    endTimeMs > 0L -> endTimeMs - nowMs
+                    else -> 0L
                 }
+            if (remainingMs > 0L) {
+                timerJobs[timerKey] =
+                    applicationScope.launch {
+                        delay((remainingMs + 3_000L).coerceAtLeast(3_000L))
+                        removeTimer(timerKey)
+                    }
+            }
+        }
+
+        val resolvedId =
+            when {
+                deskClockTimerId >= 0 -> deskClockTimerId
+                existing?.deskClockTimerId != null && existing.deskClockTimerId >= 0 ->
+                    existing.deskClockTimerId
+                else -> -1
+            }
+        val pausePi =
+            pausePendingIntent
+                ?: (if (resolvedId >= 0) deskClockPausePiById[resolvedId] else null)
+                ?: existing?.pausePendingIntent
+        val startPi =
+            startPendingIntent
+                ?: (if (resolvedId >= 0) deskClockStartPiById[resolvedId] else null)
+                ?: existing?.startPendingIntent
+        return IslandEvent.Timer(
+            label = label,
+            endTimeMs = endTimeMs,
+            originalDurationMs = originalDurationMs,
+            appIcon = appIcon,
+            isPaused = isPaused,
+            pausedRemainingMs = frozenRemaining,
+            endElapsedRealtimeMs = endEr,
+            actions = actions,
+            notificationKey = timerKey,
+            contentIntent = contentIntent,
+            packageName = packageName,
+            sbn = sbn,
+            deskClockTimerId = resolvedId,
+            pausePendingIntent = pausePi,
+            startPendingIntent = startPi,
+        )
+    }
+
+    /** Luu PI PAUSE/START + TIMER_ID tu action notif (truoc khi loc action nhom). */
+    private fun cacheDeskClockTogglePendingIntents(
+        rawActions: List<IslandEvent.NotificationAction>,
+    ) {
+        for (na in rawActions) {
+            val pi = na.action.actionIntent ?: continue
+            val intent =
+                try {
+                    pi.intent
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+            val id =
+                try {
+                    intent.getIntExtra(EXTRA_TIMER_ID, -1)
+                } catch (_: Exception) {
+                    -1
+                }
+            if (id < 0) continue
+            rememberDeskClockTimerIds(listOf(id))
+            val act = intent.action.orEmpty()
+            when {
+                DeskClockActions.matches(act, "PAUSE_TIMER") -> deskClockPausePiById[id] = pi
+                DeskClockActions.matches(act, "START_TIMER") -> deskClockStartPiById[id] = pi
+            }
+        }
+    }
+
+    /**
+     * PI Clock tao (tu notif 1-timer) — dung khi the multi khong con action Pause/Play.
+     * Khong xoa khi notif doi sang multi; chi mat khi SystemUI chet.
+     */
+    fun getDeskClockTogglePendingIntent(timerId: Int, pause: Boolean): android.app.PendingIntent? {
+        if (timerId < 0) return null
+        return if (pause) deskClockPausePiById[timerId] else deskClockStartPiById[timerId]
+    }
+
+    /**
+     * Lay TIMER_ID / TIMER_IDS tu contentIntent (URI clock-app://…/timer/N), action, groupKey.
+     * Multi-timer Clock chi gui RESET_UNEXPIRED — can id de tong hop PAUSE/START.
+     */
+    private fun extractDeskClockTimerIds(sbn: StatusBarNotification): List<Int> {
+        val ids = linkedSetOf<Int>()
+        fun absorb(intent: Intent?) {
+            if (intent == null) return
+            try {
+                intent.getIntArrayExtra(EXTRA_TIMER_IDS)?.forEach { if (it >= 0) ids.add(it) }
+            } catch (_: Exception) {}
+            try {
+                val one = intent.getIntExtra(EXTRA_TIMER_ID, -1)
+                if (one >= 0) ids.add(one)
+            } catch (_: Exception) {}
+            try {
+                val uri = intent.data?.toString().orEmpty()
+                TIMER_URI_ID_PATTERN.findAll(uri).forEach { m ->
+                    m.groupValues.getOrNull(1)?.toIntOrNull()?.takeIf { it >= 0 }?.let { ids.add(it) }
+                }
+            } catch (_: Exception) {}
+        }
+        try {
+            absorb(sbn.notification?.contentIntent?.intent)
+        } catch (_: Exception) {}
+        try {
+            absorb(sbn.notification?.deleteIntent?.intent)
+        } catch (_: Exception) {}
+        sbn.notification?.actions?.forEach { action ->
+            try {
+                absorb(action.actionIntent?.intent)
+            } catch (_: Exception) {}
+        }
+        // Chi dung group/g:N khi 1 metric — multi Clock dung group "4" chung, khong phai TIMER_ID.
+        val metricCount =
+            try {
+                sbn.notification
+                    ?.extras
+                    ?.getParcelableArrayList<Bundle>("android.metrics")
+                    ?.size
+                    ?: 0
+            } catch (_: Exception) {
+                0
+            }
+        if (metricCount <= 1) {
+            val group = sbn.notification?.group.orEmpty()
+            group.toIntOrNull()?.takeIf { it >= 0 }?.let { ids.add(it) }
+            listOf(group, sbn.groupKey.orEmpty()).forEach { g ->
+                TIMER_GROUP_ID_PATTERN.findAll(g).forEach { m ->
+                    m.groupValues
+                        .getOrNull(1)
+                        ?.toIntOrNull()
+                        ?.takeIf { it >= 0 }
+                        ?.let { ids.add(it) }
+                }
+            }
+        }
+        return ids.toList()
+    }
+
+    /** Remaining dong nhat (pausedDuration hoac end−now) — dung de khop id khi reorder. */
+    private fun metricRemainingMs(
+        metric: ParsedChronometerMetric,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): Long {
+        if (metric.isPaused) return metric.frozenDurationMs.coerceAtLeast(0L)
+        if (metric.elapsedAnchorMs > 0L) {
+            return (metric.elapsedAnchorMs - nowElapsed).coerceAtLeast(0L)
+        }
+        if (metric.wallAnchorMs > 0L) {
+            return (metric.wallAnchorMs - nowWall).coerceAtLeast(0L)
+        }
+        return 0L
+    }
+
+    private fun eventRemainingMs(ev: IslandEvent.Timer, nowWall: Long): Long {
+        if (ev.isPaused) return ev.pausedRemainingMs.coerceAtLeast(0L)
+        if (ev.endElapsedRealtimeMs > 0L) {
+            return (ev.endElapsedRealtimeMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+        if (ev.endTimeMs > 0L) return (ev.endTimeMs - nowWall).coerceAtLeast(0L)
+        return 0L
+    }
+
+    private fun loadPersistedDeskClockIds(): List<Int> {
+        val raw = deskClockPrefs.getString(PREFS_KNOWN_IDS, "").orEmpty()
+        if (raw.isEmpty()) return emptyList()
+        return raw.split(',').mapNotNull { it.trim().toIntOrNull()?.takeIf { id -> id >= 0 } }
+    }
+
+    /** Chi nap rem_* — dung cho fingerprint; khong dua id lich su vao pool gan. */
+    private fun loadPersistedDeskClockRemainings() {
+        val all = deskClockPrefs.all ?: return
+        for ((key, value) in all) {
+            if (!key.startsWith(PREFS_REMAINING_PREFIX)) continue
+            val id = key.removePrefix(PREFS_REMAINING_PREFIX).toIntOrNull() ?: continue
+            val rem = (value as? Long) ?: continue
+            if (id >= 0 && rem > 0L) deskClockLastRemainingById.putIfAbsent(id, rem)
+        }
+    }
+
+    private fun rememberDeskClockTimerIds(ids: Iterable<Int>) {
+        val valid = ids.filter { it >= 0 }.distinct()
+        if (valid.isEmpty()) return
+        // Giu biet id da thay (debug / fingerprint nap rem) — pool gan khong dung list nay.
+        val merged = (loadPersistedDeskClockIds() + valid).distinct()
+        deskClockPrefs.edit().putString(PREFS_KNOWN_IDS, merged.joinToString(",")).apply()
+        for (id in valid) {
+            if (deskClockLastRemainingById.containsKey(id)) continue
+            val rem = deskClockPrefs.getLong(PREFS_REMAINING_PREFIX + id, -1L)
+            if (rem > 0L) deskClockLastRemainingById[id] = rem
+        }
+    }
+
+    private fun persistDeskClockRemaining(timerId: Int, remainingMs: Long) {
+        if (timerId < 0 || remainingMs <= 0L) return
+        deskClockPrefs.edit().putLong(PREFS_REMAINING_PREFIX + timerId, remainingMs).apply()
+    }
+
+    /** Sau gan xong: xoa rem_* khong con dung (tranh id timer cu khop nham). */
+    private fun pruneDeskClockRemainings(activeIds: Collection<Int>) {
+        val keep = activeIds.filter { it >= 0 }.toSet()
+        val edit = deskClockPrefs.edit()
+        var changed = false
+        for (id in deskClockLastRemainingById.keys.toList()) {
+            if (id in keep) continue
+            deskClockLastRemainingById.remove(id)
+            edit.remove(PREFS_REMAINING_PREFIX + id)
+            changed = true
+        }
+        if (keep.isNotEmpty()) {
+            edit.putString(PREFS_KNOWN_IDS, keep.sorted().joinToString(","))
+            changed = true
+        }
+        if (changed) edit.apply()
+    }
+
+    /**
+     * Gan TIMER_ID duy nhat cho tung metric.
+     * Khop theo remaining ms (khong so endTime vs pausedDuration) — tranh Resume chi 1
+     * timer khi metrics doi thu tu / ca hai cung label "Da tam dung".
+     * Khong sticky theo slot #index khi multi (thu tu metric khong on dinh).
+     */
+    private fun assignDeskClockTimerIds(
+        metrics: List<ParsedChronometerMetric>,
+        criticalIndex: Int,
+        extractedIds: List<Int>,
+        cachedIds: List<Int>,
+        existingForKey: List<IslandEvent.Timer>,
+        notifKey: String,
+        useSplitKeys: Boolean,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): List<Int> {
+        val n = metrics.size
+        if (n == 0) return emptyList()
+        val out = MutableList(n) { -1 }
+        val taken = linkedSetOf<Int>()
+
+        fun claim(index: Int, id: Int): Boolean {
+            if (id < 0 || id in taken || out[index] >= 0) return false
+            out[index] = id
+            taken.add(id)
+            return true
+        }
+
+        fun remainingClose(a: Long, b: Long): Boolean {
+            if (a <= 0L || b <= 0L) return false
+            return kotlin.math.abs(a - b) <= TIMER_REMAINING_MATCH_MS
+        }
+
+        // 1) Khop remaining vs event hien co (on dinh qua pause/resume + doi label).
+        for (index in 0 until n) {
+            val rem = metricRemainingMs(metrics[index], nowWall, nowElapsed)
+            if (rem <= 0L) continue
+            val match =
+                existingForKey.firstOrNull { ev ->
+                    val eid = ev.deskClockTimerId
+                    if (eid < 0 || eid in taken) return@firstOrNull false
+                    remainingClose(eventRemainingMs(ev, nowWall), rem)
+                }
+            if (match != null) claim(index, match.deskClockTimerId)
+        }
+
+        // 2) Khop remaining vs ban do id→remaining (kem prefs sau restart).
+        for (index in 0 until n) {
+            if (out[index] >= 0) continue
+            val rem = metricRemainingMs(metrics[index], nowWall, nowElapsed)
+            if (rem <= 0L) continue
+            val matchId =
+                deskClockLastRemainingById.entries
+                    .firstOrNull { (id, last) -> id !in taken && remainingClose(last, rem) }
+                    ?.key
+            if (matchId != null) claim(index, matchId)
+        }
+
+        // 3) URI critical + pool id cua notif/event hien tai — KHONG do known_ids lich su
+        // (id timer da xoa bi gan nham → Resume sai 1 cai).
+        val pool =
+            (extractedIds.asSequence() +
+                    cachedIds.asSequence() +
+                    existingForKey.asSequence().map { it.deskClockTimerId } +
+                    deskClockTimerIdsByNotif[notifKey].orEmpty().asSequence())
+                .filter { it >= 0 }
+                .distinct()
+                .toList()
+        val criticalId = extractedIds.firstOrNull() ?: -1
+        if (criticalId >= 0) claim(criticalIndex.coerceIn(0, n - 1), criticalId)
+        for (index in 0 until n) {
+            if (out[index] >= 0) continue
+            val next = pool.firstOrNull { it !in taken } ?: -1
+            claim(index, next)
+        }
+
+        // 4) Fallback cu (1 timer / thieu cache notif) — van khong dung prefs rong.
+        for (index in 0 until n) {
+            if (out[index] >= 0) continue
+            val resolved =
+                resolveDeskClockTimerId(
+                    index = index,
+                    criticalIndex = criticalIndex,
+                    metricsSize = n,
+                    extractedIds = extractedIds,
+                    cachedIds = cachedIds,
+                )
+            claim(index, resolved)
+        }
+
+        // 5) Sticky slot chi khi 1 metric (multi: thu tu doi theo critical — nguy hiem).
+        if (!useSplitKeys) {
+            for (index in 0 until n) {
+                if (out[index] >= 0) continue
+                val prev =
+                    existingForKey
+                        .firstOrNull { it.notificationKey == notifKey }
+                        ?.deskClockTimerId
+                        ?.takeIf { it >= 0 }
+                        ?: continue
+                claim(index, prev)
+            }
+        }
+        return out
+    }
+
+    /**
+     * Gan id cho tung metric: critical → URI/id dau; con lai → cache (id da thay khi 1 timer).
+     * Neu TIMER_IDS du so metric → map theo chi so.
+     */
+    private fun resolveDeskClockTimerId(
+        index: Int,
+        criticalIndex: Int,
+        metricsSize: Int,
+        extractedIds: List<Int>,
+        cachedIds: List<Int>,
+    ): Int {
+        if (extractedIds.size >= metricsSize && metricsSize > 0) {
+            return extractedIds.getOrElse(index) { -1 }
+        }
+        val criticalId = extractedIds.firstOrNull() ?: -1
+        if (index == criticalIndex && criticalId >= 0) return criticalId
+        if (metricsSize <= 1) return criticalId
+        val packageWide =
+            deskClockTimerIdsByNotif.values.asSequence().flatten().filter { it >= 0 }.distinct()
+        val others =
+            (cachedIds.asSequence() + packageWide)
+                .filter { it >= 0 && it != criticalId }
+                .distinct()
+                .toList()
+        val otherSlots = (0 until metricsSize).filter { it != criticalIndex }
+        val slot = otherSlots.indexOf(index)
+        if (slot >= 0) return others.getOrElse(slot) { -1 }
+        return -1
+    }
+
+    /**
+     * Lay moc ket thuc timer (wall-clock ms).
+     * Thu lan luot: Metric.TimeDifference, notification.when (+ chronometer),
+     * Chronometer RemoteViews, parse mm:ss tu text.
+     */
+    private fun resolveTimerEndTimeMs(sbn: StatusBarNotification, extras: Bundle): Long {
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+
+        endTimeFromTimerMetric(extras, nowWall, nowElapsed)?.let { return it }
+
+        val showChrono = extras.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
+        val countDown = extras.getBoolean(Notification.EXTRA_CHRONOMETER_COUNT_DOWN, false)
+        val whenMs = sbn.notification.`when`
+        if (whenMs > 0L) {
+            wallClockEndFromWhen(whenMs, showChrono, countDown, nowWall, nowElapsed)?.let {
+                return it
+            }
+        }
+
+        val chronoBase = extractChronometerBase(sbn)
+        if (chronoBase > 0L) {
+            val remaining = chronoBase - nowElapsed
+            if (remaining > 0L) return nowWall + remaining
+        }
+
+        parseTimerRemainingMs(sbn, extras)?.let { remaining ->
+            if (remaining > 0L) return nowWall + remaining
+        }
+
+        return 0L
+    }
+
+    /** Fallback single endtime — tai su dung parse multi-metric countdown. */
+    private fun endTimeFromTimerMetric(
+        extras: Bundle,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): Long? =
+        parseChronometerMetricsFromExtras(extras, nowWall, nowElapsed)
+            .firstOrNull { it.countDown }
+            ?.wallAnchorMs
+
+    /**
+     * Chuyen notification.when thanh wall-clock end.
+     * AOSP: when = wall-clock end. Mot so app luu sai theo elapsedRealtime.
+     */
+    private fun wallClockEndFromWhen(
+        whenMs: Long,
+        showChrono: Boolean,
+        countDown: Boolean,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): Long? {
+        val looksLikeWallClock = whenMs > 1_000_000_000_000L // ~2001-09-09
+        if (looksLikeWallClock) {
+            if (countDown || showChrono) {
+                // Cho phep tre vai giay (lam tron DeskClock + SECOND_IN_MILLIS)
+                if (whenMs > nowWall - 5_000L) return whenMs.coerceAtLeast(nowWall)
+            }
+            if (whenMs > nowWall) return whenMs
+            return null
+        }
+
+        // when mang hinh elapsedRealtime (sai hop dong nhung gap thuc te)
+        if (showChrono || countDown) {
+            val remaining = whenMs - nowElapsed
+            if (remaining > 0L) return nowWall + remaining
+        }
+        return null
+    }
+
+    /** Parse con lai mm:ss / h:mm:ss tu shortCriticalText / sortKey / text / title. */
+    private fun parseTimerRemainingMs(sbn: StatusBarNotification, extras: Bundle): Long? {
+        val shortCritical =
+            try {
+                sbn.notification?.shortCriticalText?.toString()
+            } catch (_: Exception) {
+                extras.getCharSequence(Notification.EXTRA_SHORT_CRITICAL_TEXT)?.toString()
+                    ?: extras.getCharSequence("android.shortCriticalText")?.toString()
+            }
+        // MetricStyle embedding remaining trong sortKey (⏳0:01:46) khi extras metrics thieu
+        val sortKey = sbn.notification?.sortKey
+        val candidates =
+            listOfNotNull(
+                shortCritical,
+                sortKey,
+                extrasCharSequence(extras, Notification.EXTRA_TEXT),
+                extrasCharSequence(extras, Notification.EXTRA_TITLE),
+                extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString(),
+                extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString(),
+            )
+        for (text in candidates) {
+            parseElapsedTimeToMs(text)?.let { return it }
+            parseSortKeyRemainingMs(text)?.let { return it }
+        }
+        return null
+    }
+
+    private fun parseElapsedTimeToMs(text: String): Long? {
+        val match = TIMER_REMAINING_PATTERN.find(text) ?: return null
+        val a = match.groupValues[1].toLongOrNull() ?: return null
+        val b = match.groupValues[2].toLongOrNull() ?: return null
+        val c = match.groupValues[3].toLongOrNull()
+        val secs = if (c != null) a * 3600 + b * 60 + c else a * 60 + b
+        if (secs <= 0L) return null
+        return secs * 1000L
+    }
+
+    /**
+     * Doc danh sach vong stopwatch tu EXTRA_TEXT_LINES / BigText / EXTRA_TEXT.
+     * Giu laps cu neu notif lan nay khong gui lai lines (tranh mat khi refresh).
+     */
+    private fun parseStopwatchLapsMs(extras: Bundle, previous: List<Long>): List<Long> {
+        val lines = mutableListOf<String>()
+        extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach {
+            val s = it?.toString()?.trim().orEmpty()
+            if (s.isNotEmpty()) lines += s
+        }
+        extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.lines()?.forEach {
+            val s = it.trim()
+            if (s.isNotEmpty()) lines += s
+        }
+        extrasCharSequence(extras, Notification.EXTRA_TEXT)?.lines()?.forEach {
+            val s = it.trim()
+            if (s.isNotEmpty()) lines += s
+        }
+        if (lines.isEmpty()) return previous
+        val parsed =
+            lines.mapNotNull { line ->
+                // Bo qua dong chi la nhan "Lap"/"Vong" khong so.
+                parseElapsedTimeToMs(line)
+                    ?: STOPWATCH_LAP_PATTERN.find(line)?.let { m ->
+                        val a = m.groupValues[1].toLongOrNull() ?: return@let null
+                        val b = m.groupValues[2].toLongOrNull() ?: return@let null
+                        val c = m.groupValues[3].toLongOrNull()
+                        val frac = m.groupValues[4]
+                        val secs = if (c != null) a * 3600 + b * 60 + c else a * 60 + b
+                        val fracMs =
+                            if (frac.isNotEmpty()) {
+                                frac.padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+                            } else {
+                                0L
+                            }
+                        ((secs * 1000L) + fracMs).takeIf { it > 0L }
+                    }
+            }
+                .distinct()
+                .sorted()
+        return if (parsed.isNotEmpty()) parsed else previous
+    }
+
+    /** Parse remaining tu MetricStyle sortKey (uu tien chuoi sau emoji dong ho). */
+    private fun parseSortKeyRemainingMs(text: String): Long? {
+        if (!text.contains("⏳") && !text.contains("⏱") && !text.contains("🕐")) {
+            // Van thu pattern neu chuoi chi la H:MM:SS / M:SS
+            if (!text.any { it.isDigit() }) return null
+        }
+        val match = SORTKEY_REMAINING_PATTERN.find(text) ?: return null
+        val a = match.groupValues[1].toLongOrNull() ?: return null
+        val b = match.groupValues[2].toLongOrNull() ?: return null
+        val c = match.groupValues[3].toLongOrNull()
+        val secs = if (c != null) a * 3600 + b * 60 + c else a * 60 + b
+        if (secs <= 0L) return null
+        return secs * 1000L
+    }
+
+    /** Nhan dien stopwatch dang chay / tam dung tu label action (EN + VI). */
+    private fun detectStopwatchRunningFromLabels(actionLabels: List<String>): Boolean? {
+        val running =
+            actionLabels.any { label ->
+                label.contains("pause") ||
+                    label.contains("tạm") ||
+                    label.contains("tam dung") ||
+                    label.contains("lap") ||
+                    label.contains("vòng") ||
+                    label.contains("vong")
+            }
+        val paused =
+            actionLabels.any { label ->
+                label.contains("resume") ||
+                    label.contains("tiếp") ||
+                    label.contains("tiep")
+            }
+        return when {
+            running -> true
+            paused -> false
+            else -> null
         }
     }
 
@@ -803,41 +1730,138 @@ constructor(
         actionLabels: List<String> = emptyList(),
         actionIntents: List<String> = emptyList(),
     ) {
-        val label = extras.getString("android.title") ?: ""
+        val label = extrasCharSequence(extras, Notification.EXTRA_TITLE) ?: ""
         val icon =
             try {
-                context.packageManager.getApplicationIcon(sbn.packageName)
+                sbn.notification.smallIcon?.loadDrawable(context)
+                    ?: context.packageManager.getApplicationIcon(sbn.packageName)
             } catch (_: Exception) {
                 null
             }
 
-        val hasPauseIntent = actionIntents.any { it == DeskClockActions.PAUSE_STOPWATCH }
-        val hasStartIntent = actionIntents.any { it == DeskClockActions.START_STOPWATCH }
-        val hasLapIntent = actionIntents.any { it == DeskClockActions.LAP_STOPWATCH }
-        val isRunning = when {
-            hasPauseIntent || hasLapIntent -> true
-            hasStartIntent -> false
-            else -> actionLabels.any { it.contains("pause") || it.contains("lap") }
+        val hasPauseIntent = actionIntents.any { DeskClockActions.matches(it, "PAUSE_STOPWATCH") }
+        val hasStartIntent = actionIntents.any { DeskClockActions.matches(it, "START_STOPWATCH") }
+        val hasLapIntent = actionIntents.any { DeskClockActions.matches(it, "LAP_STOPWATCH") }
+        val labelRunning = detectStopwatchRunningFromLabels(actionLabels)
+        var isRunning =
+            when {
+                hasPauseIntent || hasLapIntent -> true
+                hasStartIntent -> false
+                labelRunning != null -> labelRunning
+                else -> true // ongoing stopwatch notif: mac dinh dang chay khi khong ro action
+            }
+
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val existing = _stopwatchEvent.value
+        var startTimeMs = existing?.startTimeMs ?: nowWall
+        var startElapsedRealtimeMs = 0L
+        var pausedElapsedMs = 0L
+        var resolvedStart = false
+
+        // Uu tien android.metrics (countDown=false): when bi Clock refresh ≈ now khi dong app.
+        // Metric thang action labels — tranh action START/PAUSE nham → dong bang sai khi
+        // Clock van chay (pill lech / tut hau so voi app).
+        val stopwatchMetric =
+            parseChronometerMetricsFromExtras(extras, nowWall, nowElapsed).firstOrNull {
+                !it.countDown
+            }
+        if (stopwatchMetric != null) {
+            if (stopwatchMetric.isPaused) {
+                isRunning = false
+                pausedElapsedMs = stopwatchMetric.frozenDurationMs
+                startElapsedRealtimeMs = 0L
+                startTimeMs =
+                    if (stopwatchMetric.wallAnchorMs > 0L) stopwatchMetric.wallAnchorMs
+                    else nowWall - pausedElapsedMs.coerceAtLeast(0L)
+            } else {
+                isRunning = true
+                pausedElapsedMs = 0L
+                startElapsedRealtimeMs = stopwatchMetric.elapsedAnchorMs
+                startTimeMs =
+                    if (stopwatchMetric.wallAnchorMs > 0L) {
+                        stopwatchMetric.wallAnchorMs
+                    } else if (startElapsedRealtimeMs != 0L) {
+                        nowWall - (nowElapsed - startElapsedRealtimeMs).coerceAtLeast(0L)
+                    } else {
+                        existing?.startTimeMs ?: nowWall
+                    }
+            }
+            resolvedStart = true
         }
 
-        var startTimeMs = System.currentTimeMillis()
-        val chronoBase = extractChronometerBase(sbn)
-        if (chronoBase > 0L) {
-            val elapsed = SystemClock.elapsedRealtime() - chronoBase
-            if (elapsed > 0L) startTimeMs = System.currentTimeMillis() - elapsed
+        if (!resolvedStart) {
+            val whenMs = sbn.notification.`when`
+            val showChrono = extras.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
+            if (whenMs > 1_000_000_000_000L) {
+                // Wall-clock start — DeskClock cu / app khong metrics
+                startTimeMs = whenMs
+                startElapsedRealtimeMs = 0L
+                resolvedStart = true
+            } else if (showChrono && whenMs > 0L) {
+                // whenMs = chronometer base (elapsedRealtime)
+                val elapsed = nowElapsed - whenMs
+                if (elapsed >= 0L) {
+                    startTimeMs = nowWall - elapsed
+                    startElapsedRealtimeMs = whenMs
+                    resolvedStart = true
+                }
+            }
+        }
+        if (!resolvedStart) {
+            val chronoBase = extractChronometerBase(sbn)
+            if (chronoBase != 0L) {
+                // RemoteViews Chronometer.base = elapsedRealtime (co the am)
+                val elapsed = (nowElapsed - chronoBase).coerceAtLeast(0L)
+                startTimeMs = nowWall - elapsed
+                startElapsedRealtimeMs = chronoBase
+                resolvedStart = true
+            }
+        }
+
+        // Dong bang elapsed khi paused (giu cu neu notif khong gui lai pausedDuration)
+        if (!isRunning) {
+            pausedElapsedMs =
+                when {
+                    pausedElapsedMs > 0L -> pausedElapsedMs
+                    existing != null && !existing.isRunning && existing.pausedElapsedMs > 0L ->
+                        existing.pausedElapsedMs
+                    startElapsedRealtimeMs != 0L ->
+                        (nowElapsed - startElapsedRealtimeMs).coerceAtLeast(0L)
+                    startTimeMs > 0L -> (nowWall - startTimeMs).coerceAtLeast(0L)
+                    else -> 0L
+                }
+            startElapsedRealtimeMs = 0L
         }
 
         val actions = extractNotificationActions(sbn)
+        val laps = parseStopwatchLapsMs(extras, existing?.laps.orEmpty())
         val event =
             IslandEvent.Stopwatch(
                 label = label,
                 startTimeMs = startTimeMs,
+                startElapsedRealtimeMs = if (isRunning) startElapsedRealtimeMs else 0L,
                 isRunning = isRunning,
+                pausedElapsedMs = if (isRunning) 0L else pausedElapsedMs,
+                laps = laps,
                 appIcon = icon,
                 actions = actions,
+                contentIntent = sbn.notification?.contentIntent,
+                packageName = sbn.packageName.orEmpty(),
+                notificationKey = sbn.key,
+                sbn = sbn,
             )
         stopwatchNotificationKey = sbn.key
-        if (sbn.key != stopwatchDismissedKey) _stopwatchEvent.value = event
+        if (sbn.key != stopwatchDismissedKey) {
+            _stopwatchEvent.value = event
+            Log.i(
+                TAG,
+                "handleStopwatch label=${event.label} isRunning=${event.isRunning} " +
+                    "startTimeMs=${event.startTimeMs} startER=${event.startElapsedRealtimeMs} " +
+                    "pausedElapsed=${event.pausedElapsedMs} " +
+                    "displayed=${event.displayedElapsedMs()} fromMetrics=${stopwatchMetric != null}",
+            )
+        }
     }
 
     private fun extractChronometerBase(sbn: StatusBarNotification): Long {
@@ -877,8 +1901,29 @@ constructor(
             } ?: emptyList()
     }
 
+    /**
+     * Action ap dung ca nhom timer (Clock: "Dat lai ca hai…", "Reset both…").
+     * Khong dua vao the expand 1-timer.
+     */
+    private fun isSharedMultiTimerAction(label: CharSequence?): Boolean {
+        val t = label?.toString()?.lowercase().orEmpty()
+        if (t.isEmpty()) return false
+        if (t.contains("cả hai") || t.contains("ca hai")) return true
+        if (t.contains("both")) return true
+        if (t.contains("all timers") || t.contains("tất cả") || t.contains("tat ca")) return true
+        // "hai/nhieu dong ho" trong cung nhan nut reset/pause nhom.
+        if ((t.contains("hai ") || t.contains("nhiều") || t.contains("nhieu")) &&
+            (t.contains("đồng hồ") || t.contains("dong ho") || t.contains("timer"))
+        ) {
+            return true
+        }
+        return false
+    }
+
     private fun handleAlarm(sbn: StatusBarNotification, extras: Bundle) {
-        val label = extras.getString("android.title") ?: context.getString(R.string.ax_dynamic_bar_alarm)
+        val label =
+            extrasCharSequence(extras, Notification.EXTRA_TITLE)
+                ?: context.getString(R.string.ax_dynamic_bar_alarm)
         val isRinging = sbn.notification.category == Notification.CATEGORY_ALARM
         val icon =
             try {
@@ -999,19 +2044,28 @@ constructor(
     }
 
     private object DeskClockActions {
-        private const val PREFIX = "com.android.deskclock.action."
-        const val START_TIMER = PREFIX + "START_TIMER"
-        const val PAUSE_TIMER = PREFIX + "PAUSE_TIMER"
-        const val RESET_TIMER = PREFIX + "RESET_TIMER"
-        const val ADD_MINUTE_TIMER = PREFIX + "ADD_MINUTE_TIMER"
-        const val SHOW_TIMER = PREFIX + "SHOW_TIMER"
-        const val START_STOPWATCH = PREFIX + "START_STOPWATCH"
-        const val PAUSE_STOPWATCH = PREFIX + "PAUSE_STOPWATCH"
-        const val RESET_STOPWATCH = PREFIX + "RESET_STOPWATCH"
-        const val LAP_STOPWATCH = PREFIX + "LAP_STOPWATCH"
-        const val SHOW_STOPWATCH = PREFIX + "SHOW_STOPWATCH"
-        const val ALARM_SNOOZE = "com.android.deskclock.ALARM_SNOOZE"
-        const val ALARM_DISMISS = "com.android.deskclock.ALARM_DISMISS"
+        private val PREFIXES =
+            listOf(
+                "com.android.deskclock.action.",
+                "com.google.android.deskclock.action.",
+            )
+
+        fun matches(action: String, name: String): Boolean =
+            PREFIXES.any { action == it + name } || action.endsWith(".action.$name")
+
+        fun isTimerAction(action: String): Boolean =
+            matches(action, "START_TIMER") ||
+                matches(action, "PAUSE_TIMER") ||
+                matches(action, "RESET_TIMER") ||
+                matches(action, "ADD_MINUTE_TIMER") ||
+                matches(action, "SHOW_TIMER")
+
+        fun isStopwatchAction(action: String): Boolean =
+            matches(action, "START_STOPWATCH") ||
+                matches(action, "PAUSE_STOPWATCH") ||
+                matches(action, "RESET_STOPWATCH") ||
+                matches(action, "LAP_STOPWATCH") ||
+                matches(action, "SHOW_STOPWATCH")
     }
 
     private fun String.matchesMaterial(set: MaterialIconSet): Boolean =

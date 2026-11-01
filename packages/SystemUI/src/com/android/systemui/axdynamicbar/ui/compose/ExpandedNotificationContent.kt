@@ -23,9 +23,6 @@ import android.content.Intent
 import android.os.Bundle
 import android.service.notification.StatusBarNotification
 import android.util.Log
-import android.util.Size
-import android.widget.FrameLayout
-import android.widget.RemoteViews
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -34,6 +31,7 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -59,6 +57,7 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.LinearWavyProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import com.android.systemui.axdynamicbar.shared.islandClickIndication
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -75,7 +74,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.shared.IslandActions
 import com.android.systemui.axdynamicbar.shared.*
@@ -104,12 +102,25 @@ internal fun NotificationExpanded(
             (event.sbn.notification.bigContentView != null ||
                 event.sbn.notification.contentView != null)
 
+    val notifClickMod =
+        if (LocalStackOwnsContentClick.current) {
+            Modifier
+        } else {
+            Modifier.clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = islandClickIndication(),
+            ) {
+                openEventContentAndCollapse(
+                    context,
+                    event.sbn.notification?.contentIntent,
+                    interactor,
+                    event.sbn.packageName.orEmpty(),
+                )
+            }
+        }
+
     Column(
-        modifier = Modifier.fillMaxWidth().clickable {
-            try { event.sbn.notification?.contentIntent?.sendWithBal(context) }
-            catch (_: Exception) {}
-            interactor.collapseIsland()
-        },
+        modifier = Modifier.fillMaxWidth().then(notifClickMod),
         verticalArrangement = Arrangement.spacedBy(SpaceMd),
     ) {
         // Plain header row rather than a tinted panel nested inside the frosted card.
@@ -268,79 +279,10 @@ private fun NotifExpandedAvatar(event: IslandEvent.Notification, size: Dp) {
     }
 }
 
-private fun resolveRemoteViews(ctx: Context, sbn: StatusBarNotification): RemoteViews? {
-
-    sbn.notification.bigContentView?.let {
-        return it
-    }
-    sbn.notification.contentView?.let {
-        return it
-    }
-
-    return try {
-        val builder = Notification.Builder.recoverBuilder(ctx, sbn.notification)
-        builder.createBigContentView() ?: builder.createContentView()
-    } catch (_: Exception) {
-        null
-    }
-}
-
+/** Alias — dung chung SbnContentView (ExpandedOngoingContent) de tranh duplicate inflate. */
 @Composable
 internal fun SbnRemoteViewContent(sbn: StatusBarNotification, fallback: @Composable () -> Unit) {
-    var remoteViewFailed by remember(sbn.key) { mutableStateOf(false) }
-
-    if (!remoteViewFailed) {
-        AndroidView(
-            factory = { factoryCtx ->
-                FrameLayout(factoryCtx).apply {
-                    try {
-                        val rv = resolveRemoteViews(factoryCtx, sbn)
-                        val inflated = rv?.apply(factoryCtx, this)
-                        if (inflated != null) {
-                            addView(
-                                inflated,
-                                FrameLayout.LayoutParams(
-                                    FrameLayout.LayoutParams.MATCH_PARENT,
-                                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                                ),
-                            )
-                        } else {
-                            remoteViewFailed = true
-                        }
-                    } catch (_: Exception) {
-                        remoteViewFailed = true
-                    }
-                }
-            },
-            update = { container ->
-                // Reapply onto the existing tree when possible. Tearing down and re-inflating on
-                // every recomposition flickered and re-ran the app's RemoteViews inflation for
-                // each progress tick.
-                try {
-                    val rv = resolveRemoteViews(container.context, sbn) ?: return@AndroidView
-                    val existing = if (container.childCount > 0) container.getChildAt(0) else null
-                    if (existing != null) {
-                        try {
-                            rv.reapply(container.context, existing)
-                            return@AndroidView
-                        } catch (_: Exception) {
-                            container.removeAllViews()
-                        }
-                    }
-                    container.addView(
-                        rv.apply(container.context, container),
-                        FrameLayout.LayoutParams(
-                            FrameLayout.LayoutParams.MATCH_PARENT,
-                            FrameLayout.LayoutParams.WRAP_CONTENT,
-                        ),
-                    )
-                } catch (_: Exception) {}
-            },
-            modifier = Modifier.fillMaxWidth().clip(ShapeIconMedium),
-        )
-    } else {
-        fallback()
-    }
+    SbnContentView(sbn, fallback = fallback)
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -431,7 +373,10 @@ private fun NotificationReplyField(
                 modifier =
                     Modifier.size(32.dp)
                         .clip(CircleShape)
-                        .clickable {
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = islandClickIndication(IslandTone.ACCENT.tint),
+                        ) {
                             sendReply(context, reply, replyText, sbn)
                             replyText = ""
                             interactor.onFocusableRequested?.invoke(false)

@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -69,6 +70,7 @@ import android.graphics.drawable.Drawable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.res.stringResource
 import com.android.systemui.axdynamicbar.model.IslandEvent
+import com.android.systemui.axdynamicbar.shared.expandOnlyEventIdFor
 import com.android.systemui.axdynamicbar.shared.ChipTier
 import com.android.systemui.axdynamicbar.shared.AlphaGlass
 import com.android.systemui.axdynamicbar.shared.AlphaIconBg
@@ -79,7 +81,6 @@ import com.android.systemui.axdynamicbar.shared.islandBlur
 import com.android.systemui.axdynamicbar.shared.PillPrimary
 import com.android.systemui.axdynamicbar.shared.ShapeXl
 import com.android.systemui.axdynamicbar.shared.ShapeXs
-import com.android.systemui.axdynamicbar.shared.SizeBadge
 import com.android.systemui.axdynamicbar.shared.SpaceMd
 import com.android.systemui.axdynamicbar.shared.SpaceSm
 import com.android.systemui.axdynamicbar.shared.SpaceXs
@@ -89,6 +90,8 @@ import com.android.systemui.axdynamicbar.shared.chipContentColorFor
 import com.android.systemui.axdynamicbar.shared.chipCornerRadius
 import com.android.systemui.axdynamicbar.shared.chipHeight
 import com.android.systemui.axdynamicbar.shared.chipProgressFor
+import com.android.systemui.axdynamicbar.shared.mediaTrackSwitchKey
+import com.android.systemui.axdynamicbar.shared.mediaTrackSwitchTransition
 import com.android.systemui.axdynamicbar.shared.textKeyFor
 import com.android.systemui.axdynamicbar.shared.tierFor
 import com.android.systemui.axdynamicbar.shared.toScaledBitmap
@@ -167,7 +170,10 @@ fun AxDynamicBarChip(
                                             viewModel.statusBarExpansion.expand()
                                         }
                                     } else {
-                                        viewModel.statusBarExpansion.expand()
+                                        // Timer/Stopwatch: chi mo dung 1 event.id (multi-timer).
+                                        viewModel.statusBarExpansion.expand(
+                                            current?.let { expandOnlyEventIdFor(it) },
+                                        )
                                     }
                                 }
                             }
@@ -257,6 +263,8 @@ fun AxDynamicBarChip(
                         !(event is IslandEvent.Sports && event.team2Name.isNotEmpty())
 
                 val progress = chipProgressFor(event, includeMediaProgress = useCircleStyle)
+                val isChronometerEvent =
+                    event is IslandEvent.Timer || event is IslandEvent.Stopwatch
 
                 if (useCircleStyle) {
                     Box(
@@ -290,7 +298,7 @@ fun AxDynamicBarChip(
                     Row(
                         modifier =
                             Modifier.height(chipHeight)
-                                .widthIn(max = 100.dp)
+                                .widthIn(max = if (isChronometerEvent) 108.dp else 100.dp)
                                 .clip(RoundedCornerShape(chipCorner))
                                 .squishAnimation(toggleCount)
                                 // The frost is tinted with the accent itself: one coloured
@@ -386,6 +394,30 @@ fun AxDynamicBarChip(
                             )
                             Spacer(Modifier.width(SpaceXs))
                             StatusBarSportsTeamBadge(sport.team2Name, sport.team2Icon, contentColor)
+                        } else if (event is IslandEvent.Media) {
+                            // Cover + tieu de chung 1 AnimatedContent + mediaTrackSwitchTransition.
+                            AnimatedContent(
+                                targetState = event,
+                                transitionSpec = {
+                                    mediaTrackSwitchTransition(motionScheme)
+                                        .using(sizeTransform = null)
+                                },
+                                contentKey = { mediaTrackSwitchKey(it) },
+                                label = "chip_media",
+                                modifier =
+                                    Modifier.weight(1f, fill = false)
+                                        .widthIn(max = chipTextMaxWidth + 20.dp),
+                            ) { media ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    PillEventIcon(media, tint = contentColor, animated = false)
+                                    // Fade + marquee nam trong NativeMarqueeText (Samsung TextView).
+                                    PillEventText(
+                                        media,
+                                        Modifier.widthIn(max = chipTextMaxWidth),
+                                        overrideColor = contentColor,
+                                    )
+                                }
+                            }
                         } else {
                             AnimatedContent(
                                 targetState = chipIconKey(event),
@@ -399,40 +431,30 @@ fun AxDynamicBarChip(
                                 PillEventIcon(event, tint = contentColor, animated = false)
                             }
                             Spacer(Modifier.width(SpaceXs))
-                            AnimatedContent(
-                                targetState = textKeyFor(event),
-                                transitionSpec = {
-                                    (fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                                        fadeOut(motionScheme.fastEffectsSpec()))
-                                        .using(sizeTransform = null)
-                                },
-                                label = "chip_text",
-                                modifier = Modifier.weight(1f, fill = false).widthIn(max = chipTextMaxWidth),
-                            ) {
+                            if (isChronometerEvent) {
+                                // Chronometer compact: Canvas khoa width — khong weight/remeasure Row
                                 PillEventText(
                                     event,
-                                    Modifier.widthIn(max = chipTextMaxWidth),
+                                    Modifier,
                                     overrideColor = contentColor,
                                 )
-                            }
-                            if (chipState.eventCount > 1) {
-                                Spacer(Modifier.width(SpaceXs))
-                                Box(
-                                    contentAlignment = Alignment.Center,
-                                    modifier = Modifier
-                                        .height(SizeBadge)
-                                        .widthIn(min = SizeBadge)
-                                        .background(
-                                            lerp(accent, contentColor, 0.3f),
-                                            RoundedCornerShape(SizeBadge / 2),
-                                        )
-                                        .padding(horizontal = 3.dp),
+                            } else {
+                                AnimatedContent(
+                                    targetState = textKeyFor(event),
+                                    transitionSpec = {
+                                        (fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
+                                            fadeOut(motionScheme.fastEffectsSpec()))
+                                            .using(sizeTransform = null)
+                                    },
+                                    label = "chip_text",
+                                    modifier =
+                                        Modifier.weight(1f, fill = false)
+                                            .widthIn(max = chipTextMaxWidth),
                                 ) {
-                                    Text(
-                                        text = "${chipState.eventCount}",
-                                        style = TsBadge,
-                                        color = contentColor,
-                                        maxLines = 1,
+                                    PillEventText(
+                                        event,
+                                        Modifier.widthIn(max = chipTextMaxWidth),
+                                        overrideColor = contentColor,
                                     )
                                 }
                             }
@@ -482,7 +504,7 @@ private fun chipIconKey(event: IslandEvent): Any =
             val app = event.previousApp ?: event.recentApps.firstOrNull()
             app?.taskId ?: app?.packageName ?: event.id
         }
-        is IslandEvent.Media -> event.albumArt ?: event.packageName
+        is IslandEvent.Media -> mediaTrackSwitchKey(event)
         is IslandEvent.Notification -> event.sbn.key
         else -> event.id
     }

@@ -66,6 +66,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -97,6 +98,64 @@ import kotlinx.coroutines.delay
 private val CircleChipSize = 28.dp
 private val CircleChipStroke = 2.5.dp
 private val CircleChipIconSize = 16.dp
+
+/**
+ * Do rong Canvas theo format (co dinh trong moi che do — tick giay khong remeasure).
+ * Chi doi width khi MM:SS <-> HH:MM:SS (qua moc 1h), khong moi giay.
+ * KHONG preferredFrameRate (graphicsLayer vote Cat::High moi tick).
+ */
+internal val CompactChronometerWidthMm = 39.dp
+// Chuan 62.dp vua khit 8 ky tu HH:MM:SS (monospace 12sp tai 450dpi la 61.15dp)
+internal val CompactChronometerWidthHh = 62.dp
+private val CompactChronometerHeight = 14.dp
+
+/** Chon width Canvas theo chuoi: HH:MM:SS / MM:SS / label (paused…). */
+internal fun compactChronometerWidthFor(text: String): Dp {
+    val colons = text.count { it == ':' }
+    return when {
+        colons >= 2 -> CompactChronometerWidthHh
+        colons == 1 -> CompactChronometerWidthMm
+        else -> CompactChronometerWidthHh
+    }
+}
+
+/**
+ * Chronometer compact: ve bang Canvas (size khoa theo format). Doi chu so chi draw,
+ * khong Text remeasure / AnimatedContent / preferredFrameRate layer.
+ */
+@Composable
+private fun CompactChronometerText(
+    text: String,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val textSizeSp = 12.sp
+    val chronoWidth = compactChronometerWidthFor(text)
+    val paint =
+        remember {
+            android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                typeface = android.graphics.Typeface.MONOSPACE
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+        }
+    Canvas(
+        modifier =
+            modifier.size(
+                width = chronoWidth,
+                height = CompactChronometerHeight,
+            ),
+    ) {
+        paint.color = android.graphics.Color.argb(
+            (color.alpha * 255f).toInt().coerceIn(0, 255),
+            (color.red * 255f).toInt().coerceIn(0, 255),
+            (color.green * 255f).toInt().coerceIn(0, 255),
+            (color.blue * 255f).toInt().coerceIn(0, 255),
+        )
+        paint.textSize = textSizeSp.toPx()
+        val y = size.height / 2f - (paint.descent() + paint.ascent()) / 2f
+        drawContext.canvas.nativeCanvas.drawText(text, size.width / 2f, y, paint)
+    }
+}
 
 @Composable
 internal fun CircleChip(
@@ -1397,18 +1456,15 @@ private fun MediaTitleText(event: IslandEvent.Media, modifier: Modifier, overrid
     val title = event.track.ifEmpty {
         event.artist.ifEmpty { "Music" }
     }
-    Text(
+    // Samsung NowBar chip: TextView MARQUEE + horizontalFadingEdge (khong Compose Offscreen).
+    val style = PillPrimary
+    NativeMarqueeText(
         text = title,
         color = color,
-        style = PillPrimary,
-        maxLines = 1,
-        overflow = TextOverflow.Clip,
-        modifier = modifier
-            .widthIn(max = 90.dp)
-            .basicMarquee(
-                initialDelayMillis = 3_000,
-                repeatDelayMillis = 5_000,
-            ),
+        textSize = style.fontSize,
+        fontWeight = style.fontWeight?.weight ?: 500,
+        fadeLength = SpaceMd,
+        modifier = modifier,
     )
 }
 
@@ -1442,37 +1498,51 @@ private fun BtText(event: IslandEvent.Bluetooth, modifier: Modifier, overrideCol
 
 @Composable
 private fun TimerText(event: IslandEvent.Timer, modifier: Modifier, overrideColor: Color? = null) {
-    val label = event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_timer) }
-    if (event.endTimeMs <= 0L) {
-        MarqueeLabel(label, overrideColor ?: toneFor(event).tint, modifier)
-        return
-    }
-    val color = overrideColor ?: if (event.isPaused) SubtleGray else toneFor(event).tint
-    val chronometer: Chronometer? =
-        if (event.isPaused) {
-            FrozenChronometerCache.get(event.id)?.let { Chronometer.Paused(it) }
-        } else {
-            Chronometer.Running(eventTimeFor(event.endTimeMs), isCountdown = true)
-        }
-    val text = chronometer?.let { rememberChronometerText(it, freezeKey = event.id) }
-    when {
-        text != null -> ChronometerLabel(text, color, modifier)
-        event.isPaused -> ChronometerLabel(stringResource(R.string.ax_dynamic_bar_paused), color, modifier)
-        else -> MarqueeLabel(label, color, modifier)
+    val hasTime = event.endTimeMs > 0L || event.pausedRemainingMs > 0L ||
+        event.endElapsedRealtimeMs > 0L
+    if (hasTime) {
+        val color = overrideColor ?: if (event.isPaused) SubtleGray else toneFor(event).tint
+        val remainingMs =
+            rememberDisplayedChronometerMs(
+                identityKey =
+                    listOf(
+                        event.endTimeMs,
+                        event.isPaused,
+                        event.pausedRemainingMs,
+                        event.endElapsedRealtimeMs,
+                    ),
+                ticking = !event.isPaused,
+                tickMs = 1000L,
+                isCountdown = true,
+                compute = { event.displayedRemainingMs() },
+            )
+        CompactChronometerText(formatCountdownCompact(remainingMs), color, modifier)
+    } else {
+        MarqueeLabel(
+            event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_timer) },
+            overrideColor ?: toneFor(event).tint,
+            modifier,
+        )
     }
 }
 
 @Composable
 private fun StopwatchText(event: IslandEvent.Stopwatch, modifier: Modifier, overrideColor: Color? = null) {
     val color = overrideColor ?: if (event.isRunning) toneFor(event).tint else SubtleGray
-    val chronometer: Chronometer? =
-        if (event.isRunning && event.startTimeMs > 0L) {
-            Chronometer.Running(eventTimeFor(event.startTimeMs), isCountdown = false)
-        } else {
-            FrozenChronometerCache.get(event.id)?.let { Chronometer.Paused(it) }
-        }
-    val text = chronometer?.let { rememberChronometerText(it, freezeKey = event.id) }
-    ChronometerLabel(text ?: stringResource(R.string.ax_dynamic_bar_paused), color, modifier)
+    val elapsedMs =
+        rememberDisplayedChronometerMs(
+            identityKey =
+                listOf(
+                    event.startTimeMs,
+                    event.startElapsedRealtimeMs,
+                    event.isRunning,
+                    event.pausedElapsedMs,
+                ),
+            ticking = event.isRunning,
+            tickMs = 1000L,
+            compute = { event.displayedElapsedMs() },
+        )
+    CompactChronometerText(formatStopwatchCompact(elapsedMs), color, modifier)
 }
 
 @Composable

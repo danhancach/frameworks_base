@@ -16,37 +16,30 @@
 
 package com.android.systemui.axdynamicbar.ui.compose
 
-import androidx.compose.foundation.Canvas
+import android.app.PendingIntent
+import android.service.notification.StatusBarNotification
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Close
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import android.app.Notification
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.dimensionResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -55,216 +48,160 @@ import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.shared.IslandActions
 import com.android.systemui.axdynamicbar.shared.*
 import com.android.systemui.res.R
-import kotlinx.coroutines.delay
 
+/**
+ * Expand timer: RemoteViews goc Clock (MetricStyle / actions notif).
+ * Khong dung ChronometerExpandedShell / synthetic PAUSE-START.
+ */
 @Composable
-internal fun TimerExpanded(event: IslandEvent.Timer, interactor: IslandActions) {
-    val style = eventStyleFor(event)
-    val accent = style.accent
-    val totalMs = event.originalDurationMs.takeIf { it > 0L } ?: 1L
-    var remainingMs by
-        remember(event.endTimeMs) {
-            mutableLongStateOf(
-                if (event.endTimeMs > 0L)
-                    (event.endTimeMs - System.currentTimeMillis()).coerceAtLeast(0L)
-                else 0L
-            )
-        }
-    if (!event.isPaused) {
-        LaunchedEffect(event.endTimeMs) {
-            if (event.endTimeMs > 0L) {
-                while (remainingMs > 0L) {
-                    delay(500)
-                    remainingMs = (event.endTimeMs - System.currentTimeMillis()).coerceAtLeast(0L)
-                }
-            }
-        }
-    }
-    val progress = if (event.endTimeMs > 0L) remainingMs.toFloat() / totalMs else 0f
-    val counting = event.endTimeMs > 0L && !event.isPaused
-
-    TileWithActions(
-        event = event,
-        actions = event.actions.map { it.action to it.label.toString() },
-        style = style,
-        interactor = interactor,
-        icon = {
-            Box(modifier = Modifier.size(SizeIconBadge), contentAlignment = Alignment.Center) {
-                // `accent` is resolved above: a DrawScope lambda is not composable.
-                Canvas(Modifier.size(SizeIconBadge)) {
-                    drawArc(
-                        color = accent.copy(alpha = AlphaSubtle),
-                        startAngle = -90f,
-                        sweepAngle = 360f,
-                        useCenter = false,
-                        style = Stroke(width = SizeStrokeWidth.toPx(), cap = StrokeCap.Round),
-                        topLeft = Offset.Zero,
-                        size = Size(size.width, size.height),
-                    )
-                    drawArc(
-                        color = accent,
-                        startAngle = -90f,
-                        sweepAngle = 360f * progress.coerceIn(0f, 1f),
-                        useCenter = false,
-                        style = Stroke(width = SizeStrokeWidth.toPx(), cap = StrokeCap.Round),
-                        topLeft = Offset.Zero,
-                        size = Size(size.width, size.height),
-                    )
-                }
-                style.icon?.let { Icon(it, null, tint = accent, modifier = Modifier.size(14.dp)) }
-            }
-        },
-        // The ring is its own affordance; drawn bare, not on a badge.
-        iconBackground = false,
-        title = {
-            // The countdown is the headline; the timer's name drops to the caption beneath it.
-            Text(
+internal fun TimerExpanded(
+    event: IslandEvent.Timer,
+    interactor: IslandActions,
+) {
+    ChronometerRemoteViewsExpanded(
+        sbn = event.sbn,
+        fallbackLabel = event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_timer) },
+        fallbackSubtitle =
+            run {
+                val remainingMs = event.displayedRemainingMs()
+                val hasTime =
+                    event.endTimeMs > 0L ||
+                        event.pausedRemainingMs > 0L ||
+                        event.endElapsedRealtimeMs > 0L
                 when {
+                    hasTime -> formatCountdownLong(remainingMs)
                     event.isPaused -> stringResource(R.string.ax_dynamic_bar_paused)
-                    counting -> formatCountdownLong(remainingMs)
                     else -> stringResource(R.string.ax_dynamic_bar_running)
-                },
-                color = if (event.isPaused) SubtleGray else accent,
-                style = if (counting) TsValue else MaterialTheme.typography.titleSmall,
-                maxLines = 1,
-            )
-            Text(
-                event.label.ifEmpty { stringResource(style.labelRes) },
-                color = SubtleGray,
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        },
-    )
-}
-
-@Composable
-internal fun StopwatchExpanded(event: IslandEvent.Stopwatch, interactor: IslandActions) {
-    val style = eventStyleFor(event)
-    var elapsedMs by
-        remember(event.startTimeMs) {
-            mutableLongStateOf((System.currentTimeMillis() - event.startTimeMs).coerceAtLeast(0L))
-        }
-    if (event.isRunning) {
-        LaunchedEffect(event.startTimeMs) {
-            while (true) {
-                delay(100)
-                elapsedMs = (System.currentTimeMillis() - event.startTimeMs).coerceAtLeast(0L)
-            }
-        }
-    }
-
-    TileWithActions(
-        event = event,
-        actions = event.actions.map { it.action to it.label.toString() },
-        style = style,
+                }
+            },
+        contentIntent = event.contentIntent,
+        packageName = event.packageName,
         interactor = interactor,
-        icon = {
-            if (event.isRunning) PulsingDot(color = style.accent, size = 14.dp)
-            else style.icon?.let { Icon(it, null, tint = style.accent, modifier = Modifier.size(16.dp)) }
-        },
-        title = {
-            Text(
-                if (event.isRunning) formatStopwatch(elapsedMs)
-                else stringResource(R.string.ax_dynamic_bar_paused),
-                color = if (event.isRunning) style.accent else SubtleGray,
-                style = if (event.isRunning) TsValue else MaterialTheme.typography.titleSmall,
-                maxLines = 1,
-            )
-            Text(
-                event.label.ifEmpty { stringResource(style.labelRes) },
-                color = SubtleGray,
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        },
     )
 }
 
 /**
- * Timer/stopwatch shell. Forwarded actions sit in the header row when they are all recognised
- * commands (pause, reset, +1 min…) and drop to their own row otherwise, so an unrecognised labelled
- * action never squeezes the countdown. With nothing to forward, the tile offers its own dismiss.
+ * Expand stopwatch: RemoteViews goc Clock — khong Compose lap ledger / shell custom.
  */
 @Composable
-private fun TileWithActions(
-    event: IslandEvent,
-    actions: List<Pair<Notification.Action, String>>,
-    style: EventStyle,
-    interactor: IslandActions,
-    icon: @Composable () -> Unit,
-    iconBackground: Boolean = true,
-    title: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
-) {
-    val context = LocalContext.current
-    val inline = rememberActionsFitInline(actions.map { it.first })
+internal fun StopwatchExpanded(event: IslandEvent.Stopwatch, interactor: IslandActions) {
+    ChronometerRemoteViewsExpanded(
+        sbn = event.sbn,
+        fallbackLabel = event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_stopwatch) },
+        fallbackSubtitle = formatStopwatch(event.displayedElapsedMs()),
+        contentIntent = event.contentIntent,
+        packageName = event.packageName,
+        interactor = interactor,
+    )
+}
 
-    val buttons: @Composable () -> Unit = {
-        if (actions.isEmpty()) {
-            ActionIconButton(
-                icon = Icons.Filled.Close,
-                tint = style.accent,
-                bg = style.accent.copy(alpha = AlphaIconBg),
-                contentDescription = stringResource(R.string.ax_dynamic_bar_dismiss),
-                onClick = { interactor.dismissEvent(event) },
+/**
+ * Host SbnContentView theo khung QS (MetricStyle promoted + max height shade).
+ * Padding / maxWidth = notification_shade_content_margin — khong PrimaryCard SpaceXxl.
+ */
+@Composable
+internal fun ChronometerRemoteViewsExpanded(
+    sbn: StatusBarNotification?,
+    fallbackLabel: String,
+    fallbackSubtitle: String,
+    contentIntent: PendingIntent?,
+    packageName: String,
+    interactor: IslandActions,
+) {
+    val fallback: @Composable () -> Unit = {
+        ChronometerRemoteViewsFallback(
+            label = fallbackLabel,
+            subtitle = fallbackSubtitle,
+        )
+    }
+    val shadeMargin = dimensionResource(R.dimen.notification_shade_content_margin_horizontal)
+    // Max height = cung dimen ExpandableNotificationRow dung cho promoted ongoing trong shade.
+    val maxH = dimensionResource(R.dimen.notification_max_height_for_promoted_ongoing)
+    val screenDp = LocalConfiguration.current.screenWidthDp.dp
+    // Be rong noi dung QS: man hinh - 2*margin shade (giong notification stack).
+    val qsContentMax = (screenDp - shadeMargin * 2).coerceAtLeast(280.dp)
+    // Morph host da co mot glass — chi RemoteViews, khong islandBlur card thu hai.
+    val morphHostFrame = LocalKeyguardMorphHostFrame.current
+    Box(
+        modifier =
+            Modifier
+                .widthIn(max = qsContentMax)
+                .fillMaxWidth()
+                .wrapContentHeight()
+                .heightIn(max = maxH)
+                .islandCardSurface(
+                    morphHostFrame = morphHostFrame,
+                    onClick = {
+                        interactor.openChronometerApp(contentIntent, packageName)
+                        interactor.collapseIsland()
+                    },
+                ),
+    ) {
+        if (sbn != null) {
+            SbnContentView(
+                sbn,
+                fallback = fallback,
+                qsMetricFrame = true,
+                preserveRemoteViewRipple = true,
             )
         } else {
-            actions.forEach { (action, label) ->
-                NotificationActionButton(action = action, label = label, tone = style.tone) {
-                    try {
-                        action.actionIntent?.sendWithBal(context)
-                    } catch (_: Exception) {}
-                }
-            }
+            fallback()
         }
     }
+}
 
-    ExpandedCardLayout(
-        accentColor = style.accent,
-        icon = icon,
-        iconBackground = iconBackground,
-        title = title,
-        trailing = if (inline || actions.isEmpty()) {
-            {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(SpaceSm),
-                ) { buttons() }
-            }
-        } else null,
-        actions = if (!inline && actions.isNotEmpty()) {
-            {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(SpaceSm),
-                ) { buttons() }
-            }
-        } else null,
-    )
+/** The chronometer expand tu boc card QS — StackedPanels khong boc PrimaryCard lan nua. */
+@Composable
+internal fun ChronometerQsCard(content: @Composable () -> Unit) {
+    // ChronometerRemoteViewsExpanded tu ve khung; wrapper chi de slot API giong PrimaryCard.
+    content()
+}
+
+/** Fallback nhe khi sbn null / inflate RemoteViews fail — khong dung shell chronometer day du. */
+@Composable
+private fun ChronometerRemoteViewsFallback(
+    label: String,
+    subtitle: String,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(SpaceXxl),
+        verticalArrangement = Arrangement.spacedBy(SpaceXxs),
+    ) {
+        Text(
+            label,
+            color = OnCardText,
+            style = MaterialTheme.typography.titleMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            subtitle,
+            color = SubtleGray,
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 @Composable
 internal fun RowScope.CompactTimerRow(event: IslandEvent.Timer) {
-    var remainingMs by
-        remember(event.endTimeMs) {
-            mutableLongStateOf(
-                if (event.endTimeMs > 0L)
-                    (event.endTimeMs - System.currentTimeMillis()).coerceAtLeast(0L)
-                else 0L
-            )
-        }
-    if (!event.isPaused) {
-        LaunchedEffect(event.endTimeMs) {
-            if (event.endTimeMs > 0L) {
-                while (remainingMs > 0L) {
-                    delay(500)
-                    remainingMs = (event.endTimeMs - System.currentTimeMillis()).coerceAtLeast(0L)
-                }
-            }
-        }
-    }
+    val remainingMs =
+        rememberDisplayedChronometerMs(
+            identityKey =
+                listOf(
+                    event.endTimeMs,
+                    event.isPaused,
+                    event.pausedRemainingMs,
+                    event.endElapsedRealtimeMs,
+                ),
+            ticking = !event.isPaused,
+            tickMs = 500L,
+            isCountdown = true,
+            compute = { event.displayedRemainingMs() },
+        )
+    val hasTime =
+        event.endTimeMs > 0L || event.pausedRemainingMs > 0L || event.endElapsedRealtimeMs > 0L
     val style = eventStyleFor(event)
     Box(
         modifier =
@@ -273,7 +210,7 @@ internal fun RowScope.CompactTimerRow(event: IslandEvent.Timer) {
     ) {
         style.icon?.let { Icon(it, null, tint = style.accent, modifier = Modifier.size(18.dp)) }
     }
-    Spacer(Modifier.width(SpaceLg))
+    Spacer(modifier = Modifier.width(SpaceLg))
     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(SpaceXxs)) {
         if (event.label.isNotEmpty())
             Text(
@@ -283,9 +220,9 @@ internal fun RowScope.CompactTimerRow(event: IslandEvent.Timer) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-        if (event.endTimeMs > 0L) {
+        if (hasTime) {
             Text(
-                if (event.isPaused) stringResource(R.string.ax_dynamic_bar_paused) else formatCountdownLong(remainingMs),
+                formatCountdownLong(remainingMs),
                 color = if (event.isPaused) SubtleGray else style.accent,
                 style = TsMono.copy(fontSize = 13.sp),
             )
@@ -297,18 +234,19 @@ internal fun RowScope.CompactTimerRow(event: IslandEvent.Timer) {
 
 @Composable
 internal fun RowScope.CompactStopwatchRow(event: IslandEvent.Stopwatch) {
-    var elapsedMs by
-        remember(event.startTimeMs) {
-            mutableLongStateOf((System.currentTimeMillis() - event.startTimeMs).coerceAtLeast(0L))
-        }
-    if (event.isRunning) {
-        LaunchedEffect(event.startTimeMs) {
-            while (true) {
-                delay(200)
-                elapsedMs = (System.currentTimeMillis() - event.startTimeMs).coerceAtLeast(0L)
-            }
-        }
-    }
+    val elapsedMs =
+        rememberDisplayedChronometerMs(
+            identityKey =
+                listOf(
+                    event.startTimeMs,
+                    event.startElapsedRealtimeMs,
+                    event.isRunning,
+                    event.pausedElapsedMs,
+                ),
+            ticking = event.isRunning,
+            tickMs = 200L,
+            compute = { event.displayedElapsedMs() },
+        )
     val style = eventStyleFor(event)
     Box(
         modifier =
@@ -318,7 +256,7 @@ internal fun RowScope.CompactStopwatchRow(event: IslandEvent.Stopwatch) {
         if (event.isRunning) PulsingDot(color = style.accent, size = 18.dp)
         else style.icon?.let { Icon(it, null, tint = style.accent, modifier = Modifier.size(18.dp)) }
     }
-    Spacer(Modifier.width(SpaceLg))
+    Spacer(modifier = Modifier.width(SpaceLg))
     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(SpaceXxs)) {
         Text(
             event.label.ifEmpty { stringResource(style.labelRes) },
@@ -328,7 +266,7 @@ internal fun RowScope.CompactStopwatchRow(event: IslandEvent.Stopwatch) {
             overflow = TextOverflow.Ellipsis,
         )
         Text(
-            if (event.isRunning) formatStopwatch(elapsedMs) else stringResource(R.string.ax_dynamic_bar_paused),
+            formatStopwatch(elapsedMs),
             color = if (event.isRunning) style.accent else SubtleGray,
             style = TsMono.copy(fontSize = 13.sp),
         )

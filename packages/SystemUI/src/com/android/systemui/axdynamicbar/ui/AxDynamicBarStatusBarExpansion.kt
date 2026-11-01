@@ -40,11 +40,15 @@ constructor(
     private val interactor: AxDynamicBarInteractor,
 ) {
     private val _intent = MutableStateFlow(false)
+    // Chronometer: chi mo dung 1 event.id (multi-timer tach chip). null = stack nhu cu.
+    private val _expandOnlyEventId = MutableStateFlow<String?>(null)
 
     val isExpanded: StateFlow<Boolean> =
         combine(_intent, interactor.isOnKeyguard) { intent, onKg -> intent && !onKg }
             .distinctUntilChanged()
             .stateIn(applicationScope, SharingStarted.Lazily, false)
+
+    val expandOnlyEventId: StateFlow<String?> = _expandOnlyEventId
 
     init {
         interactor.isOnKeyguard
@@ -71,17 +75,27 @@ constructor(
             .launchIn(applicationScope)
     }
 
-    fun expand() {
+    fun expand(onlyEventId: String? = null) {
         val state = interactor.uiState.value
         if (state.events.isEmpty() || state.events.all { it is IslandEvent.AospChip }) return
+        _expandOnlyEventId.value = onlyEventId
         _intent.value = true
     }
 
     fun collapse() {
         _intent.value = false
+        _expandOnlyEventId.value = null
     }
 
-    fun toggle() {
-        if (_intent.value) collapse() else expand()
+    /**
+     * Cap nhat expand-only khi stack commit doi chip (timer → media = null, media → timer = id).
+     * Khong doi _intent — panel dang mo.
+     */
+    fun setExpandOnlyEventId(onlyEventId: String?) {
+        _expandOnlyEventId.value = onlyEventId
+    }
+
+    fun toggle(onlyEventId: String? = null) {
+        if (_intent.value) collapse() else expand(onlyEventId)
     }
 }

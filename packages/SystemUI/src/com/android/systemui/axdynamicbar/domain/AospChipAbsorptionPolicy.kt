@@ -26,8 +26,16 @@ class AospChipAbsorptionPolicy @Inject constructor() {
 
     private val chronometerChipKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
+    companion object {
+        private val CLOCK_PACKAGES = setOf("com.google.android.deskclock", "com.android.deskclock")
+    }
+
+    /**
+     * System chip → island AospChip; chronometer/Clock notif → chi absorb de lay key
+     * (dedup PromotedOngoing), khong map AospChip.
+     */
     fun isAbsorbed(chip: OngoingActivityChipModel.Active): Boolean =
-        isSystemChip(chip) || isChronometerNotificationChip(chip)
+        isSystemChip(chip) || isChronometerNotificationChip(chip) || isClockChip(chip)
 
     /** True for chips created by NotifChipsViewModel (promoted ongoing notifications). */
     fun isNotificationChip(chip: OngoingActivityChipModel.Active): Boolean =
@@ -35,12 +43,8 @@ class AospChipAbsorptionPolicy @Inject constructor() {
             chip.key == chip.notificationKey &&
             !chip.isScreenShareNotification
 
-    /** Forget keys whose chips no longer exist. Call once per chip-list emission. */
-    fun prune(presentKeys: Set<String>) {
-        chronometerChipKeys.retainAll(presentKeys)
-    }
-
-    private fun isSystemChip(chip: OngoingActivityChipModel.Active): Boolean {
+    /** Call / share / record / cast — chip duoc phep thanh IslandEvent.AospChip. */
+    fun isSystemChip(chip: OngoingActivityChipModel.Active): Boolean {
         val key = chip.key
         return key.startsWith("callChip-") ||
             key == "ShareToApp" ||
@@ -48,6 +52,22 @@ class AospChipAbsorptionPolicy @Inject constructor() {
             key == "CastToOtherDevice"
     }
 
+    /** Forget keys whose chips no longer exist. Call once per chip-list emission. */
+    fun prune(presentKeys: Set<String>) {
+        chronometerChipKeys.retainAll(presentKeys)
+    }
+
+    /**
+     * DeskClock package — bat ke content type (truoc khi Timer content sticky).
+     * Khac [isChronometerNotificationChip]: theo package, khong theo Content.Timer.
+     */
+    private fun isClockChip(chip: OngoingActivityChipModel.Active): Boolean =
+        chip.managingPackageName in CLOCK_PACKAGES
+
+    /**
+     * Notif chip co Content.Timer (sticky key) — moi app dung MetricStyle chronometer,
+     * khong chi Clock. Ghi key de dedup; khong emit AospChip.
+     */
     private fun isChronometerNotificationChip(chip: OngoingActivityChipModel.Active): Boolean {
         if (!isNotificationChip(chip)) return false
         if (chip.content is OngoingActivityChipModel.Content.Timer) {

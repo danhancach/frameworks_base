@@ -27,14 +27,15 @@ import kotlinx.coroutines.flow.map
 
 /** What the island absorbed from AOSP chips, plus what other sources must now stay quiet about. */
 data class AospChipSnapshot(
-    /** Chips to show in the island. */
+    /** Chips to show in the island (system only — call/share/record/cast). */
     val events: List<IslandEvent.AospChip> = emptyList(),
-    /** Notification keys owned by absorbed notification chips (hidden ones included). */
+    /**
+     * Keys of absorbed chronometer/Clock notification chips — chi de dedup PromotedOngoing;
+     * khong wrap thanh AospChip (pill = IslandEvent.Timer/Stopwatch).
+     */
     val notificationKeys: Set<String> = emptySet(),
     /** Packages owning absorbed notification chips (hidden ones included). */
     val packages: Set<String> = emptySet(),
-    /** True if any promoted chronometer notification (e.g. Clock timer/stopwatch) is absorbed. */
-    val hasChronometerChip: Boolean = false,
 )
 
 @SysUISingleton
@@ -49,16 +50,16 @@ class AospChipIslandManager @Inject constructor(
                 policy.prune(all.mapTo(HashSet()) { it.key })
 
                 val absorbed = all.filter { policy.isAbsorbed(it) }
+                // Chronometer/Clock notif: ghi key/package, khong emit AospChip.
                 val notifChips = absorbed.filter { policy.isNotificationChip(it) }
 
                 AospChipSnapshot(
                     events =
                         absorbed
-                            .filterNot { policy.isNotificationChip(it) && it.isHidden }
+                            .filter { policy.isSystemChip(it) }
                             .map { IslandEvent.AospChip(active = it) },
                     notificationKeys = notifChips.mapNotNullTo(HashSet()) { it.notificationKey },
                     packages = notifChips.mapNotNullTo(HashSet()) { it.managingPackageName },
-                    hasChronometerChip = notifChips.isNotEmpty(),
                 )
             }
             .distinctUntilChanged()
