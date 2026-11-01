@@ -53,7 +53,13 @@ constructor(
         }
     }
 
-    val isBlurSupported: Flow<Boolean> = windowRootViewBlurInteractor.isTranslucentSupported
+    // Giong hang notif: translucent AND cross-window blur (tat window blur → het frost).
+    val isBlurSupported: Flow<Boolean> =
+        windowRootViewBlurInteractor.isNotificationRowFrostSupported
+
+    // Giong isBlurSupported: frost lockscreen = translucent khoa + cross-window blur.
+    val isLockscreenTranslucentSupported: Flow<Boolean> =
+        windowRootViewBlurInteractor.isLockscreenNotificationRowFrostSupported
 
     /** Notifies that the user has clicked the shelf. */
     fun onShelfClicked() {

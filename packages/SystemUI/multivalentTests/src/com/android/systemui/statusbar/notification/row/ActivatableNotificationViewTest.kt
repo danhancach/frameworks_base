@@ -32,7 +32,7 @@ import androidx.test.filters.SmallTest
 import com.android.app.animation.Interpolators
 import com.android.systemui.Flags
 import com.android.systemui.SysuiTestCase
-import com.android.systemui.common.shared.colors.SurfaceEffectColors
+import com.android.systemui.blur.AxSystemFrost
 import com.android.systemui.res.R
 import com.android.systemui.statusbar.notification.FakeShadowView
 import com.android.systemui.statusbar.notification.NotificationUtils
@@ -101,7 +101,7 @@ class ActivatableNotificationViewTest : SysuiTestCase() {
         mNormalColor =
             mContext.getColor(com.android.internal.R.color.materialColorSurfaceContainerHigh)
         mOpaqueColor = mContext.getColor(com.android.internal.R.color.materialColorSurfaceContainer)
-        mSurfaceEffectColor = SurfaceEffectColors.surfaceEffect1(mContext)
+        mSurfaceEffectColor = AxSystemFrost.surfaceColor(mContext, true)
     }
 
     @Test
