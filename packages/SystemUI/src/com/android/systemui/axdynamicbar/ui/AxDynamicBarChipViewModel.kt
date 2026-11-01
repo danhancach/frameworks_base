@@ -1,27 +1,31 @@
 package com.android.systemui.axdynamicbar.ui
 
+import android.os.SystemClock
 import com.android.systemui.animation.Expandable
 import com.android.systemui.axdynamicbar.domain.AxDynamicBarInteractor
 import com.android.systemui.axdynamicbar.model.IslandEvent
-import com.android.systemui.statusbar.chips.ui.model.OngoingActivityChipModel
 import com.android.systemui.biometrics.AuthController
 import com.android.systemui.biometrics.domain.interactor.UdfpsOverlayInteractor
+import com.android.systemui.classifier.domain.interactor.FalsingInteractor
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.statusbar.KeyguardIndicationController
+import com.android.systemui.statusbar.chips.ui.model.OngoingActivityChipModel
 import com.android.systemui.statusbar.pipeline.battery.domain.interactor.BatteryInteractor
 import com.android.systemui.statusbar.policy.BatteryController
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -56,7 +60,13 @@ constructor(
     private val keyguardIndicationController: KeyguardIndicationController,
     val keyguardExpansion: AxDynamicBarKeyguardExpansion,
     val statusBarExpansion: AxDynamicBarStatusBarExpansion,
+    private val falsingInteractor: FalsingInteractor,
 ) {
+    /** Goi ngay ACTION_DOWN (pointerInteropFilter) — tranh falsing FP unlock. */
+    fun avoidFalsingGesture() {
+        falsingInteractor.avoidGesture()
+    }
+
     val isLowUdfps: StateFlow<Boolean> =
         udfpsOverlayInteractor.udfpsOverlayParams
             .map { params ->
@@ -137,6 +147,107 @@ constructor(
                     }
                 }
         }
+        // Dem nguoc het gio → mo pill dung timer do (giong cuoc goi den; multi-timer dung onlyEventId).
+        observeTimerExpiryAutoExpand()
+    }
+
+    /**
+     * Schedule expand 1 lan / (event.id + moc end). Khong restart job neu cung stamp dang chay.
+     * Bo qua khi co cuoc goi den (collector call dang giu expand/collapse).
+     */
+    private fun observeTimerExpiryAutoExpand() {
+        applicationScope.launch {
+            val expiryJobs = ConcurrentHashMap<String, Job>()
+            val scheduledStamp = ConcurrentHashMap<String, String>()
+            val firedStamps = ConcurrentHashMap.newKeySet<String>()
+            interactor.uiState
+                .map { state ->
+                    state.events
+                        .filterIsInstance<IslandEvent.Timer>()
+                        .mapNotNull { timer ->
+                            if (timer.isPaused) return@mapNotNull null
+                            val endEr = timer.endElapsedRealtimeMs
+                            val endWall = timer.endTimeMs
+                            if (endEr <= 0L && endWall <= 0L) null
+                            else TimerExpiryWatch(timer.id, endEr, endWall)
+                        }
+                        .associateBy { it.id }
+                }
+                .distinctUntilChanged()
+                .collect { watches ->
+                    for (id in expiryJobs.keys - watches.keys) {
+                        expiryJobs.remove(id)?.cancel()
+                        scheduledStamp.remove(id)
+                        firedStamps.removeIf { it.startsWith("$id#") }
+                    }
+                    for ((id, watch) in watches) {
+                        val stamp = watch.stamp()
+                        if (stamp in firedStamps) continue
+                        if (scheduledStamp[id] == stamp && expiryJobs[id]?.isActive == true) {
+                            continue
+                        }
+                        val remainingMs = watch.remainingMs()
+                        expiryJobs.remove(id)?.cancel()
+                        scheduledStamp[id] = stamp
+                        expiryJobs[id] =
+                            launch {
+                                if (remainingMs > 0L) delay(remainingMs)
+                                if (!shouldFireTimerExpiryExpand(id, stamp)) return@launch
+                                if (!firedStamps.add(stamp)) return@launch
+                                expandForTimerExpiry(id)
+                            }
+                    }
+                }
+        }
+    }
+
+    private fun shouldFireTimerExpiryExpand(eventId: String, stamp: String): Boolean {
+        if (hasIncomingCall()) return false
+        val current =
+            interactor.uiState.value.events
+                .filterIsInstance<IslandEvent.Timer>()
+                .firstOrNull { it.id == eventId } ?: return false
+        if (current.isPaused) return false
+        return TimerExpiryWatch(
+                current.id,
+                current.endElapsedRealtimeMs,
+                current.endTimeMs,
+            )
+            .stamp() == stamp
+    }
+
+    private fun hasIncomingCall(): Boolean =
+        interactor.uiState.value.events.any {
+            it is IslandEvent.Call && it.callType == "Phone:incoming"
+        }
+
+    private fun expandForTimerExpiry(eventId: String) {
+        interactor.dismissNotificationAlert()
+        interactor.pinEventById(eventId)
+        if (interactor.isOnKeyguard.value) {
+            keyguardExpansion.expand(eventId)
+        } else {
+            statusBarExpansion.expand(eventId)
+        }
+    }
+
+    /** Moc het gio timer — schedule expand 1 lan / (id + end). */
+    private data class TimerExpiryWatch(
+        val id: String,
+        val endElapsedRealtimeMs: Long,
+        val endTimeMs: Long,
+    ) {
+        fun stamp(): String = "$id#$endElapsedRealtimeMs#$endTimeMs"
+
+        fun remainingMs(
+            nowElapsedMs: Long = SystemClock.elapsedRealtime(),
+            nowWallMs: Long = System.currentTimeMillis(),
+        ): Long =
+            when {
+                endElapsedRealtimeMs > 0L -> endElapsedRealtimeMs - nowElapsedMs
+                endTimeMs > 0L -> endTimeMs - nowWallMs
+                else -> Long.MAX_VALUE
+            }
     }
 
     // Re-compute charging string whenever battery info changes
@@ -201,13 +312,16 @@ constructor(
 
     fun cyclePrev() = interactor.cyclePrev()
 
+    /** Pin event theo id (stack reorder commit Samsung Now Bar). */
+    fun pinEventById(eventId: String) = interactor.pinEventById(eventId)
+
     fun dismissEvent(event: IslandEvent) = interactor.dismissEvent(event)
 
-    fun togglePlayPause() = interactor.togglePlayPause()
+    fun togglePlayPause(mediaKey: String) = interactor.togglePlayPause(mediaKey)
 
-    fun skipNext() = interactor.skipNext()
+    fun skipNext(mediaKey: String) = interactor.skipNext(mediaKey)
 
-    fun skipPrev() = interactor.skipPrev()
+    fun skipPrev(mediaKey: String) = interactor.skipPrev(mediaKey)
 
     fun toggleTorch() = interactor.toggleTorch()
 

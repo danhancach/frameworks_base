@@ -2,121 +2,61 @@
 
 package com.android.systemui.axdynamicbar.ui.compose
 
-import androidx.compose.runtime.mutableIntStateOf
-import kotlinx.coroutines.flow.drop
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.coroutineScope
-import androidx.compose.runtime.snapshotFlow
-import androidx.compose.animation.core.keyframes
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.Animatable
-import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.LayerDrawable
-import android.util.TypedValue
 import android.view.MotionEvent
-import android.widget.SeekBar
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.SizeTransform
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.StartOffset
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Shuffle
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.AvTimer
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearWavyProgressIndicator
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.viewinterop.AndroidView
-import kotlin.math.cos
-import kotlin.math.sin
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.dp
-import com.android.systemui.axdynamicbar.shared.IslandActions
-import com.android.systemui.res.R
 import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.model.RecordingState
 import com.android.systemui.axdynamicbar.shared.*
 import com.android.systemui.haptics.slider.compose.ui.SliderHapticsViewModel
-import com.android.systemui.media.controls.ui.drawable.SquigglyProgress
+import com.android.systemui.res.R
 import kotlinx.coroutines.delay
 
-private val KeyguardSeekBarHeight = 28.dp
+/**
+ * true khi host morph (Layout + KeyguardIslandBlurBg) da la khung —
+ * panel/chronometer/pill bo blur/clip rieng (mot be mat kinh).
+ */
+internal val LocalKeyguardMorphHostFrame = staticCompositionLocalOf { false }
 
 @Composable
 internal fun KeyguardExpandedContent(
@@ -125,6 +65,9 @@ internal fun KeyguardExpandedContent(
     interactor: IslandActions,
     onCollapse: () -> Unit,
     hapticsViewModelFactory: SliderHapticsViewModel.Factory,
+    onAvoidFalsing: () -> Unit = {},
+    /** Popup neo tu pill lower-region — khong fillMaxSize (tranh panel lech tren lock icon). */
+    asPillAnchoredPopup: Boolean = false,
 ) {
     if (event is IslandEvent.KeyguardIndication ||
         event is IslandEvent.AppSwitch ||
@@ -136,126 +79,147 @@ internal fun KeyguardExpandedContent(
 
     val view = LocalView.current
     val touchSlop = LocalViewConfiguration.current.touchSlop
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .pointerInteropFilter {
-                when (it.actionMasked) {
-                    MotionEvent.ACTION_DOWN,
-                    MotionEvent.ACTION_MOVE -> view.parent?.requestDisallowInterceptTouchEvent(true)
-                    MotionEvent.ACTION_UP,
-                    MotionEvent.ACTION_CANCEL -> view.parent?.requestDisallowInterceptTouchEvent(false)
-                }
-                false
-            }
-            .pointerInput(onCollapse, touchSlop) {
-                awaitEachGesture {
-                    var downEvent = awaitPointerEvent(PointerEventPass.Final)
-                    while (downEvent.changes.none { it.changedToDownIgnoreConsumed() }) {
-                        downEvent = awaitPointerEvent(PointerEventPass.Final)
+    val rootModifier =
+        if (asPillAnchoredPopup) {
+            Modifier.fillMaxWidth()
+        } else {
+            Modifier.fillMaxSize()
+        }
+    CompositionLocalProvider(LocalKeyguardMorphHostFrame provides asPillAnchoredPopup) {
+        Box(
+            modifier = rootModifier
+                .pointerInteropFilter {
+                    // Chi avoidFalsing — khong disallow som (nut/slider uu tien).
+                    if (it.actionMasked == MotionEvent.ACTION_DOWN) {
+                        onAvoidFalsing()
                     }
-                    val down = downEvent.changes.first { it.changedToDownIgnoreConsumed() }
-                    val downPosition = down.position
-                    val downConsumed = down.isConsumed
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Final)
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                            ?: event.changes.firstOrNull()
-                            ?: break
-                        if (!change.pressed) {
-                            if (!downConsumed && !change.isConsumed) {
-                                val dx = change.position.x - downPosition.x
+                    false
+                }
+                .pointerInput(onCollapse, touchSlop, asPillAnchoredPopup) {
+                    awaitEachGesture {
+                        // Final: sau control con. Khong return som khi DOWN consumed —
+                        // than Media (islandCardSurface) van keo xuong collapse sau nguong.
+                        var downEvent = awaitPointerEvent(PointerEventPass.Final)
+                        while (downEvent.changes.none { it.changedToDownIgnoreConsumed() }) {
+                            downEvent = awaitPointerEvent(PointerEventPass.Final)
+                        }
+                        val down = downEvent.changes.first { it.changedToDownIgnoreConsumed() }
+                        val downPosition = down.position
+                        var draggingDown = false
+                        // true den UP/CANCEL — khong reset khi MOVE khong con consumed.
+                        var childTookOver = false
+                        try {
+                            while (true) {
+                                // Dang keo collapse: Initial de chiem tu clickable than.
+                                val pass =
+                                    if (draggingDown) PointerEventPass.Initial
+                                    else PointerEventPass.Final
+                                val event = awaitPointerEvent(pass)
+                                val change = event.changes.firstOrNull { it.id == down.id }
+                                    ?: event.changes.firstOrNull()
+                                    ?: break
                                 val dy = change.position.y - downPosition.y
-                                if (dx * dx + dy * dy <= touchSlop * touchSlop) {
+                                val dx = change.position.x - downPosition.x
+                                val pastSlop =
+                                    kotlin.math.abs(dx) > touchSlop ||
+                                        kotlin.math.abs(dy) > touchSlop
+                                val verticalCollapseIntent =
+                                    dy > touchSlop &&
+                                        kotlin.math.abs(dy) >
+                                            kotlin.math.abs(dx) * 1.2f
+                                if (
+                                    !draggingDown &&
+                                    !childTookOver &&
+                                    verticalCollapseIntent
+                                ) {
+                                    draggingDown = true
                                     change.consume()
-                                    onCollapse()
+                                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                                } else if (
+                                    !draggingDown &&
+                                    !childTookOver &&
+                                    change.isConsumed &&
+                                    pastSlop
+                                ) {
+                                    childTookOver = true
+                                }
+                                if (childTookOver && !draggingDown) {
+                                    if (!change.pressed) break
+                                    continue
+                                }
+                                if (draggingDown) change.consume()
+                                if (!change.pressed) {
+                                    if (draggingDown && dy > touchSlop) {
+                                        change.consume()
+                                        onCollapse()
+                                    } else if (
+                                        !asPillAnchoredPopup &&
+                                        !change.isConsumed &&
+                                        dx * dx + dy * dy <= touchSlop * touchSlop
+                                    ) {
+                                        // Tap ngoai panel (full-screen host).
+                                        change.consume()
+                                        onCollapse()
+                                    }
+                                    break
                                 }
                             }
-                            break
+                        } finally {
+                            view.parent?.requestDisallowInterceptTouchEvent(false)
                         }
                     }
-                }
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        when (event) {
-            is IslandEvent.Media -> KeyguardMediaPanel(event, interactor)
-            is IslandEvent.Timer -> KeyguardTimerPanel(event, interactor)
-            is IslandEvent.Stopwatch -> KeyguardStopwatchPanel(event, interactor)
-            is IslandEvent.AudioRecording -> KeyguardAudioRecordingPanel(event, interactor)
-            else -> KeyguardGenericPanel(event, interactor, hapticsViewModelFactory)
-        }
-    }
-}
-
-@Composable
-private fun ProgressRing(
-    progress: Float,
-    color: Color,
-    modifier: Modifier = Modifier,
-    trackColor: Color = color.copy(alpha = AlphaFaint),
-    strokeWidth: Dp = 10.dp,
-    handleRadius: Dp = 8.dp,
-) {
-    Canvas(modifier = modifier) {
-        val stroke = strokeWidth.toPx()
-        val handle = handleRadius.toPx()
-        val pad = handle.coerceAtLeast(stroke / 2)
-        val arcSize = Size(size.width - pad * 2, size.height - pad * 2)
-        val topLeft = Offset(pad, pad)
-        drawArc(
-            color = trackColor,
-            startAngle = -90f,
-            sweepAngle = 360f,
-            useCenter = false,
-            topLeft = topLeft,
-            size = arcSize,
-            style = Stroke(width = stroke, cap = StrokeCap.Round),
-        )
-        if (progress > 0f) {
-            val sweep = 360f * progress
-            drawArc(
-                color = color,
-                startAngle = -90f,
-                sweepAngle = sweep,
-                useCenter = false,
-                topLeft = topLeft,
-                size = arcSize,
-                style = Stroke(width = stroke, cap = StrokeCap.Round),
-            )
-            val angleRad = Math.toRadians((-90.0 + sweep)).toFloat()
-            val cx = size.width / 2 + (arcSize.width / 2) * cos(angleRad)
-            val cy = size.height / 2 + (arcSize.height / 2) * sin(angleRad)
-            drawCircle(color = color, radius = handle, center = Offset(cx, cy))
+                },
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            when (event) {
+                // Giong Timer: khong boc KeyguardPanelSurface — RemoteViews clock / MediaCard
+                // tu xu ly hit; PanelSurface clickable long tranh Surface(onClick) cua nut.
+                is IslandEvent.Media -> MediaCard(event, interactor)
+                is IslandEvent.Timer -> KeyguardTimerPanel(event, interactor, onCollapse)
+                is IslandEvent.Stopwatch -> KeyguardStopwatchPanel(event, interactor, onCollapse)
+                is IslandEvent.AudioRecording -> KeyguardAudioRecordingPanel(event, interactor)
+                else -> KeyguardGenericPanel(event, interactor, hapticsViewModelFactory)
+            }
         }
     }
 }
 
 /**
- * The frosted keyguard panel. The blur backdrop is the surface (opaque [CardBg] where blur is
- * unavailable). The inert clickable is load-bearing: it consumes taps on the panel so the
- * tap-outside-to-collapse handler in [KeyguardExpandedContent] only fires outside it — without it
- * a tap on album art or the countdown would collapse the panel, and the full-height media panel
- * would leave nowhere to tap that doesn't.
+ * Be mat kinh keyguard (blur/opaque CardBg). Clickable ro: nuot tap trong panel
+ * de handler tap-ngoai-collapse chi chay ngoai the.
+ *
+ * Khi [LocalKeyguardMorphHostFrame]: host morph da co blur+corner — chi noi dung, khong the rieng.
  */
 @Composable
 private fun KeyguardPanelSurface(
     modifier: Modifier = Modifier.fillMaxWidth(),
     content: @Composable () -> Unit,
 ) {
-    Box(
-        modifier = Modifier
-            .widthIn(max = ExpandedMaxWidth)
-            .then(modifier)
-            .padding(horizontal = SpaceSection)
-            .clip(ShapeXl)
-            .islandBlur(RadiusXl, CardBg)
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = {},
-            ),
-    ) {
+    val morphHostFrame = LocalKeyguardMorphHostFrame.current
+    val surfaceMod =
+        if (morphHostFrame) {
+            Modifier
+                .fillMaxWidth()
+                .then(modifier)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {},
+                )
+        } else {
+            Modifier
+                .widthIn(max = ExpandedMaxWidth)
+                .then(modifier)
+                .padding(horizontal = SpaceSection)
+                .clip(ShapeXl)
+                .islandBlur(RadiusXl, CardBg)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {},
+                )
+        }
+    Box(modifier = surfaceMod) {
         content()
     }
 }
@@ -279,670 +243,46 @@ private fun TonalBanner(
 }
 
 @Composable
-private fun KeyguardMediaPanel(event: IslandEvent.Media, interactor: IslandActions) {
-    val colors = rememberMediaColors(event)
-    val motionScheme = MaterialTheme.motionScheme
-
-    KeyguardPanelSurface(Modifier.fillMaxSize()) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(SpaceSection),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Box(
-            modifier = Modifier
-                .weight(1f, fill = true)
-                .fillMaxWidth(),
-            contentAlignment = Alignment.Center,
-        ) {
-            AnimatedContent(
-                targetState = event.albumArt,
-                transitionSpec = {
-                    fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                        fadeOut(motionScheme.fastEffectsSpec()) using
-                        SizeTransform(clip = false)
-                },
-                contentKey = { it?.hashCode() ?: 0 },
-                label = "kg_media_album_art",
-            ) { art ->
-                if (art != null) {
-                    Image(
-                        bitmap = art.toSquareScaledBitmap(SizeAlbumLg),
-                        contentDescription = null,
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .aspectRatio(1f)
-                            .clip(ShapeLg),
-                        contentScale = ContentScale.Crop,
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .aspectRatio(1f)
-                            .clip(ShapeLg)
-                            .background(colors.tonal),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(Icons.Filled.MusicNote, null, tint = colors.accent.copy(AlphaDisabled), modifier = Modifier.size(SpacePanelLarge))
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(SpaceLg))
-
-        val trackText = event.track.ifEmpty { stringResource(R.string.ax_dynamic_bar_now_playing) }
-        AnimatedContent(
-            targetState = trackText,
-            transitionSpec = {
-                fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                    fadeOut(motionScheme.fastEffectsSpec()) using
-                    SizeTransform(clip = false)
-            },
-            label = "kg_media_track",
-        ) { title ->
-            Text(
-                title,
-                color = OnCardText,
-                style = MaterialTheme.typography.titleLarge,
-                textAlign = TextAlign.Center,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-
-        if (event.artist.isNotEmpty()) {
-            Spacer(Modifier.height(SpaceMd))
-            AnimatedContent(
-                targetState = event.artist,
-                transitionSpec = {
-                    fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                        fadeOut(motionScheme.fastEffectsSpec()) using
-                        SizeTransform(clip = false)
-                },
-                label = "kg_media_artist",
-            ) { artist ->
-                Text(
-                    artist,
-                    color = OnCardSecondary,
-                    style = MaterialTheme.typography.bodyMedium,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-
-        Spacer(Modifier.height(SpaceLg))
-
-        // An inner well rather than a second opaque card: it sits on the frosted panel, so a
-        // translucent fill keeps the glass reading through.
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.dp, CardBorderBrush, ShapeCard),
-            shape = ShapeCard,
-            color = DarkCard.copy(alpha = AlphaGlass),
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = SpaceXxl, vertical = SpaceLg),
-                verticalArrangement = Arrangement.Center,
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Row(
-                        modifier = Modifier.weight(1f),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(SpaceMd),
-                    ) {
-                        event.appIcon?.let { icon ->
-                            Image(
-                                bitmap = icon.toScaledBitmap(SizeIconSm),
-                                contentDescription = null,
-                                modifier = Modifier.size(SizeIconSm).clip(ShapeXs),
-                                colorFilter = ColorFilter.tint(colors.accent),
-                            )
-                        } ?: Icon(
-                            Icons.Filled.MusicNote,
-                            null,
-                            tint = colors.accent,
-                            modifier = Modifier.size(SizeIconSm),
-                        )
-                        Text(
-                            event.outputDeviceName.ifBlank {
-                                stringResource(R.string.ax_dynamic_bar_now_playing)
-                            },
-                            color = OnCardText,
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    Surface(
-                        onClick = {
-                            interactor.openMediaOutputSwitcher()
-                            interactor.collapseIsland()
-                        },
-                        shape = ShapeChip,
-                        color = colors.accent.copy(alpha = AlphaSubtle),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = SpaceLg, vertical = SpaceSm),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(SpaceXs),
-                        ) {
-                            Icon(
-                                Icons.Filled.VolumeUp,
-                                stringResource(R.string.ax_dynamic_bar_output),
-                                tint = colors.accent,
-                                modifier = Modifier.size(SizeIconSm),
-                            )
-                        }
-                    }
-                }
-
-                if (event.duration > 0L) {
-                    Spacer(Modifier.height(SpaceMd))
-                    KeyguardMediaSeekBar(event, interactor, colors.accent)
-                }
-
-                Spacer(Modifier.height(SpaceMd))
-
-                var customAction1ToggleCount by remember { mutableIntStateOf(0) }
-                var prevToggleCount by remember { mutableIntStateOf(0) }
-                var playPauseToggleCount by remember { mutableIntStateOf(0) }
-                var nextToggleCount by remember { mutableIntStateOf(0) }
-                var customAction2ToggleCount by remember { mutableIntStateOf(0) }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(
-                        onClick = {
-                            event.customActions.firstOrNull()?.let {
-                                interactor.sendCustomAction(it.action)
-                            }
-                            customAction1ToggleCount++
-                        },
-                        modifier = Modifier.size(SizeButtonLg).squishAnimation(customAction1ToggleCount),
-                    ) {
-                        val ca = event.customActions.firstOrNull()
-                        if (ca != null) {
-                            CustomActionIcon(ca, tint = OnCardSecondary, modifier = Modifier.size(SizeIconMd))
-                        } else {
-                            Icon(Icons.Filled.Shuffle, stringResource(R.string.ax_dynamic_bar_shuffle), tint = OnCardSecondary, modifier = Modifier.size(SizeIconMd))
-                        }
-                    }
-
-                    Spacer(Modifier.width(SpaceSm))
-
-                    IconButton(
-                        onClick = {
-                            interactor.skipPrev()
-                            prevToggleCount++
-                        },
-                        modifier = Modifier.size(SizeButtonLg).squishAnimation(prevToggleCount),
-                    ) {
-                        Icon(Icons.Filled.SkipPrevious, stringResource(R.string.ax_dynamic_bar_previous), tint = OnCardText, modifier = Modifier.size(SizeIconMd))
-                    }
-
-                    Spacer(Modifier.width(SpaceSm))
-
-                    Surface(
-                        onClick = {
-                            interactor.togglePlayPause()
-                            playPauseToggleCount++
-                        },
-                        modifier = Modifier.size(SizeButtonLg).squishAnimation(playPauseToggleCount),
-                        shape = CircleShape,
-                        color = colors.accent.copy(alpha = AlphaAccent),
-                    ) {
-                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                            AnimatedContent(
-                                targetState = event.isPlaying,
-                                transitionSpec = {
-                                    fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
-                                        fadeOut(motionScheme.fastEffectsSpec())
-                                },
-                                label = "kg_media_playpause",
-                            ) { playing ->
-                                Icon(
-                                    if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                    if (playing) stringResource(R.string.ax_dynamic_bar_pause) else stringResource(R.string.ax_dynamic_bar_play),
-                                    tint = colors.accent,
-                                    modifier = Modifier.size(SizeIconMd),
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.width(SpaceSm))
-
-                    IconButton(
-                        onClick = {
-                            interactor.skipNext()
-                            nextToggleCount++
-                        },
-                        modifier = Modifier.size(SizeButtonLg).squishAnimation(nextToggleCount),
-                    ) {
-                        Icon(Icons.Filled.SkipNext, stringResource(R.string.ax_dynamic_bar_next), tint = OnCardText, modifier = Modifier.size(SizeIconMd))
-                    }
-
-                    Spacer(Modifier.width(SpaceSm))
-
-                    IconButton(
-                        onClick = {
-                            event.customActions.getOrNull(1)?.let {
-                                interactor.sendCustomAction(it.action)
-                            }
-                            customAction2ToggleCount++
-                        },
-                        modifier = Modifier.size(SizeButtonLg).squishAnimation(customAction2ToggleCount),
-                    ) {
-                        val ca = event.customActions.getOrNull(1)
-                        if (ca != null) {
-                            CustomActionIcon(ca, tint = OnCardSecondary, modifier = Modifier.size(SizeIconMd))
-                        } else {
-                            Icon(Icons.Filled.Shuffle, stringResource(R.string.ax_dynamic_bar_shuffle), tint = OnCardSecondary, modifier = Modifier.size(SizeIconMd))
-                        }
-                    }
-                }
-            }
-        }
-    }
-    }
-}
-
-@Composable
-private fun KeyguardMediaSeekBar(
-    event: IslandEvent.Media,
+private fun KeyguardTimerPanel(
+    event: IslandEvent.Timer,
     interactor: IslandActions,
-    accent: Color,
+    onCollapse: () -> Unit,
 ) {
-    val mediaProgress = rememberMediaProgress(event)
-    val isPlaying = event.isPlaying
-    val durationMs = event.duration
-    val positionMs = mediaProgress.positionMs
-    val serverFraction = mediaProgress.progress
-    val speed = event.playbackSpeed.takeIf { it > 0f } ?: 1f
-
-    // What is playing; a new track or source restarts interpolation.
-    val mediaKey = "${event.packageName}|${event.track}|${event.artist}"
-
-    var isScrubbing by remember { mutableStateOf(false) }
-    var displayFraction by remember { mutableFloatStateOf(serverFraction) }
-
-    val interactorRef = rememberUpdatedState(interactor)
-    // Gesture handlers are installed once; read the duration through state so seeks after a
-    // track change use the current track's length.
-    val durationRef = rememberUpdatedState(durationMs)
-
-    // Read the dismiss swipe lock provided by MagneticSwipeToDismiss
-    val swipeLock = LocalDismissSwipeLock.current
-
-    // Frame-interpolated progress while playing; snaps to the reported value otherwise.
-    LaunchedEffect(mediaKey, positionMs, durationMs, isPlaying, speed) {
-        if (isScrubbing) return@LaunchedEffect
-
-        displayFraction = serverFraction
-
-        if (!isPlaying || durationMs <= 0L) return@LaunchedEffect
-
-        val startProgressMs = positionMs
-        val startNanos = withFrameNanos { it }
-        while (true) {
-            val frameNanos = withFrameNanos { it }
-            if (isScrubbing) break
-            val elapsedMs = (frameNanos - startNanos) / 1_000_000L
-            val interpolated =
-                ((startProgressMs + elapsedMs * speed) / durationMs).coerceIn(0f, 1f)
-            displayFraction = interpolated
-            if (interpolated >= 1f) break
+    // RemoteViews goc Clock — khong Compose countdown / synthetic Pause.
+    val remainingMs = event.displayedRemainingMs()
+    val hasTime =
+        event.endTimeMs > 0L || event.pausedRemainingMs > 0L || event.endElapsedRealtimeMs > 0L
+    val subtitle =
+        when {
+            hasTime -> formatCountdownLong(remainingMs)
+            event.isPaused -> stringResource(R.string.ax_dynamic_bar_paused)
+            else -> stringResource(R.string.ax_dynamic_bar_running)
         }
-    }
-
-    val displayMs = (displayFraction * durationMs).toLong()
-    val accentArgb = accent.toArgb()
-    val trackAlphaArgb = accent.copy(alpha = AlphaSubtle).toArgb()
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(KeyguardSeekBarHeight)
-            .pointerInput(swipeLock) {
-                awaitEachGesture {
-                    awaitPointerEvent()
-                    swipeLock.value = true
-                    try {
-                        do {
-                            val event = awaitPointerEvent()
-                        } while (event.changes.any { it.pressed })
-                    } finally {
-                        swipeLock.value = false
-                    }
-                }
-            }
-            .pointerInput("tap") {
-                detectTapGestures { offset ->
-                    val f = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                    displayFraction = f
-                    interactorRef.value.seekTo((f * durationRef.value).toLong())
-                }
-            }
-            .pointerInput("drag") {
-                detectHorizontalDragGestures(
-                    onDragStart = { offset ->
-                        isScrubbing = true
-                        displayFraction = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                    },
-                    onDragEnd = {
-                        interactorRef.value.seekTo((displayFraction * durationRef.value).toLong())
-                        isScrubbing = false
-                    },
-                    onDragCancel = { isScrubbing = false },
-                    onHorizontalDrag = { change, _ ->
-                        displayFraction =
-                            (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                        change.consume()
-                    },
-                )
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        AndroidView(
-            factory = { context ->
-                SeekBar(context).apply {
-                    max = 10_000
-                    splitTrack = false
-                    setPadding(0, 0, 0, 0)
-                    isEnabled = false
-
-                    thumb = createKeyguardSeekBarThumb(context, accentArgb)
-                    thumbOffset = thumb.intrinsicWidth / 2
-
-                    val layer = (progressDrawable?.mutate() as? LayerDrawable)
-                    if (layer != null) {
-                        layer.findDrawableByLayerId(android.R.id.background)
-                            ?.mutate()?.setTint(trackAlphaArgb)
-
-                        layer.findDrawableByLayerId(android.R.id.secondaryProgress)
-                            ?.mutate()?.setTint(
-                                com.android.internal.graphics.ColorUtils
-                                    .setAlphaComponent(accentArgb, 60)
-                            )
-
-                        val squiggle = SquigglyProgress().apply {
-                            waveLength = context.resources.getDimensionPixelSize(
-                                R.dimen.qs_media_seekbar_progress_wavelength
-                            ).toFloat()
-                            lineAmplitude = context.resources.getDimensionPixelSize(
-                                R.dimen.qs_media_seekbar_progress_amplitude
-                            ).toFloat()
-                            phaseSpeed = context.resources.getDimensionPixelSize(
-                                R.dimen.qs_media_seekbar_progress_phase
-                            ).toFloat()
-                            strokeWidth = context.resources.getDimensionPixelSize(
-                                R.dimen.qs_media_seekbar_progress_stroke_width
-                            ).toFloat()
-                            setTint(accentArgb)
-                            drawRemainingLine = false
-                            transitionEnabled = false
-                            animate = false
-                        }
-                        layer.setDrawableByLayerId(android.R.id.progress, squiggle)
-                        progressDrawable = layer
-                    }
-                }
-            },
-            update = { bar ->
-                val target = (displayFraction * 10_000f).toInt().coerceIn(0, 10_000)
-                bar.progress = target
-
-                // Re-tint thumb for accent color changes (e.g. track switch)
-                (bar.thumb as? GradientDrawable)?.setColor(accentArgb)
-
-                val alpha = if (isPlaying) 255 else (255 * 0.55f).toInt()
-                bar.thumb?.alpha = alpha
-
-                val layer = bar.progressDrawable as? LayerDrawable
-
-                // Re-tint track colors
-                layer?.findDrawableByLayerId(android.R.id.background)
-                    ?.setTint(trackAlphaArgb)
-                layer?.findDrawableByLayerId(android.R.id.secondaryProgress)
-                    ?.setTint(
-                        com.android.internal.graphics.ColorUtils
-                            .setAlphaComponent(accentArgb, 60)
-                    )
-
-                val squiggle = layer
-                    ?.findDrawableByLayerId(android.R.id.progress) as? SquigglyProgress
-
-                squiggle?.apply {
-                    setTint(accentArgb)
-                    setAlpha(alpha)
-                    animate = isPlaying && !isScrubbing
-                }
-
-                layer?.alpha = alpha
-            },
-            modifier = Modifier.fillMaxWidth().height(KeyguardSeekBarHeight),
-        )
-    }
-    Spacer(Modifier.height(SpaceXs))
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Text(formatElapsedTime(displayMs), color = OnCardSecondary, style = MaterialTheme.typography.labelSmall)
-        Text(formatElapsedTime(event.duration), color = OnCardSecondary, style = MaterialTheme.typography.labelSmall)
-    }
-}
-
-private fun createKeyguardSeekBarThumb(context: android.content.Context, tintColor: Int): GradientDrawable {
-    val wPx = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, 4f, context.resources.displayMetrics
-    ).toInt().coerceAtLeast(1)
-    val hPx = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, 16f, context.resources.displayMetrics
-    ).toInt().coerceAtLeast(1)
-    val radiusPx = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, 16f, context.resources.displayMetrics
+    // ChronometerRemoteViewsExpanded da boc khung QS — khong them KeyguardPanelSurface padding lon.
+    ChronometerRemoteViewsExpanded(
+        sbn = event.sbn,
+        fallbackLabel = event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_timer) },
+        fallbackSubtitle = subtitle,
+        contentIntent = event.contentIntent,
+        packageName = event.packageName,
+        interactor = interactor,
     )
-    return GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        setSize(wPx, hPx)
-        cornerRadius = radiusPx
-        setColor(tintColor)
-    }
 }
 
 @Composable
-private fun KeyguardTimerPanel(event: IslandEvent.Timer, interactor: IslandActions) {
-    val context = LocalContext.current
-    val colors = rememberIslandColors(event)
-    var remainingMs by remember(event.endTimeMs) {
-        mutableLongStateOf((event.endTimeMs - System.currentTimeMillis()).coerceAtLeast(0L))
-    }
-    if (!event.isPaused) {
-        LaunchedEffect(event.endTimeMs) {
-            while (remainingMs > 0L) {
-                delay(500)
-                remainingMs = (event.endTimeMs - System.currentTimeMillis()).coerceAtLeast(0L)
-            }
-        }
-    }
-
-    val elapsedFraction = if (event.originalDurationMs > 0L)
-        (remainingMs.toFloat() / event.originalDurationMs).coerceIn(0f, 1f)
-    else 0f
-
-    val pulseTransition = rememberInfiniteTransition(label = "timer_pulse")
-    val pulseScale by pulseTransition.animateFloat(
-        initialValue = 1f, targetValue = if (remainingMs < 10_000L) 1.06f else 1f,
-        animationSpec = infiniteRepeatable(tween(500), RepeatMode.Reverse),
-        label = "timer_pulse_scale",
+private fun KeyguardStopwatchPanel(
+    event: IslandEvent.Stopwatch,
+    interactor: IslandActions,
+    onCollapse: () -> Unit,
+) {
+    ChronometerRemoteViewsExpanded(
+        sbn = event.sbn,
+        fallbackLabel = event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_stopwatch) },
+        fallbackSubtitle = formatStopwatch(event.displayedElapsedMs()),
+        contentIntent = event.contentIntent,
+        packageName = event.packageName,
+        interactor = interactor,
     )
-
-    KeyguardPanelSurface { Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(SpaceSection),
-        verticalArrangement = Arrangement.spacedBy(SpaceXxl),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        TonalBanner(colors) {
-            Box(
-                modifier = Modifier
-                    .size(32.dp)
-                    .clip(CircleShape)
-                    .background(colors.accent.copy(alpha = AlphaSubtle)),
-                contentAlignment = Alignment.Center,
-            ) {
-                eventStyleFor(event).icon?.let { Icon(it, null, tint = colors.accent, modifier = Modifier.size(18.dp)) }
-            }
-            Text(
-                event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_timer) }.uppercase(),
-                color = colors.accent,
-                style = MaterialTheme.typography.labelMedium,
-            )
-        }
-
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier.size(SizeAlbumLg)
-                .graphicsLayer { scaleX = pulseScale; scaleY = pulseScale },
-        ) {
-            ProgressRing(
-                progress = elapsedFraction,
-                color = colors.accent,
-                modifier = Modifier.fillMaxSize(),
-            )
-            Text(
-                if (event.isPaused) stringResource(R.string.ax_dynamic_bar_paused) else formatCountdownLong(remainingMs),
-                color = OnCardText,
-                style = MaterialTheme.typography.displayMedium,
-            )
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(SpaceLg),
-        ) {
-            val toggleAction = event.actions.firstOrNull()
-            if (toggleAction != null) {
-                ExpressivePillButton(
-                    label = if (event.isPaused) stringResource(R.string.ax_dynamic_bar_resume) else stringResource(R.string.ax_dynamic_bar_pause),
-                    icon = if (event.isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
-                    contentColor = colors.onAccent,
-                    backgroundColor = colors.accent,
-                    modifier = Modifier.weight(1f),
-                    onClick = { toggleAction.action.actionIntent?.sendWithBal(context) },
-                )
-            }
-            ExpressivePillButton(
-                label = stringResource(R.string.ax_dynamic_bar_dismiss),
-                icon = Icons.Filled.Stop,
-                contentColor = colors.accent,
-                backgroundColor = colors.tonal,
-                modifier = Modifier.weight(1f),
-                onClick = { interactor.dismissEvent(event) },
-            )
-        }
-    }
-}
-}
-
-@Composable
-private fun KeyguardStopwatchPanel(event: IslandEvent.Stopwatch, interactor: IslandActions) {
-    val context = LocalContext.current
-    val colors = rememberIslandColors(event)
-    var elapsedMs by remember(event.startTimeMs) {
-        mutableLongStateOf((System.currentTimeMillis() - event.startTimeMs).coerceAtLeast(0L))
-    }
-    if (event.isRunning) {
-        LaunchedEffect(event.startTimeMs) {
-            while (true) {
-                delay(200)
-                elapsedMs = (System.currentTimeMillis() - event.startTimeMs).coerceAtLeast(0L)
-            }
-        }
-    }
-
-    val secFraction = if (event.isRunning) (elapsedMs % 60000) / 60000f else 0f
-
-    KeyguardPanelSurface { Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(SpaceSection),
-        verticalArrangement = Arrangement.spacedBy(SpaceXxl),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        TonalBanner(colors) {
-            Box(
-                modifier = Modifier
-                    .size(32.dp)
-                    .clip(CircleShape)
-                    .background(colors.accent.copy(alpha = AlphaSubtle)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Filled.AvTimer, null, tint = colors.accent, modifier = Modifier.size(18.dp))
-            }
-            Text(
-                event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_stopwatch) }.uppercase(),
-                color = colors.accent,
-                style = MaterialTheme.typography.labelMedium,
-            )
-        }
-
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(SizeAlbumLg)) {
-            ProgressRing(
-                progress = secFraction,
-                color = colors.accent,
-                modifier = Modifier.fillMaxSize(),
-            )
-            Text(
-                if (event.isRunning) formatStopwatch(elapsedMs) else stringResource(R.string.ax_dynamic_bar_paused),
-                color = OnCardText,
-                style = MaterialTheme.typography.displayMedium,
-            )
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(SpaceLg),
-        ) {
-            val toggleAction = event.actions.firstOrNull()
-            if (toggleAction != null) {
-                ExpressivePillButton(
-                    label = if (event.isRunning) stringResource(R.string.ax_dynamic_bar_pause) else stringResource(R.string.ax_dynamic_bar_resume),
-                    icon = if (event.isRunning) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                    contentColor = colors.onAccent,
-                    backgroundColor = colors.accent,
-                    modifier = Modifier.weight(1f),
-                    onClick = { toggleAction.action.actionIntent?.sendWithBal(context) },
-                )
-            }
-            ExpressivePillButton(
-                label = stringResource(R.string.ax_dynamic_bar_reset),
-                icon = Icons.Filled.Stop,
-                contentColor = colors.accent,
-                backgroundColor = colors.tonal,
-                modifier = Modifier.weight(1f),
-                onClick = { interactor.dismissEvent(event) },
-            )
-        }
-    }
-}
 }
 
 @Composable
@@ -1079,45 +419,3 @@ private fun KeyguardGenericPanel(
 }
 }
 
-@Composable
-private fun Modifier.squishAnimation(toggleCount: Int): Modifier {
-    val scaleX = remember { Animatable(1f, visibilityThreshold = 0.01f) }
-    val scaleY = remember { Animatable(1f, visibilityThreshold = 0.01f) }
-    val currentToggleCount by rememberUpdatedState(toggleCount)
-    LaunchedEffect(Unit) {
-        snapshotFlow { currentToggleCount }
-            .drop(1)
-            .collectLatest {
-                scaleX.snapTo(1f)
-                scaleY.snapTo(1f)
-                coroutineScope {
-                    launch {
-                        scaleX.animateTo(
-                            targetValue = 1f,
-                            animationSpec = keyframes {
-                                durationMillis = 400
-                                1.066f at 120 using FastOutSlowInEasing
-                                0.967f at 260
-                                1f at 400
-                            },
-                        )
-                    }
-                    launch {
-                        scaleY.animateTo(
-                            targetValue = 1f,
-                            animationSpec = keyframes {
-                                durationMillis = 400
-                                0.945f at 120 using FastOutSlowInEasing
-                                1.033f at 260
-                                1f at 400
-                            },
-                        )
-                    }
-                }
-            }
-    }
-    return this.graphicsLayer {
-        this.scaleX = scaleX.value
-        this.scaleY = scaleY.value
-    }
-}
