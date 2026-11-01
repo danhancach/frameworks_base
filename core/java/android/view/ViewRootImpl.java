@@ -109,6 +109,7 @@ import static android.view.WindowManager.LayoutParams.TYPE_APPLICATION_STARTING;
 import static android.view.WindowManager.LayoutParams.TYPE_BASE_APPLICATION;
 import static android.view.WindowManager.LayoutParams.TYPE_INPUT_METHOD;
 import static android.view.WindowManager.LayoutParams.TYPE_INPUT_METHOD_DIALOG;
+import static android.view.WindowManager.LayoutParams.TYPE_NOTIFICATION_SHADE;
 import static android.view.WindowManager.LayoutParams.TYPE_STATUS_BAR_ADDITIONAL;
 import static android.view.WindowManager.LayoutParams.TYPE_SYSTEM_ALERT;
 import static android.view.WindowManager.LayoutParams.TYPE_TOAST;
@@ -1256,7 +1257,8 @@ public final class ViewRootImpl implements ViewParent,
     // time for initial touch boost period.
     private static final int FRAME_RATE_INITIAL_TOUCH_BOOST_TIME = 30;
     // time for touch boost period.
-    private static final int FRAME_RATE_TOUCH_BOOST_TIME = 3000;
+    // OEM: HighHint hold 1000ms (stock 3000); giu mIsTouchBoosting khi velocity AT_LEAST.
+    private static final int FRAME_RATE_TOUCH_BOOST_TIME = 1000;
     // Timeout for the other frame rate boosts other than touch boost.
     private static final int FRAME_RATE_BOOST_TIME = 3000;
     // time for evaluating the interval between current time and
@@ -14512,8 +14514,9 @@ public final class ViewRootImpl implements ViewParent,
         if (frameRate <= 0) {
             return;
         }
+        // AT_LEAST (setFrameContentVelocity luc coast): khong tat mIsTouchBoosting —
+        // neu tat, HighHint chet giua coast; mep velocity=0 → 60 ngay (Settings/AllApps).
         if (frameRateCompatibility == FRAME_RATE_COMPATIBILITY_AT_LEAST && !mIsPressedGesture) {
-            mIsTouchBoosting = false;
             mIsFrameRateBoosting = false;
         }
         float nextFrameRate;
@@ -14612,6 +14615,14 @@ public final class ViewRootImpl implements ViewParent,
     }
 
     private void boostFrameRate(int boostTimeOut) {
+        // App/Home va shade hien lai khong can giu High thu dong 3s.
+        // Touch va animation van tu bo phieu de giu peak khi con chuyen dong.
+        final int windowType = mWindowAttributes.type;
+        final boolean isApplicationWindow = windowType >= FIRST_APPLICATION_WINDOW
+                && windowType <= LAST_APPLICATION_WINDOW;
+        if (isApplicationWindow || windowType == TYPE_NOTIFICATION_SHADE) {
+            boostTimeOut = Math.min(boostTimeOut, FRAME_RATE_TOUCH_BOOST_TIME);
+        }
         mIsFrameRateBoosting = true;
         mHandler.removeMessages(MSG_TOUCH_BOOST_TIMEOUT);
         mHandler.sendEmptyMessageDelayed(MSG_TOUCH_BOOST_TIMEOUT,
