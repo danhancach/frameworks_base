@@ -32,6 +32,7 @@ import android.animation.ValueAnimator;
 import android.annotation.IntDef;
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.database.ContentObserver;
 import android.graphics.Color;
 import android.os.Handler;
 import android.util.Log;
@@ -58,6 +59,7 @@ import com.android.keyguard.KeyguardUpdateMonitorCallback;
 import com.android.systemui.Dumpable;
 import com.android.systemui.Flags;
 import com.android.systemui.animation.ShadeInterpolation;
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.bouncer.shared.constants.KeyguardBouncerConstants;
 import com.android.systemui.bouncer.ui.BouncerColors;
 import com.android.systemui.dagger.SysUISingleton;
@@ -378,6 +380,8 @@ public class ScrimController implements ViewTreeObserver.OnPreDrawListener, Dump
     Consumer<TransitionStep> mBouncerToGoneTransition;
 
     private boolean mViewsAttached;
+    /** Theo doi system_blur_radius_pct — refresh mau scrim khi strength → 0%. */
+    @Nullable private ContentObserver mRadiusObserver;
 
     @Inject
     public ScrimController(
@@ -562,6 +566,11 @@ public class ScrimController implements ViewTreeObserver.OnPreDrawListener, Dump
             collectFlow(behindScrim,
                     mWindowRootViewBlurInteractor.get().isBlurCurrentlySupported(),
                     this::handleBlurSupportedChanged);
+            // Strength 0% = CardBg; can refresh mau khi keo slider (khong doi blurSupported).
+            if (mRadiusObserver == null) {
+                mRadiusObserver = AxSystemFrost.registerRadiusObserver(
+                        mContext, this::onThemeChanged);
+            }
         }
     }
 

@@ -20,12 +20,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import com.android.compose.animation.scene.ContentScope
+import com.android.systemui.blur.rememberSystemBlurRadiusEpoch
 import com.android.systemui.shade.ui.ShadeColors
 
 /** Scrim for QS/Shade, this will fill the max size, so it should be inside a Box like layout. */
@@ -43,15 +44,18 @@ fun ContentScope.ShadePanelScrim(isTransparencyEnabled: Boolean, modifier: Modif
 }
 
 @Composable
-@ReadOnlyComposable
 private fun scrimColor(isTransparencyEnabled: Boolean): Color {
     // Read configuration to invalidate on changes
     LocalConfiguration.current
-    return Color(
-        ShadeColors.shadePanel(
-            context = LocalContext.current,
-            blurSupported = isTransparencyEnabled,
-            withScrim = true,
+    val context = LocalContext.current
+    val radiusEpoch = rememberSystemBlurRadiusEpoch()
+    return remember(radiusEpoch, isTransparencyEnabled, context) {
+        Color(
+            ShadeColors.shadePanel(
+                context = context,
+                blurSupported = isTransparencyEnabled,
+                withScrim = true,
+            )
         )
-    )
+    }
 }
