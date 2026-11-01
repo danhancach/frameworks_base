@@ -21,6 +21,7 @@ import static com.android.systemui.util.ColorUtilKt.hexColorString;
 
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.database.ContentObserver;
 import android.graphics.Canvas;
 import android.graphics.Path;
 import android.graphics.PorterDuff;
@@ -31,6 +32,7 @@ import android.graphics.drawable.LayerDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.util.AttributeSet;
 import android.view.View;
+import android.view.ViewTreeObserver;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -40,8 +42,10 @@ import androidx.annotation.VisibleForTesting;
 import com.android.internal.graphics.drawable.BackgroundBlurDrawable;
 import com.android.internal.util.ContrastColorUtil;
 import com.android.systemui.Dumpable;
-import com.android.systemui.common.shared.colors.SurfaceEffectColors;
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.res.R;
+import com.android.systemui.scene.shared.flag.SceneContainerFlag;
+import com.android.systemui.shade.NotificationPanelView;
 import com.android.systemui.statusbar.notification.shared.NotificationAddXOnHoverToDismiss;
 import com.android.systemui.util.Assert;
 import com.android.systemui.util.DrawableDumpKt;
@@ -80,6 +84,11 @@ public class NotificationBackgroundView extends View implements Dumpable,
     private final int convexR = 9;
     private final int concaveR = 22;
     private BackgroundBlurDrawable mBackgroundBlurDrawable;
+    private int mBlurDrawableAlpha = 255;
+    private final ViewTreeObserver.OnPreDrawListener mBlurAlphaListener = () -> {
+        updateBlurAlpha();
+        return true;
+    };
     @VisibleForTesting
     protected View.OnAttachStateChangeListener mOnAttachStateChangeListener;
 
@@ -88,6 +97,8 @@ public class NotificationBackgroundView extends View implements Dumpable,
     private boolean mOnKeyguard = true;
 
     private boolean mIsBlurSupported = false;
+    /** Theo doi system_blur_radius_pct de cap nhat BackgroundBlurDrawable. */
+    @Nullable private ContentObserver mRadiusObserver;
 
     public NotificationBackgroundView(Context context, AttributeSet attrs) {
         super(context, attrs);
@@ -96,19 +107,86 @@ public class NotificationBackgroundView extends View implements Dumpable,
                 R.color.notification_state_color_light);
         mDarkColoredStatefulColors = getResources().getColorStateList(
                 R.color.notification_state_color_dark);
-        if (mIsBlurSupported) {
-            mNormalColor = SurfaceEffectColors.surfaceEffect1(getContext());
-        } else {
-            mNormalColor = mContext.getColor(
-                    com.android.internal.R.color.materialColorSurfaceContainerHigh);
-        }
+        mNormalColor = AxSystemFrost.surfaceColor(getContext(), mIsBlurSupported);
         mFocusOverlayStroke = getResources().getDimension(R.dimen.notification_focus_stroke_width);
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        getViewTreeObserver().addOnPreDrawListener(mBlurAlphaListener);
+        updateBlurAlpha();
+        if (mRadiusObserver == null) {
+            mRadiusObserver = AxSystemFrost.registerRadiusObserver(getContext(), this::applyBlurRadiusFromSettings);
+        }
+        applyBlurRadiusFromSettings();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        ViewTreeObserver observer = getViewTreeObserver();
+        if (observer.isAlive()) {
+            observer.removeOnPreDrawListener(mBlurAlphaListener);
+        }
+        AxSystemFrost.unregisterRadiusObserver(getContext(), mRadiusObserver);
+        mRadiusObserver = null;
+        super.onDetachedFromWindow();
+    }
+
+    /** Cap nhat radius + mau theo thanh strength (0% = CardBg dac). */
+    private void applyBlurRadiusFromSettings() {
+        mNormalColor = AxSystemFrost.surfaceColor(getContext(), mIsBlurSupported);
+        if (mBackgroundBlurDrawable != null) {
+            // Chi cap nhat radius o day — KHONG setColor(mNormalColor): se ghi de tint
+            // colorized/custom; cha onFrostMaterialChanged day lai mau dung qua setTint.
+            // Gate mIsBlurSupported: translucent off / blur off → radius 0, khong ghost region.
+            mBackgroundBlurDrawable.setBlurRadius(
+                    AxSystemFrost.appliedBlurRadiusPx(getContext(), mIsBlurSupported));
+        }
+        // mBackground chua set luc onAttached — tranh NPE LayerDrawable.getDrawable.
+        if (mBackground != null) {
+            setStatefulColors();
+        }
+        // Dong bo mNormalColor/mOpaqueColor o cha (interpolate / shelf) khi strength doi.
+        if (getParent() instanceof ActivatableNotificationView) {
+            ((ActivatableNotificationView) getParent()).onFrostMaterialChanged();
+        } else if (mBackground != null) {
+            // Fallback: khong co cha ANV — giu tint hien tai (0 = chua set → dung material).
+            setTint(mTintColor != 0 ? mTintColor : mNormalColor);
+        }
+        invalidate();
+    }
+
+    private void updateBlurAlpha() {
+        if (mBackgroundBlurDrawable == null) return;
+
+        // SurfaceFlinger composites blur regions separately: neither ancestor alpha nor the
+        // panel's Canvas MULTIPLY mask (used for the brightness mirror) reaches the drawable.
+        // Dong bo alpha voi cay View cha va mask cua brightness mirror panel.
+        // Khong kiem tra getVisibility de tranh ket alpha = 0 hoac nhap nhay trong frame chuyen tiep.
+        float alpha = mBlurDrawableAlpha / 255f;
+        View view = this;
+        while (view != null && alpha > 0f) {
+            alpha *= view.getAlpha() * view.getTransitionAlpha();
+            if (view instanceof NotificationPanelView && !SceneContainerFlag.isEnabled()) {
+                float panelAlpha = ((NotificationPanelView) view).getCurrentPanelAlpha();
+                if (panelAlpha < 255f) {
+                    alpha *= panelAlpha / 255f;
+                }
+            }
+            view = view.getParent() instanceof View ? (View) view.getParent() : null;
+        }
+        int targetAlpha = Math.round(255f * Math.max(0f, Math.min(1f, alpha)));
+        if (mBackgroundBlurDrawable.getAlpha() != targetAlpha) {
+            mBackgroundBlurDrawable.setAlpha(targetAlpha);
+        }
     }
 
     /** Sets whether blur/translucency is supported for notification rows. */
     public void setIsBlurSupported(boolean isBlurSupported) {
         if (mIsBlurSupported != isBlurSupported) {
             mIsBlurSupported = isBlurSupported;
+            mNormalColor = AxSystemFrost.surfaceColor(getContext(), mIsBlurSupported);
             setStatefulColors();
             invalidate();
         }
@@ -261,7 +339,10 @@ public class NotificationBackgroundView extends View implements Dumpable,
 
     @Override
     protected boolean verifyDrawable(Drawable who) {
-        return super.verifyDrawable(who) || who == mBackground;
+        // Blur alpha can return from zero after sleep without the row being laid out again.
+        // Accept its invalidation so the display list is re-recorded when the blur reappears.
+        return super.verifyDrawable(who) || who == mBackground
+                || who == mBackgroundBlurDrawable;
     }
 
     @Override
@@ -357,13 +438,12 @@ public class NotificationBackgroundView extends View implements Dumpable,
                             if (mBackgroundBlurDrawable == null) {
                                 mBackgroundBlurDrawable =
                                         view.getViewRootImpl().createBackgroundBlurDrawable();
-                                mBackgroundBlurDrawable.setBlurRadius(
-                                        getResources().getDimensionPixelSize(
-                                                R.dimen.notification_background_blur_radius));
                                 mBackgroundBlurDrawable.setXfermode(null);
                                 mBackgroundBlurDrawable.setCallback(
                                         NotificationBackgroundView.this);
                                 mBackgroundBlurDrawable.setColor(mNormalColor);
+                                applyBlurRadiusFromSettings();
+                                updateBlurAlpha();
 
                                 updateBackgroundRadii();
                                 invalidate();
@@ -506,10 +586,11 @@ public class NotificationBackgroundView extends View implements Dumpable,
         if (mExpandAnimationRunning) {
             return;
         }
-        mBackground.setAlpha(drawableAlpha);
-        if (mBackgroundBlurDrawable != null) {
-            mBackgroundBlurDrawable.setAlpha(drawableAlpha);
+        if (mBackground != null) {
+            mBackground.setAlpha(drawableAlpha);
         }
+        mBlurDrawableAlpha = drawableAlpha;
+        updateBlurAlpha();
     }
 
     /**

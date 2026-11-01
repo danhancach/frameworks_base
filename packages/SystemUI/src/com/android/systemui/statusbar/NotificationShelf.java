@@ -1166,9 +1166,18 @@ public class NotificationShelf extends ActivatableNotificationView {
     }
 
     @Override
+    public void setOnKeyguard(boolean onKeyguard) {
+        super.setOnKeyguard(onKeyguard);
+        updateIfNeeded();
+    }
+
+    @Override
     protected boolean usesTransparentBackground() {
-        return super.usesTransparentBackground()
-                && mAmbientState != null
-                && !mAmbientState.isOnKeyguard();
+        // Tren keyguard dong bo nen voi notification row theo thiet lap lockscreen blur
+        boolean onKeyguard = mOnKeyguard || (mAmbientState != null && mAmbientState.isOnKeyguard());
+        if (onKeyguard) {
+            return mIsLockscreenBlurSupported;
+        }
+        return super.usesTransparentBackground();
     }
 }

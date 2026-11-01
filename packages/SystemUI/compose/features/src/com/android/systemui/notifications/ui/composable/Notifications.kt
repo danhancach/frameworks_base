@@ -101,6 +101,7 @@ import com.android.compose.nestedscroll.PriorityNestedScrollConnection
 import com.android.compose.nestedscroll.ScrollController
 import com.android.internal.jank.Cuj.CUJ_NOTIFICATION_SHADE_SCROLL_FLING
 import com.android.internal.jank.InteractionJankMonitor
+import com.android.systemui.blur.rememberSystemBlurRadiusEpoch
 import com.android.systemui.common.ui.compose.windowinsets.LocalScreenCornerRadius
 import com.android.systemui.notifications.intelligence.rules.shared.NmContextualDisplayLaunch
 import com.android.systemui.notifications.intelligence.rules.ui.viewmodel.NotificationRulesParentViewModel
@@ -405,17 +406,21 @@ fun ContentScope.NestedScrollingNotificationPanel(
     val density = LocalDensity.current
     val screenCornerRadius = LocalScreenCornerRadius.current
     val scrimCornerRadius = dimensionResource(R.dimen.notification_scrim_corner_radius)
+    val context = LocalContext.current
+    val radiusEpoch = rememberSystemBlurRadiusEpoch()
     val classicShadeNotificationScrimBgColor =
-        Color(
-            ShadeColors.classicShadeNotificationScrimBg(
-                LocalContext.current,
-                blurSupported = isTransparencyEnabled,
-                // When the Notification Scrim punches a hole in the scene bg, we need to use the
-                // composite colors of the Scene Scrim, and the Notification Scrim to achieve the
-                // same color as  in the shade types where we are NOT punching a hole.
-                composited = shouldPunchHoleBehindScrim,
+        remember(radiusEpoch, isTransparencyEnabled, shouldPunchHoleBehindScrim, context) {
+            Color(
+                ShadeColors.classicShadeNotificationScrimBg(
+                    context,
+                    blurSupported = isTransparencyEnabled,
+                    // When the Notification Scrim punches a hole in the scene bg, we need to use the
+                    // composite colors of the Scene Scrim, and the Notification Scrim to achieve the
+                    // same color as  in the shade types where we are NOT punching a hole.
+                    composited = shouldPunchHoleBehindScrim,
+                )
             )
-        )
+        }
     val expansionFraction by viewModel.expandFraction.collectAsStateWithLifecycle(0f)
     val screenHeight = with(density) { LocalConfiguration.current.screenHeightDp.dp.toPx() }
 

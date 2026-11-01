@@ -466,13 +466,14 @@ public class ExpandableNotificationRowController implements NotifViewController 
             }
         });
 
+        // Can translucent + window blur (nhu PrimaryCard); khong blur khi tat disable_window_blurs.
         collectFlow(
                 mView,
-                mWindowRootViewBlurInteractor.isTranslucentSupported(),
+                mWindowRootViewBlurInteractor.isNotificationRowFrostSupported(),
                 mView::setIsBlurSupported);
         collectFlow(
                 mView,
-                mWindowRootViewBlurInteractor.isLockscreenTranslucentSupported(),
+                mWindowRootViewBlurInteractor.isLockscreenNotificationRowFrostSupported(),
                 mView::setIsLockscreenBlurSupported);
     }
 

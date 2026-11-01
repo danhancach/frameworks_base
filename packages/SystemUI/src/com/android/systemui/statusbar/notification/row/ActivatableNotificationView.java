@@ -45,7 +45,7 @@ import com.android.internal.jank.InteractionJankMonitor;
 import com.android.internal.jank.InteractionJankMonitor.Configuration;
 import com.android.systemui.Flags;
 import com.android.systemui.Gefingerpoken;
-import com.android.systemui.common.shared.colors.SurfaceEffectColors;
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.res.R;
 import com.android.systemui.shade.TouchLogger;
 import com.android.systemui.statusbar.NotificationShelf;
@@ -113,6 +113,8 @@ public abstract class ActivatableNotificationView extends ExpandableOutlineView 
     private float mNormalBackgroundVisibilityAmount;
     private FakeShadowView mFakeShadow;
     private int mCurrentBackgroundTint;
+    /** true = bo qua early-return cache trong setBackgroundTintColor (frost strength doi). */
+    private boolean mForceBackgroundTintUpdate;
     private int mTargetTint;
     private int mStartTint;
     private int mOverrideTint;
@@ -155,9 +157,9 @@ public abstract class ActivatableNotificationView extends ExpandableOutlineView 
 
     protected void updateColors() {
         if (usesTransparentBackground()) {
-            mNormalColor = SurfaceEffectColors.surfaceEffect1(getContext());
-            mOpaqueColor = mContext.getColor(
-                    com.android.internal.R.color.materialColorSurfaceContainer);
+            // Tint khi frost active (radius > 0); strength 0% = CardBg dac.
+            mNormalColor = AxSystemFrost.surfaceColor(getContext(), true);
+            mOpaqueColor = AxSystemFrost.fallbackColor(getContext());
         } else {
             mNormalColor = mContext.getColor(
                     com.android.internal.R.color.materialColorSurfaceContainerHigh);
@@ -168,6 +170,31 @@ public abstract class ActivatableNotificationView extends ExpandableOutlineView 
                 R.color.notification_ripple_tinted_color);
         mNormalRippleColor = mContext.getColor(
                 R.color.notification_ripple_untinted_color);
+    }
+
+    /**
+     * Strength / theme frost doi — chi cap nhat mau cha + tint, khong recreate background.
+     * Goi tu NotificationBackgroundView khi system_blur_radius_pct thay doi.
+     * Force qua virtual {@link #setBackgroundTintColor(int)} de ExpandableNotificationRow
+     * van ap dung colorized alpha 0.9 + dong bo NotificationContentView; khong goi
+     * mBackgroundNormal.setTint truc tiep (bypass override).
+     */
+    void onFrostMaterialChanged() {
+        updateColors();
+        if (mBackgroundColorAnimator != null) {
+            mBackgroundColorAnimator.cancel();
+            mBackgroundColorAnimator = null;
+        }
+        if (mBackgroundNormal != null) {
+            mBackgroundNormal.setRippleColor(getRippleColor());
+        }
+        // Bat force: early-return cache khong chan refresh khi mau tinh toan khong doi.
+        mForceBackgroundTintUpdate = true;
+        try {
+            setBackgroundTintColor(calculateBgColor());
+        } finally {
+            mForceBackgroundTintUpdate = false;
+        }
     }
 
     /**
@@ -343,9 +370,13 @@ public abstract class ActivatableNotificationView extends ExpandableOutlineView 
     }
 
     protected void setBackgroundTintColor(int color) {
-        if (color != mCurrentBackgroundTint) {
+        // mForceBackgroundTintUpdate: refresh NBV ke ca khi color == cache (strength doi,
+        // mau tinh toan khong doi). Cache luon luu mau SAU transform subclass (vd. alpha 0.9).
+        if (mForceBackgroundTintUpdate || color != mCurrentBackgroundTint) {
             mCurrentBackgroundTint = color;
-            mBackgroundNormal.setTint(color);
+            if (mBackgroundNormal != null) {
+                mBackgroundNormal.setTint(color);
+            }
         }
     }
 

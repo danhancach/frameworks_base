@@ -3776,6 +3776,10 @@ public class ExpandableNotificationRow extends ActivatableNotificationView
             mChildrenContainer.setAlpha(1f);
             mChildrenContainer.setLayerType(LAYER_TYPE_NONE, null);
         }
+        if (mBackgroundNormal != null) {
+            // Khoi phuc alpha co so cho nen thong bao dong bo voi noi dung
+            mBackgroundNormal.setDrawableAlpha(255);
+        }
         updateIfNeeded();
     }
 
