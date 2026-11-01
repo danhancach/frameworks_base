@@ -137,9 +137,15 @@ public class BroadcastSkipPolicy {
                 r.callingPid, r.callingUid, receiverUid, info.activityInfo.exported);
         if (perm != PackageManager.PERMISSION_GRANTED) {
             if (!info.activityInfo.exported) {
-                return "Permission Denial: broadcasting "
-                        + broadcastDescription(r, component)
-                        + " is not exported from uid " + receiverUid;
+                // SystemUI AxDynamicBar: multi-timer Clock chi gui RESET trong notif,
+                // can broadcast PAUSE/START toi TimerReceiver (exported=false).
+                if (allowSystemUiDeskClockTimerBroadcast(r, component)) {
+                    // Cho phep — khong skip.
+                } else {
+                    return "Permission Denial: broadcasting "
+                            + broadcastDescription(r, component)
+                            + " is not exported from uid " + receiverUid;
+                }
             } else {
                 return "Permission Denial: broadcasting "
                         + broadcastDescription(r, component)
@@ -806,5 +812,51 @@ public class BroadcastSkipPolicy {
                             .build();
         }
         return attributionSources;
+    }
+
+    /**
+     * AxDynamicBar: cho SystemUI gui PAUSE/START/TOGGLE toi Google Clock TimerReceiver
+     * (exported=false) khi notif multi-timer khong con PI action tung timer.
+     */
+    private static boolean allowSystemUiDeskClockTimerBroadcast(
+            @NonNull BroadcastRecord r, @NonNull ComponentName component) {
+        if (component == null || r == null || r.intent == null) {
+            return false;
+        }
+        final String cls = component.getClassName();
+        if (cls == null || !cls.endsWith(".timer.TimerReceiver")) {
+            return false;
+        }
+        final String pkg = component.getPackageName();
+        if (pkg == null || (!pkg.equals("com.google.android.deskclock")
+                && !pkg.equals("com.android.deskclock"))) {
+            return false;
+        }
+        final String action = r.intent.getAction();
+        if (action == null) {
+            return false;
+        }
+        if (!action.equals("com.android.deskclock.action.PAUSE_TIMER")
+                && !action.equals("com.android.deskclock.action.START_TIMER")
+                && !action.equals("com.android.deskclock.action.TOGGLE_TIMER")) {
+            return false;
+        }
+        // Goi truc tiep tu SystemUI (sendBroadcast) — callerPackage = com.android.systemui.
+        if ("com.android.systemui".equals(r.callerPackage)) {
+            return true;
+        }
+        // ProcessBuilder("am") tu SystemUI: callerPackage co the null, van dung uid SystemUI.
+        try {
+            final String[] pkgs = AppGlobals.getPackageManager().getPackagesForUid(r.callingUid);
+            if (pkgs != null) {
+                for (String p : pkgs) {
+                    if ("com.android.systemui".equals(p)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (RemoteException ignored) {
+        }
+        return false;
     }
 }
