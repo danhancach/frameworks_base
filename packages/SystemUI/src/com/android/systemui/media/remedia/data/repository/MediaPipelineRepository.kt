@@ -25,6 +25,7 @@ import com.android.systemui.dagger.qualifiers.Background
 import com.android.systemui.media.controls.data.model.MediaSortKeyModel
 import com.android.systemui.media.controls.shared.areIconsEqual
 import com.android.systemui.media.controls.shared.model.MediaData
+import com.android.systemui.media.controls.util.LockscreenMediaHelper
 import com.android.systemui.media.remedia.data.model.UpdateArtInfoModel
 import com.android.systemui.util.settings.SecureSettings
 import com.android.systemui.util.settings.SettingsProxyExt.observerFlow
@@ -48,6 +49,7 @@ abstract class MediaPipelineRepository(
     @Application applicationScope: CoroutineScope,
     @Background private val backgroundDispatcher: CoroutineDispatcher,
     private val secureSettings: SecureSettings,
+    private val lockscreenMediaHelper: LockscreenMediaHelper? = null,
 ) {
 
     protected val mutableUserEntries: MutableStateFlow<Map<InstanceId, MediaData>> =
@@ -58,7 +60,8 @@ abstract class MediaPipelineRepository(
         MutableStateFlow(LinkedHashMap())
     val allMediaEntries: StateFlow<Map<String, MediaData>> = mutableAllEntries.asStateFlow()
 
-    private val mutableAllowMediaPlayerOnLockscreen = MutableStateFlow(true)
+    private val mutableAllowMediaPlayerOnLockscreen =
+        MutableStateFlow(lockscreenMediaHelper?.isMediaAllowedOnLockscreen() ?: true)
     val allowMediaPlayerOnLockscreen: StateFlow<Boolean> =
         mutableAllowMediaPlayerOnLockscreen.asStateFlow()
 
@@ -148,14 +151,17 @@ abstract class MediaPipelineRepository(
     }
 
     private fun listenForLockscreenSettingChanges(scope: CoroutineScope): Job {
+        val flow =
+            lockscreenMediaHelper?.isMediaAllowedOnLockscreen
+                ?: secureSettings
+                    .observerFlow(UserHandle.USER_ALL, Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN)
+                    .onStart { emit(Unit) }
+                    .map { getMediaLockScreenSetting() }
+                    .distinctUntilChanged()
+                    .flowOn(backgroundDispatcher)
+
         return scope.launch {
-            secureSettings
-                .observerFlow(UserHandle.USER_ALL, Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN)
-                .onStart { emit(Unit) }
-                .map { getMediaLockScreenSetting() }
-                .distinctUntilChanged()
-                .flowOn(backgroundDispatcher)
-                .collectLatest { mutableAllowMediaPlayerOnLockscreen.value = it }
+            flow.collectLatest { mutableAllowMediaPlayerOnLockscreen.value = it }
         }
     }
 

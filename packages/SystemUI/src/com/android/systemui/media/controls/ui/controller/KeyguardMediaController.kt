@@ -46,6 +46,7 @@ import com.android.systemui.lifecycle.repeatWhenAttached
 import com.android.systemui.media.controls.domain.pipeline.interactor.MediaCarouselInteractor
 import com.android.systemui.media.controls.ui.view.MediaHost
 import com.android.systemui.media.controls.ui.view.MediaHostState
+import com.android.systemui.media.controls.util.LockscreenMediaHelper
 import com.android.systemui.media.dagger.MediaModule
 import com.android.systemui.media.remedia.shared.flag.MediaControlsInComposeFlag
 import com.android.systemui.media.remedia.ui.compose.Media
@@ -107,6 +108,7 @@ constructor(
     private val mediaCarouselInteractor: MediaCarouselInteractor,
     private val falsingSystem: MediaFalsingSystem,
     private val secureSettings: SecureSettings,
+    private val lockscreenMediaHelper: LockscreenMediaHelper? = null,
 ) : Dumpable {
     private var lastUsedStatusBarState = -1
 
@@ -129,7 +131,8 @@ constructor(
             }
         }
 
-    private var allowMediaPlayerOnLockScreen = true
+    private var allowMediaPlayerOnLockScreen =
+        lockscreenMediaHelper?.isMediaAllowedOnLockscreen() ?: true
     private val _isMediaVisibleOnLockscreen = mutableStateOf(false)
     private var isMediaVisibleOnLockscreen: Boolean
         get() = _isMediaVisibleOnLockscreen.value
@@ -220,18 +223,21 @@ constructor(
 
     @VisibleForTesting
     fun listenForLockscreenSettingChanges(scope: CoroutineScope): Job {
+        val flow =
+            lockscreenMediaHelper?.isMediaAllowedOnLockscreen
+                ?: secureSettings
+                    .observerFlow(UserHandle.USER_ALL, Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN)
+                    // query to get initial value
+                    .onStart { emit(Unit) }
+                    .map { getMediaLockScreenSetting() }
+                    .distinctUntilChanged()
+                    .flowOn(backgroundDispatcher)
+
         return scope.launch {
-            secureSettings
-                .observerFlow(UserHandle.USER_ALL, Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN)
-                // query to get initial value
-                .onStart { emit(Unit) }
-                .map { getMediaLockScreenSetting() }
-                .distinctUntilChanged()
-                .flowOn(backgroundDispatcher)
-                .collectLatest {
-                    allowMediaPlayerOnLockScreen = it
-                    onMediaHostVisibilityChanged(mediaHost.visible)
-                }
+            flow.collectLatest {
+                allowMediaPlayerOnLockScreen = it
+                onMediaHostVisibilityChanged(mediaHost.visible)
+            }
         }
     }
 
