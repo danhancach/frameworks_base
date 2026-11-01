@@ -27,6 +27,8 @@ import com.android.systemui.statusbar.notification.data.repository.ActiveNotific
 import com.android.systemui.statusbar.notification.data.repository.ActiveNotificationsStore
 import com.android.systemui.statusbar.notification.data.repository.NotificationsKeyguardViewStateRepository
 import com.android.systemui.statusbar.notification.promoted.domain.interactor.AODPromotedNotificationInteractor
+import com.android.systemui.axdynamicbar.domain.AxDynamicBarInteractor
+import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.statusbar.notification.shared.ActiveBundleModel
 import com.android.systemui.statusbar.notification.shared.ActiveNotificationEntryModel
 import com.android.systemui.statusbar.notification.shared.ActiveNotificationGroupModel
@@ -43,6 +45,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+
 
 /** Domain logic related to notification icons. */
 class NotificationIconsInteractor
@@ -234,24 +237,61 @@ constructor(
     @Background bgContext: CoroutineContext,
     iconsInteractor: NotificationIconsInteractor,
     settingsRepository: NotificationListenerSettingsRepository,
+    private val axDynamicBarInteractor: dagger.Lazy<AxDynamicBarInteractor>,
 ) {
     @OptIn(ExperimentalCoroutinesApi::class)
     val statusBarNotifs: Flow<Set<ActiveNotificationIconModel>> =
-        settingsRepository.showSilentStatusIcons
-            .flatMapLatest { showSilentIcons ->
-                iconsInteractor.filteredNotifSet(
-                    showAmbient = false,
-                    showLowPriority = showSilentIcons,
-                    showDismissed = false,
-                    showRepliedMessages = false,
-                )
-            }
-            .map { notifs ->
-                notifs
-                    .filter { it.statusBarIcon != null }
-                    .distinctBy { it.statusBarIcon!!.toString() }
-                    .toSet()
-            }
+        combine(
+            settingsRepository.showSilentStatusIcons
+                .flatMapLatest { showSilentIcons ->
+                    iconsInteractor.filteredNotifSet(
+                        showAmbient = false,
+                        showLowPriority = showSilentIcons,
+                        showDismissed = false,
+                        showRepliedMessages = false,
+                    )
+                },
+            axDynamicBarInteractor.get().uiState,
+        ) { notifs, uiState ->
+            val isAxEnabled = axDynamicBarInteractor.get().settings.isEnabled.value
+            // Su kien dang hien tren pill — an dung icon notif tuong ung.
+            val activePillEvent =
+                if (isAxEnabled && uiState.shouldShow) {
+                    uiState.notificationAlert ?: uiState.topEvent
+                } else {
+                    null
+                }
+
+            val activePillNotifKey: String? =
+                when (activePillEvent) {
+                    is IslandEvent.Timer ->
+                        activePillEvent.notificationKey.takeIf { it.isNotEmpty() }
+                    is IslandEvent.Stopwatch ->
+                        activePillEvent.notificationKey.takeIf { it.isNotEmpty() }
+                    is IslandEvent.AospChip -> activePillEvent.active.notificationKey
+                    is IslandEvent.PromotedOngoing -> activePillEvent.sbn.key
+                    is IslandEvent.Notification -> activePillEvent.sbn.key
+                    else -> null
+                }?.substringBefore('#')
+
+            notifs
+                .filter { notif ->
+                    if (notif.statusBarIcon == null) return@filter false
+                    if (activePillNotifKey != null) {
+                        val key = notif.notifKey
+                        if (
+                            key == activePillNotifKey ||
+                                key.startsWith("$activePillNotifKey#") ||
+                                activePillNotifKey.startsWith("$key#")
+                        ) {
+                            return@filter false
+                        }
+                    }
+                    true
+                }
+                .distinctBy { it.statusBarIcon!!.toString() }
+                .toSet()
+        }
             .flowOn(bgContext)
 
     /** Emits `true` whenever there is at least one status bar notification. */

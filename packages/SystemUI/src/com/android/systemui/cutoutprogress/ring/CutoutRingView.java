@@ -545,11 +545,14 @@ public final class CutoutRingView extends View {
             }
         }
 
+        // Khong tao cutout gia khi DisplayCutout rong (vd pdx237: camera o bezel,
+        // khong co punch-hole). Ve vong o giua mep tren se tao "vet cat camera" ao.
         if (!mHasCutout) {
-            float cx = getResources().getDisplayMetrics().widthPixels / 2f;
-            float radius = 15f * mDp;
-            mCutoutPath.addCircle(cx, radius * 2f, radius, Path.Direction.CW);
-            mHasCutout = true;
+            mCutoutPath.reset();
+            mRainbowShader = null;
+            mRainbowCx = Float.NaN;
+            invalidate();
+            return super.onApplyWindowInsets(insets);
         }
 
         mRainbowShader = null;

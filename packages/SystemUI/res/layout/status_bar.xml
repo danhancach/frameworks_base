@@ -51,8 +51,9 @@
         android:paddingTop="@dimen/status_bar_padding_top"
         android:orientation="horizontal">
 
-        <!-- Container for the entire start half of the status bar. It will always use the same
-             width, independent of the number of visible children and sub-children. -->
+        <!-- Start side: weight=1 lay het phan con lai sau end (system icons wrap).
+             AOSP mac dinh chia doi weight=1/1 -> giua status bar trong o pdx237 (khong cutout)
+             trong khi notif icons bi hep. -->
         <FrameLayout
             android:id="@+id/status_bar_start_side_container"
             android:layout_height="match_parent"
@@ -60,14 +61,12 @@
             android:clipChildren="false"
             android:layout_weight="1">
 
-            <!-- Container that is wrapped around the views on the start half of the status bar.
-                 Its width will change with the number of visible children and sub-children.
-                 It is useful when we want to know the visible bounds of the content. -->
+            <!-- match_parent: dung full start container de NIC do dung width con lai. -->
             <!-- IMPORTANT: The height of this view *must* be match_parent so that clickable items
                  in this container are large enough for accessibility. See b/446113663 -->
             <FrameLayout
                 android:id="@+id/status_bar_start_side_content"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:layout_gravity="center_vertical|start"
                 android:clipChildren="false">
@@ -115,15 +114,16 @@
                         systemui:isStatusBar="true"
                     />
 
-                    <!-- To avoid chips causing notifs to re-layout, wrap them in a FrameLayout
-                    so they can overlap -->
+                    <!-- weight=1: notif area gian ra sau clock/Dynamic Bar chip (sibling).
+                         wrap_content cu de NIC hep -> an icon du width man con trong. -->
                     <FrameLayout
                         android:id="@+id/start_side_notif_and_chip_container"
                         android:layout_height="match_parent"
-                        android:layout_width="wrap_content">
+                        android:layout_width="0dp"
+                        android:layout_weight="1">
                         <com.android.systemui.statusbar.AlphaOptimizedFrameLayout
                             android:id="@+id/notification_icon_area"
-                            android:layout_width="wrap_content"
+                            android:layout_width="match_parent"
                             android:layout_height="match_parent"
                             android:orientation="horizontal"
                             android:clipChildren="false"/>
@@ -141,13 +141,12 @@
             android:gravity="center_horizontal|center_vertical"
         />
 
-        <!-- Container for the entire end half of the status bar. It will always use the same
-             width, independent of the number of visible children and sub-children. -->
+        <!-- End: wrap_content (khong weight) — chi chiem cho system icons.
+             Start weight=1 lay phan con lai de them notif icons. -->
         <FrameLayout
             android:id="@+id/status_bar_end_side_container"
-            android:layout_width="0dp"
+            android:layout_width="wrap_content"
             android:layout_height="match_parent"
-            android:layout_weight="1"
             android:clipChildren="false">
 
             <!-- Container that is wrapped around the views on the end half of the

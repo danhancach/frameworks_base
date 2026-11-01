@@ -31,7 +31,6 @@ import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.animation.PathInterpolator
 import android.view.flags.Flags as ViewFlags
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.annotation.VisibleForTesting
@@ -849,25 +848,16 @@ private fun addStartSideComposable(
             }
         }
 
-    if (!Flags.statusBarChipVisibilityJankFix()) {
-        // Add the composable container for ongoingActivityChips before the
-        // notification_icon_area to maintain the same ordering for ongoing activity
-        // chips in the status bar layout.
-        val notificationIconAreaIndex =
-            startSideExceptHeadsUp.indexOfChild(
-                startSideExceptHeadsUp.findViewById(R.id.start_side_notif_and_chip_container)
-            )
-        startSideExceptHeadsUp.addView(composeView, notificationIconAreaIndex)
-    } else {
-        // notif_and_chip_container is a FrameLayout so the chips and notif icon container views
-        // don't interfere with each other's layout bounds. They are mutually exclusive per the
-        // view model
-        val startSideNotifAndChipsView =
-            phoneStatusBarView.requireViewById<FrameLayout>(
-                R.id.start_side_notif_and_chip_container
-            )
-        startSideNotifAndChipsView.addView(composeView, 0)
-    }
+    // AxDynamicBar chip co the hien cung notif icons (khong mutual exclusive nhu AOSP
+    // statusBarChipVisibilityJankFix). Neu gan ComposeView vao FrameLayout
+    // start_side_notif_and_chip_container thi chip chong len notification_icon_area —
+    // NIC van do full width container -> overflow DOT sai + khoang trong. Luon chen
+    // composeView lam anh em LinearLayout truoc notif container de NIC do dung phan con lai.
+    val notificationIconAreaIndex =
+        startSideExceptHeadsUp.indexOfChild(
+            startSideExceptHeadsUp.findViewById(R.id.start_side_notif_and_chip_container)
+        )
+    startSideExceptHeadsUp.addView(composeView, notificationIconAreaIndex)
 }
 
 @VisibleForTesting
