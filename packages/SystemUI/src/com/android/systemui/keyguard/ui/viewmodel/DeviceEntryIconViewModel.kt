@@ -20,6 +20,7 @@ import android.animation.FloatEvaluator
 import android.animation.IntEvaluator
 import com.android.keyguard.KeyguardViewController
 import com.android.systemui.accessibility.domain.interactor.AccessibilityInteractor
+import com.android.systemui.axdynamicbar.ui.AxDynamicBarKeyguardExpansion
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.deviceentry.domain.interactor.DeviceEntryInteractor
@@ -73,6 +74,7 @@ constructor(
     accessibilityInteractor: AccessibilityInteractor,
     @Application private val scope: CoroutineScope,
     private val sceneInteractor: Lazy<SceneInteractor>,
+    private val axDynamicBarKeyguardExpansion: AxDynamicBarKeyguardExpansion,
 ) {
     val isUdfpsSupported: StateFlow<Boolean> = deviceEntryUdfpsInteractor.isUdfpsSupported
     val udfpsLocation: StateFlow<SensorLocation?> =
@@ -164,7 +166,7 @@ constructor(
                     .onStart { emit(true) }
             }
         }
-    val deviceEntryViewAlpha: Flow<Float> =
+    private val baseDeviceEntryViewAlpha: Flow<Float> =
         if (SceneContainerFlag.isEnabled) {
             showDeviceEntryIcon.map { if (it) 1f else 0f }
         } else {
@@ -177,6 +179,12 @@ constructor(
                     initialValue = 0f,
                 )
         }
+
+    // An icon khoa khi keo/snap pill (legacy + Compose lockscreen).
+    val deviceEntryViewAlpha: Flow<Float> =
+        combine(baseDeviceEntryViewAlpha, axDynamicBarKeyguardExpansion.isPillDragging) {
+            alpha, dragging -> if (dragging) 0f else alpha
+        }.distinctUntilChanged()
 
     private fun initialAlphaFromKeyguardState(keyguardState: KeyguardState): Float {
         SceneContainerFlag.assertInLegacyMode()
