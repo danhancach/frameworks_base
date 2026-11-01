@@ -29,6 +29,7 @@ import android.widget.ListAdapter;
 
 import androidx.constraintlayout.helper.widget.Flow;
 
+import com.android.systemui.blur.AxSystemFrost;
 import com.android.systemui.statusbar.BlurUtils;
 
 /**
@@ -78,17 +79,11 @@ public class GlobalActionsPowerDialog {
                 context.getTheme()));
         window.addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        if (blurUtils.supportsBlursOnWindows()
+        // Radius/mau theo PrimaryCard (system_blur_radius_pct) va toggle DIALOG_BLUR_ENABLED.
+        final boolean blurEnabled = blurUtils.supportsBlursOnWindows()
                 && Settings.System.getInt(context.getContentResolver(),
-                        Settings.System.DIALOG_BLUR_ENABLED, 1) != 0) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND);
-            int blurBehindRadius = context.getResources()
-                    .getDimensionPixelSize(com.android.systemui.res.R.dimen.max_window_blur_radius);
-            window.getAttributes().setBlurBehindRadius(blurBehindRadius);
-            window.setDimAmount(0.54f);
-        } else {
-            window.setDimAmount(0.88f);
-        }
+                        Settings.System.DIALOG_BLUR_ENABLED, 1) != 0;
+        AxSystemFrost.applyWindowBlurBehind(window, blurEnabled);
 
         return dialog;
     }

@@ -79,6 +79,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.core.graphics.drawable.toBitmap
+import com.android.axion.blur.AxBlurSurface
+import com.android.axion.blur.AxBlurSurfaceDefaults
+import com.android.axion.blur.axBlurBackground
+import com.android.axion.blur.rememberAxBlurEnabled
+import com.android.systemui.blur.AxSystemFrost
 import com.android.systemui.globalactions.GlobalActionsDialogLite
 import com.android.systemui.statusbar.BlurUtils
 import androidx.savedstate.SavedStateRegistryController
@@ -88,6 +93,27 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
+
+/**
+ * Panel frost giong PrimaryCard: axBlurBackground + CardBg (surfaceBright) fallback;
+ * strength / disable_window_blurs do BlurEngine theo Settings.
+ */
+@Composable
+private fun PowerFrostPanel(
+    modifier: Modifier = Modifier,
+    shape: RoundedCornerShape = RoundedCornerShape(32.dp),
+    cornerRadius: Dp = 32.dp,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    AxBlurSurface(
+        modifier = modifier,
+        shape = shape,
+        cornerRadius = cornerRadius,
+        surfaceColor = MaterialTheme.colorScheme.surfaceBright,
+        highlight = AxBlurSurfaceDefaults.highlightBrush(),
+        content = content,
+    )
+}
 
 data class TileConfig(
     val action: GlobalActionsDialogLite.Action,
@@ -207,17 +233,13 @@ class GlobalActionsComposeDialog(
             addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)
             
-            if (blurUtils.supportsBlursOnWindows()) {
-                addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-                attributes = attributes.apply {
-                    blurBehindRadius = context.resources.getDimensionPixelSize(
-                        com.android.systemui.res.R.dimen.max_window_blur_radius
-                    )
-                }
-                setDimAmount(0.4f)
-            } else {
-                setDimAmount(0.7f)
-            }
+            // Giong PrimaryCard: radius theo system_blur_radius_pct; 0% = nen dac.
+            AxSystemFrost.applyWindowBlurBehind(
+                this,
+                blurUtils.supportsBlursOnWindows(),
+                dimWhenBlur = 0.4f,
+                dimWhenSolid = 0.7f,
+            )
             
             setLayout(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -635,15 +657,11 @@ private fun RestartChoiceMenu(
     onOptionSelected: (GlobalActionsDialogLite.Action) -> Unit,
     onBack: () -> Unit
 ) {
-    Surface(
+    PowerFrostPanel(
         modifier = Modifier
             .width(340.dp)
             .padding(16.dp)
             .pointerInput(Unit) { detectTapGestures { } },
-        shape = RoundedCornerShape(32.dp),
-        color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 6.dp,
-        shadowElevation = 8.dp
     ) {
         Column(
             modifier = Modifier.padding(24.dp),
@@ -766,17 +784,13 @@ private fun PowerMenuContainer(
             
             val topPadding = if (isEditMode) 4.dp else 0.dp
 
-            Surface(
+            PowerFrostPanel(
                 modifier = Modifier
                     .width(340.dp)
                     .align(BiasAlignment(0f, animatedBias))
                     .padding(top = topPadding, start = 16.dp, end = 16.dp)
                     .pointerInput(Unit) { detectTapGestures { } }
                     .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessLow)),
-                shape = RoundedCornerShape(32.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 6.dp,
-                shadowElevation = 8.dp
             ) {
                 Column(
                     modifier = Modifier.padding(24.dp),
@@ -805,14 +819,12 @@ private fun PowerMenuContainer(
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 16.dp)
             ) {
-                Surface(
+                PowerFrostPanel(
                     modifier = Modifier
                         .width(200.dp)
                         .pointerInput(Unit) { detectTapGestures { } },
                     shape = RoundedCornerShape(24.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainer,
-                    tonalElevation = 6.dp,
-                    shadowElevation = 6.dp
+                    cornerRadius = 24.dp,
                 ) {
                     Column(
                         modifier = Modifier
@@ -845,16 +857,12 @@ private fun PowerMenuContainer(
             }
         }
     } else {
-        Surface(
+        PowerFrostPanel(
             modifier = Modifier
                 .width(340.dp)
                 .padding(16.dp)
                 .pointerInput(Unit) { detectTapGestures { } }
                 .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessLow)),
-            shape = RoundedCornerShape(32.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp,
-            shadowElevation = 8.dp
         ) {
             Column(
                 modifier = Modifier.padding(24.dp),
@@ -1444,14 +1452,6 @@ private fun rememberHapticClick(): () -> Unit {
 }
 
 @Composable
-private fun sliderTrackColor(blurEnabled: Boolean): Color =
-    if (blurEnabled) {
-        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.78f)
-    } else {
-        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f)
-    }
-
-@Composable
 private fun ConfirmationSliderView(
     title: String,
     message: String,
@@ -1459,7 +1459,6 @@ private fun ConfirmationSliderView(
     color: Color,
     onConfirm: () -> Unit,
     onCancel: () -> Unit,
-    blurEnabled: Boolean = false
 ) {
     var offsetX by remember { mutableFloatStateOf(0f) }
     var maxOffsetPx by remember { mutableFloatStateOf(0f) }
@@ -1469,6 +1468,7 @@ private fun ConfirmationSliderView(
     val thumbInset = 10.dp
     val view = LocalView.current
     val cancelHaptic = rememberHapticClick()
+    val blurEnabled = rememberAxBlurEnabled()
 
     val isDark = isSystemInDarkTheme()
     val textColor = if (isDark) Color.White else Color.Black
@@ -1495,7 +1495,13 @@ private fun ConfirmationSliderView(
                 .fillMaxWidth()
                 .height(72.dp)
                 .clip(RoundedCornerShape(36.dp))
-                .background(sliderTrackColor(blurEnabled))
+                .axBlurBackground(
+                    enabled = true,
+                    fallbackColor = MaterialTheme.colorScheme.surfaceBright,
+                    tintColor = AxBlurSurfaceDefaults.tintColor(),
+                    cornerRadius = 36.dp,
+                    highlight = AxBlurSurfaceDefaults.highlightBrush(),
+                )
                 .border(
                     1.dp,
                     if (blurEnabled) {
