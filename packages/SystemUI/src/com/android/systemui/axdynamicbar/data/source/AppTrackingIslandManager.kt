@@ -29,8 +29,15 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
     private val _appSwitchEvent = MutableStateFlow<IslandEvent.AppSwitch?>(null)
     val appSwitchEvent: StateFlow<IslandEvent.AppSwitch?> = _appSwitchEvent.asStateFlow()
 
+    /** Package user app dang foreground; null = launcher / SystemUI / khong co app. */
+    private val _foregroundPackage = MutableStateFlow<String?>(null)
+    val foregroundPackage: StateFlow<String?> = _foregroundPackage.asStateFlow()
+
     private val recentApps = mutableListOf<IslandEvent.RecentApp>()
-    private var listening = false
+    /** Theo doi task stack (media hide +/hoac app_switch). */
+    private var stackListening = false
+    /** Co emit IslandEvent.AppSwitch khi doi app. */
+    private var emitAppSwitch = false
     private var launcherPackage: String? = null
     private val activityManager by lazy {
         context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -40,6 +47,7 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
     @Volatile private var currentForegroundPkg: String? = null
 
     private fun emitEvent() {
+        if (!emitAppSwitch) return
         val event =
             if (recentApps.isNotEmpty())
                 IslandEvent.AppSwitch(
@@ -51,20 +59,23 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
         _appSwitchEvent.value = event
     }
 
+    private fun setForegroundPackage(pkg: String?) {
+        currentForegroundPkg = pkg
+        if (_foregroundPackage.value != pkg) {
+            _foregroundPackage.value = pkg
+        }
+    }
+
     private val listener =
         object : TaskStackChangeListener {
             override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
                 val topActivity = taskInfo.topActivity ?: return
                 val pkg = topActivity.packageName
-                if (
-                    pkg == launcherPackage ||
-                        pkg == "com.android.systemui" ||
-                        pkg == "com.android.launcher3"
-                ) {
-                    currentForegroundPkg = null
+                if (isHomeOrSystemUi(pkg)) {
+                    setForegroundPackage(null)
                     return
                 }
-                if (!hasLauncherIntent(pkg)) return
+                // Track moi app foreground cho media ownership, ke ca khong co launcher intent.
                 if (pkg == currentForegroundPkg) {
                     if (Log.isLoggable(TAG, Log.DEBUG)) {
                         Log.d(TAG, "skip duplicate front pkg=$pkg task=${taskInfo.taskId}")
@@ -73,7 +84,10 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
                 }
 
                 val leavingPkg = currentForegroundPkg
-                currentForegroundPkg = pkg
+                setForegroundPackage(pkg)
+
+                // Chi app co the launch moi vao app-switch pill.
+                if (!emitAppSwitch || !hasLauncherIntent(pkg)) return
 
                 val appName =
                     try {
@@ -139,22 +153,75 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
             }
         }
 
+    /** Theo doi foreground (an media pill khi app mo) — khong can bat event app_switch. */
+    fun startForegroundTracking() {
+        ensureStackListening()
+    }
+
+    fun stopForegroundTracking() {
+        // Giữ listener neu app_switch van bat.
+        if (!emitAppSwitch) {
+            tearDownStackListening()
+        }
+    }
+
     fun startListening() {
-        if (listening) return
-        listening = true
-        launcherPackage = resolveLauncherPackage()
-        TaskStackChangeListeners.getInstance().registerTaskStackListener(listener)
+        emitAppSwitch = true
+        ensureStackListening()
     }
 
     fun stopListening() {
-        if (!listening) return
-        listening = false
-        launcherIntentCache.clear()
-        TaskStackChangeListeners.getInstance().unregisterTaskStackListener(listener)
+        emitAppSwitch = false
         synchronized(recentApps) {
             recentApps.clear()
             _appSwitchEvent.value = null
         }
+        // Van theo doi foreground neu media can.
+        // stopForegroundTracking goi rieng khi tat media.
+        if (!stackListening) return
+        // Neu chi app_switch tat ma foreground tracking van can — repository quyet.
+    }
+
+    /** Tat het (media + app_switch). */
+    fun stopAll() {
+        emitAppSwitch = false
+        tearDownStackListening()
+        synchronized(recentApps) {
+            recentApps.clear()
+            _appSwitchEvent.value = null
+        }
+        setForegroundPackage(null)
+    }
+
+    private fun ensureStackListening() {
+        if (stackListening) return
+        stackListening = true
+        launcherPackage = resolveLauncherPackage()
+        TaskStackChangeListeners.getInstance().registerTaskStackListener(listener)
+        seedForegroundFromRunningTask()
+    }
+
+    /** Dong bo foreground hien tai (tranh pill media le khi da o trong app). */
+    private fun seedForegroundFromRunningTask() {
+        try {
+            val task = activityManager.getRunningTasks(1).firstOrNull() ?: return
+            val pkg = task.topActivity?.packageName ?: return
+            if (isHomeOrSystemUi(pkg) || !hasLauncherIntent(pkg)) {
+                setForegroundPackage(null)
+            } else {
+                setForegroundPackage(pkg)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to seed foreground package", e)
+        }
+    }
+
+    private fun tearDownStackListening() {
+        if (!stackListening) return
+        stackListening = false
+        launcherIntentCache.clear()
+        TaskStackChangeListeners.getInstance().unregisterTaskStackListener(listener)
+        setForegroundPackage(null)
     }
 
     fun clear() {
@@ -206,11 +273,13 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
             }
 
             recentApps.removeAll { it.taskId == taskId }
-            if (pkg == currentForegroundPkg) currentForegroundPkg = null
+            if (pkg == currentForegroundPkg) setForegroundPackage(null)
 
             val newPreviousApp =
                 if (_appSwitchEvent.value?.previousApp?.taskId == taskId) null
                 else _appSwitchEvent.value?.previousApp
+
+            if (!emitAppSwitch) return
 
             val event =
                 if (recentApps.isNotEmpty())
@@ -225,6 +294,13 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
     }
 
     private val launcherIntentCache = HashMap<String, Boolean>()
+
+    /** Launcher / SystemUI — khong coi la app foreground (giu pill media tren home). */
+    private fun isHomeOrSystemUi(pkg: String): Boolean =
+        pkg == launcherPackage ||
+            pkg == "com.android.systemui" ||
+            pkg == "com.android.launcher3" ||
+            pkg == "com.google.android.apps.nexuslauncher"
 
     private fun hasLauncherIntent(pkg: String): Boolean =
         launcherIntentCache.getOrPut(pkg) {
