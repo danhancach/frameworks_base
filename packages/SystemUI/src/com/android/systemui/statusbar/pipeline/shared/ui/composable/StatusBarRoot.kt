@@ -853,6 +853,10 @@ private fun addStartSideComposable(
     // start_side_notif_and_chip_container thi chip chong len notification_icon_area —
     // NIC van do full width container -> overflow DOT sai + khoang trong. Luon chen
     // composeView lam anh em LinearLayout truoc notif container de NIC do dung phan con lai.
+    //
+    // Icon reflow (task-028): CAM GONE ca ComposeView (clock/date/OAC chung cay).
+    // AxDynamicBarChip reclaim CHI width slot sau overlay handoff → LinearLayout
+    // giao phan con lai cho start_side_notif_and_chip_container / NIC.
     val notificationIconAreaIndex =
         startSideExceptHeadsUp.indexOfChild(
             startSideExceptHeadsUp.findViewById(R.id.start_side_notif_and_chip_container)

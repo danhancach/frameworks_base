@@ -33,6 +33,8 @@ internal fun NativeMarqueeText(
     fontWeight: Int = 400,
     fadeLength: Dp = SpaceMd,
     gravity: Int = Gravity.START or Gravity.CENTER_VERTICAL,
+    /** false = END ellipsize, khong selected — freeze frame dummy overlay. */
+    marqueeEnabled: Boolean = true,
 ) {
     val fadePx = with(LocalDensity.current) { fadeLength.roundToPx().coerceAtLeast(1) }
     val textSizePx = with(LocalDensity.current) { textSize.toPx() }
@@ -44,21 +46,25 @@ internal fun NativeMarqueeText(
         factory = { context ->
             TextView(context).apply {
                 setSingleLine(true)
-                ellipsize = TextUtils.TruncateAt.MARQUEE
-                marqueeRepeatLimit = -1
-                isHorizontalFadingEdgeEnabled = true
-                setFadingEdgeLength(fadePx)
                 includeFontPadding = false
-                setHorizontallyScrolling(true)
                 typeface = Typeface.create(Typeface.DEFAULT, typefaceStyle)
-                // Samsung: selected = dieu kien chay marquee.
-                isSelected = true
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
             }
         },
         update = { tv ->
-            if (tv.horizontalFadingEdgeLength != fadePx) {
-                tv.setFadingEdgeLength(fadePx)
+            if (marqueeEnabled) {
+                tv.ellipsize = TextUtils.TruncateAt.MARQUEE
+                tv.marqueeRepeatLimit = -1
+                tv.isHorizontalFadingEdgeEnabled = true
+                if (tv.horizontalFadingEdgeLength != fadePx) {
+                    tv.setFadingEdgeLength(fadePx)
+                }
+                tv.setHorizontallyScrolling(true)
+            } else {
+                tv.ellipsize = TextUtils.TruncateAt.END
+                tv.isHorizontalFadingEdgeEnabled = false
+                tv.setHorizontallyScrolling(false)
+                tv.isSelected = false
             }
             tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, textSizePx)
             tv.setTextColor(colorArgb)
@@ -67,13 +73,18 @@ internal fun NativeMarqueeText(
             if (tv.typeface != desired) {
                 tv.typeface = desired
             }
-            if (tv.text?.toString() != text) {
+            val textChanged = tv.text?.toString() != text
+            if (textChanged) {
                 tv.text = text
-                // Restart sau doi bai (Samsung rebind chip text).
+            }
+            if (marqueeEnabled) {
+                // Samsung: selected = dieu kien chay marquee; restart sau doi bai.
+                if (textChanged || !tv.isSelected) {
+                    tv.isSelected = false
+                    tv.isSelected = true
+                }
+            } else {
                 tv.isSelected = false
-                tv.isSelected = true
-            } else if (!tv.isSelected) {
-                tv.isSelected = true
             }
         },
     )

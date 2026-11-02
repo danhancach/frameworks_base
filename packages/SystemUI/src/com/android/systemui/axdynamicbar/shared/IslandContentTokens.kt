@@ -1042,6 +1042,22 @@ internal fun chipProgressFor(event: IslandEvent, includeMediaProgress: Boolean =
     }
 
 /**
+ * Cung quy tac [AxDynamicBarChip] useCircleStyle — chipStyle==1 + loai alert/timer/…
+ * Morph shell phai derive tu day (khong chi event accent).
+ */
+internal fun statusBarChipUsesCircleStyle(
+    chipStyle: Int,
+    event: IslandEvent,
+    isAlert: Boolean = false,
+): Boolean =
+    chipStyle == 1 &&
+        !isAlert &&
+        event !is IslandEvent.AudioRecording &&
+        event !is IslandEvent.Timer &&
+        event !is IslandEvent.Stopwatch &&
+        !(event is IslandEvent.Sports && event.team2Name.isNotEmpty())
+
+/**
  * Key doi bai chung cho cover + tieu de — khong dung Drawable identity
  * (UMO rebind moi lan play/pause tao Drawable moi → nhay cover).
  */

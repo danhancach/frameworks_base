@@ -360,29 +360,7 @@ private fun GlassChip(
     }
 }
 
-/**
- * Nhip noi dung AOD/keyguard — mo/dong KHONG doi xung; alpha luon clamp 0..1
- * (tach khoi spring overshoot neu co).
- *
- * Mo: pill rut som; expand hien khi khung du cho (progress ~ rong).
- * Dong: expand tat nhanh (~12% dau progress, ~50ms/400ms); pill tro lai sau.
- */
-private fun morphPillContentAlpha(progress: Float, closing: Boolean): Float =
-    if (closing) {
-        // Pill tro lai o nua sau luc dong.
-        ((0.55f - progress) / 0.55f).coerceIn(0f, 1f)
-    } else {
-        (1f - progress / 0.35f).coerceIn(0f, 1f)
-    }
-
-private fun morphExpandContentAlpha(progress: Float, closing: Boolean): Float =
-    if (closing) {
-        // Thu hoi noi dung chi tiet nhanh — het alpha khi progress con ~0.88.
-        ((progress - 0.88f) / 0.12f).coerceIn(0f, 1f)
-    } else {
-        // Chi hien khi khung du lon (~ progress 0.4+); khong copy nguong 239dp Samsung.
-        ((progress - 0.4f) / 0.4f).coerceIn(0f, 1f)
-    }
+// morphPillContentAlpha / morphExpandContentAlpha — shared KeyguardMorphGeometry.kt
 
 @Composable
 private fun rememberChargingParts(batteryString: String): List<String> {

@@ -82,4 +82,55 @@ class KeyguardExpandedHeightLockTest : SysuiTestCase() {
         assertThat(cur.heightPx).isEqualTo(810)
         assertThat(cur.owner).isEqualTo("battery")
     }
+
+    // --- STATUS BAR retarget (task-008): bridge envelope, follow natural ---
+
+    @Test
+    fun statusBar_ownerSwitch_bridgesLastExpanded_notPill() {
+        val locked = LockedTargetHeight(heightPx = 500, owner = "event:media")
+        // Owner doi — matched=0 nhung bridge lastExpanded, khong 0/pill.
+        assertThat(statusBarMorphTargetHeightPx(locked, "event:timer_1", lastExpandedHPx = 500))
+            .isEqualTo(500)
+        assertThat(statusBarMorphTargetHeightPx(locked, "event:timer_1", lastExpandedHPx = 0))
+            .isEqualTo(0)
+    }
+
+    @Test
+    fun statusBar_sameOwner_followsNaturalHeight() {
+        var cur = LockedTargetHeight(heightPx = 500, owner = "event:timer_1")
+        cur = resolveStatusBarLockedTargetHeight(cur, "event:timer_1", measuredHPx = 560, pillHPx = 60)
+        assertThat(cur.heightPx).isEqualTo(560)
+        cur = resolveStatusBarLockedTargetHeight(cur, "event:timer_1", measuredHPx = 420, pillHPx = 60)
+        assertThat(cur.heightPx).isEqualTo(420)
+    }
+
+    @Test
+    fun statusBar_resolve_ignoresPillAndZero_andNoopEqual() {
+        val locked = LockedTargetHeight(heightPx = 500, owner = "event:media")
+        assertThat(
+            resolveStatusBarLockedTargetHeight(locked, "event:media", measuredHPx = 0, pillHPx = 60)
+        ).isEqualTo(locked)
+        assertThat(
+            resolveStatusBarLockedTargetHeight(locked, "event:media", measuredHPx = 60, pillHPx = 60)
+        ).isEqualTo(locked)
+        assertThat(
+            resolveStatusBarLockedTargetHeight(locked, "event:media", measuredHPx = 500, pillHPx = 60)
+        ).isEqualTo(locked)
+    }
+
+    @Test
+    fun statusBar_ownerSwitch_retargetsWhenMeasured() {
+        var cur = LockedTargetHeight(heightPx = 500, owner = "event:media")
+        cur =
+            resolveStatusBarLockedTargetHeight(
+                cur,
+                owner = "event:timer_1",
+                measuredHPx = 480,
+                pillHPx = 60,
+            )
+        assertThat(cur.heightPx).isEqualTo(480)
+        assertThat(cur.owner).isEqualTo("event:timer_1")
+        assertThat(statusBarMorphTargetHeightPx(cur, "event:timer_1", lastExpandedHPx = 500))
+            .isEqualTo(480)
+    }
 }

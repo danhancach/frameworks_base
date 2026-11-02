@@ -72,6 +72,11 @@ fun ExpandedIslandContent(
     pinnedEventId: String? = null,
     /** Cap nhat expand-only khi stack commit (null cho media / non-chronometer). */
     onExpandOnlyEventIdChange: ((String?) -> Unit)? = null,
+    /**
+     * Confirmed stack pin — event.id the moi (ke ca media↔media).
+     * Ownership: goi SAU interactor.pinEventById; sync frozen morph/dummy.
+     */
+    onConfirmedStackEventId: ((String) -> Unit)? = null,
     hapticsViewModelFactory: SliderHapticsViewModel.Factory,
 ) {
     if (events.isEmpty()) return
@@ -88,14 +93,22 @@ fun ExpandedIslandContent(
         }
         if (stackEvents.isEmpty()) return
 
-        // Pin + dong bo expandOnlyEventId (timer→media = null, media→timer = id).
+        // Pin + dong bo expandOnly + frozen (timer↔media / multi media).
         val stackInteractor =
-            remember(interactor, events, onExpandOnlyEventIdChange) {
+            remember(interactor, events, onExpandOnlyEventIdChange, onConfirmedStackEventId) {
                 object : IslandActions by interactor {
                     override fun pinEventById(eventId: String) {
+                        // Pin sync uiState.topEvent TRUOC callback (atomic ownership).
                         interactor.pinEventById(eventId)
                         val next = events.find { it.id == eventId }
-                        onExpandOnlyEventIdChange?.invoke(next?.let { expandOnlyEventIdFor(it) })
+                        // Uu tien event.id that — media↔media null→null van sync frozen.
+                        if (onConfirmedStackEventId != null) {
+                            onConfirmedStackEventId.invoke(eventId)
+                        } else {
+                            onExpandOnlyEventIdChange?.invoke(
+                                next?.let { expandOnlyEventIdFor(it) },
+                            )
+                        }
                     }
                 }
             }
