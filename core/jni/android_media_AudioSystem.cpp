@@ -941,6 +941,12 @@ android_media_AudioSystem_setMasterMono(JNIEnv *env, jobject thiz, jboolean mono
     return check_AudioSystem_Command(AudioSystem::setMasterMono(mono));
 }
 
+static jint
+android_media_AudioSystem_setSpeakerPortraitMono(JNIEnv *env, jobject thiz, jboolean mono)
+{
+    return check_AudioSystem_Command(AudioSystem::setSpeakerPortraitMono(mono));
+}
+
 static jboolean
 android_media_AudioSystem_getMasterMono(JNIEnv *env, jobject thiz)
 {
@@ -3567,6 +3573,7 @@ static const JNINativeMethod gMethods[] = {
         MAKE_AUDIO_SYSTEM_METHOD(getMasterMute),
         MAKE_AUDIO_SYSTEM_METHOD(setMasterMono),
         MAKE_AUDIO_SYSTEM_METHOD(getMasterMono),
+        MAKE_AUDIO_SYSTEM_METHOD(setSpeakerPortraitMono),
         MAKE_AUDIO_SYSTEM_METHOD(setMasterBalance),
         MAKE_AUDIO_SYSTEM_METHOD(getMasterBalance),
         MAKE_AUDIO_SYSTEM_METHOD(getPrimaryOutputSamplingRate),

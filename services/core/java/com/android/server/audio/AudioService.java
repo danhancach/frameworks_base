@@ -155,6 +155,7 @@ import android.hardware.SensorPrivacyManager;
 import android.hardware.SensorPrivacyManagerInternal;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.DisplayManager.DisplayListener;
+import android.hardware.display.DisplayManagerGlobal;
 import android.hardware.hdmi.HdmiAudioSystemClient;
 import android.hardware.hdmi.HdmiClient;
 import android.hardware.hdmi.HdmiControlManager;
@@ -562,6 +563,7 @@ public class AudioService extends IAudioService.Stub
     private static final int MSG_INIT_INPUT_GAINS = 104;
     private static final int MSG_APPLY_INPUT_GAIN_INDEX = 105;
     private static final int MSG_PERSIST_INPUT_GAIN_INDEX = 106;
+    private static final int MSG_SPEAKER_PORTRAIT_MONO = 107;
 
     // end of messages handled under wakelock
 
@@ -1475,6 +1477,8 @@ public class AudioService extends IAudioService.Stub
             if (displayId != Display.DEFAULT_DISPLAY) {
                 return;
             }
+            // Truoc phan screen_state: goc moi van duoc doc ke ca khi helper xoay dang tat.
+            scheduleSpeakerPortraitMono(false);
             int displayState = mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY).getState();
             if (displayState == Display.STATE_ON) {
                 if (mMonitorRotation) {
@@ -2033,6 +2037,8 @@ public class AudioService extends IAudioService.Stub
         if (mDisplayManager != null) {
             mDisplayManager.registerDisplayListener(mDisplayListener, mAudioHandler);
         }
+        // Doc lai goc sau khi listener san sang. Khong phu thuoc ro.audio.monitorRotation.
+        scheduleSpeakerPortraitMono(false);
     }
 
     public void systemReady() {
@@ -2170,6 +2176,7 @@ public class AudioService extends IAudioService.Stub
     //-----------------------------------------------------------------
     // rotation/fold updates coming from RotationHelper
     void onRotationUpdate(Integer rotation) {
+        scheduleSpeakerPortraitMono(false);
         mSpatializerHelper.setDisplayOrientation((float) (rotation * Math.PI / 180.));
         // use REPLACE as only the last rotation matters
         final String rotationParameter = "rotation=" + rotation;
@@ -2321,6 +2328,8 @@ public class AudioService extends IAudioService.Stub
 
         // Restore mono mode
         updateMasterMono(mContentResolver);
+        mSpeakerPortraitMonoSent = false;
+        scheduleSpeakerPortraitMono(true);
 
         // Restore audio balance
         updateMasterBalance(mContentResolver);
@@ -3143,6 +3152,45 @@ public class AudioService extends IAudioService.Stub
     }
 
 
+    private boolean mSpeakerPortraitMonoEffective;
+    private boolean mSpeakerPortraitMonoSent;
+
+    private void scheduleSpeakerPortraitMono(boolean force) {
+        sendMsg(mAudioHandler, MSG_SPEAKER_PORTRAIT_MONO, SENDMSG_REPLACE,
+                force ? 1 : 0, 0, null, 0);
+    }
+
+    // Doc preference Global + goc man hinh luc chay. Khong giu callback tre.
+    private void applySpeakerPortraitMono(boolean force) {
+        final int rotation = resolveSpeakerPortraitRotation();
+        final boolean pref = mSettings.getGlobalInt(mContentResolver,
+                Settings.Global.SONY_SPEAKER_PORTRAIT_MONO, 1) == 1;
+        final boolean requested = SpeakerPortraitMonoPolicy.isRequested(pref, rotation);
+        if (!force && mSpeakerPortraitMonoSent && requested == mSpeakerPortraitMonoEffective) {
+            return;
+        }
+        final int rc = AudioSystem.setSpeakerPortraitMono(requested);
+        if (rc != 0) {
+            Log.e(TAG, "setSpeakerPortraitMono failed " + rc);
+            mSpeakerPortraitMonoSent = false;
+            return;
+        }
+        mSpeakerPortraitMonoEffective = requested;
+        mSpeakerPortraitMonoSent = true;
+    }
+
+    private int resolveSpeakerPortraitRotation() {
+        try {
+            final android.view.DisplayInfo info = DisplayManagerGlobal.getInstance()
+                    .getDisplayInfo(Display.DEFAULT_DISPLAY);
+            return info == null ? SpeakerPortraitMonoPolicy.ROTATION_UNKNOWN
+                    : SpeakerPortraitMonoPolicy.degreesFromSurfaceRotation(info.rotation);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "speaker portrait rotation unavailable", e);
+            return SpeakerPortraitMonoPolicy.ROTATION_UNKNOWN;
+        }
+    }
+
     private void updateMasterMono(ContentResolver cr)
     {
         final boolean masterMono = mSettings.getSystemIntForUser(
@@ -3581,6 +3629,7 @@ public class AudioService extends IAudioService.Stub
         updateUserMutableStreams();
 
         updateMasterMono(cr);
+        scheduleSpeakerPortraitMono(false);
 
         updateMasterBalance(cr);
 
@@ -11960,6 +12009,10 @@ public class AudioService extends IAudioService.Stub
                     onPersistInputGainIndex((AudioDeviceAttributes) msg.obj);
                     break;
 
+                case MSG_SPEAKER_PORTRAIT_MONO:
+                    applySpeakerPortraitMono(msg.arg1 != 0);
+                    break;
+
                 case MSG_PERSIST_RINGER_MODE:
                     // note that the value persisted is the current ringer mode, not the
                     // value of ringer mode as of the time the request was made to persist
@@ -12246,6 +12299,8 @@ public class AudioService extends IAudioService.Stub
                 Settings.Global.DOCK_AUDIO_MEDIA_ENABLED), false, this);
             mContentResolver.registerContentObserver(Settings.System.getUriFor(
                     Settings.System.MASTER_MONO), false, this, UserHandle.USER_ALL);
+            mContentResolver.registerContentObserver(Settings.Global.getUriFor(
+                    Settings.Global.SONY_SPEAKER_PORTRAIT_MONO), false, this);
             mContentResolver.registerContentObserver(Settings.System.getUriFor(
                     Settings.System.MASTER_BALANCE), false, this, UserHandle.USER_ALL);
             mContentResolver.registerContentObserver(Settings.System.getUriFor(
@@ -12282,6 +12337,7 @@ public class AudioService extends IAudioService.Stub
                 }
                 readDockAudioSettings(mContentResolver);
                 updateMasterMono(mContentResolver);
+                scheduleSpeakerPortraitMono(false);
                 updateMasterBalance(mContentResolver);
                 updateShowAppVolume(mContentResolver);
             }
@@ -12486,12 +12542,14 @@ public class AudioService extends IAudioService.Stub
                     RotationHelper.enable();
                 }
                 AudioSystem.setParameters("screen_state=on");
+                scheduleSpeakerPortraitMono(false);
             } else if (action.equals(Intent.ACTION_SCREEN_OFF)) {
                 if (mMonitorRotation) {
                     //reduce wakeups (save current) by only listening when display is on
                     RotationHelper.disable();
                 }
                 AudioSystem.setParameters("screen_state=off");
+                scheduleSpeakerPortraitMono(false);
             } else if (action.equals(Intent.ACTION_CONFIGURATION_CHANGED)) {
                 sendMsg(mAudioHandler,
                         MSG_CONFIGURATION_CHANGED,
@@ -14107,6 +14165,7 @@ public class AudioService extends IAudioService.Stub
                 }
             }
             mVolumeController.setLayoutDirection(config.getLayoutDirection());
+            scheduleSpeakerPortraitMono(false);
         } catch (Exception e) {
             Log.e(TAG, "Error handling configuration change: ", e);
         }

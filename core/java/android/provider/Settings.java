@@ -15884,6 +15884,14 @@ public final class Settings {
         public static final String NOTIFICATION_BUBBLES = "notification_bubbles";
 
         /**
+         * Mono loa trong khi portrait. 1 = bat, 0 = stereo. Mac dinh 1.
+         * Device-wide (Global), khong theo user. Khong phai accessibility master_mono.
+         * @hide
+         */
+        @Readable
+        public static final String SONY_SPEAKER_PORTRAIT_MONO = "sony_speaker_portrait_mono";
+
+        /**
          * Whether users are allowed to add more users or guest from lockscreen.
          * <p>
          * Type: int
