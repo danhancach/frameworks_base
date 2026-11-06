@@ -2035,11 +2035,13 @@ public final class NotificationPanelViewController implements
         updatePanelExpanded();
         updateGestureExclusionRect();
 
-        if (mQsController.isExpandImmediate() && !mQsController.getFullyExpanded()) {
-            mNotificationStackScrollLayoutController.getView().setAlpha(0f);
-        } else {
-            mNotificationStackScrollLayoutController.getView().setAlpha(1f);
-        }
+        // Cap Quick-QS alpha independently so height updates cannot override keyguard fades
+        // or the brightness mirror's panel alpha.
+        boolean hideForQuickQs = mBarState != KEYGUARD
+                && !isFullyCollapsed()
+                && mQsController.isExpandImmediate()
+                && !mQsController.getFullyExpanded();
+        mNotificationStackScrollLayoutController.setMaxAlphaForQuickQs(hideForQuickQs ? 0f : 1f);
 
         if (mHeaderImageEnabled) {
             mView.post(() -> updateHeaderImage());
@@ -2057,6 +2059,7 @@ public final class NotificationPanelViewController implements
             updateSystemUiStateFlags();
             if (!isExpanded) {
                 mQsController.closeQsCustomizer();
+                mNotificationStackScrollLayoutController.setMaxAlphaForQuickQs(1f);
             }
         }
     }
@@ -3688,6 +3691,9 @@ public final class NotificationPanelViewController implements
             mBarState = statusBarState;
             ScrimUtils.get().setBarState(mBarState);
             mQsController.setBarState(statusBarState);
+            if (statusBarState == KEYGUARD) {
+                mNotificationStackScrollLayoutController.setMaxAlphaForQuickQs(1f);
+            }
 
             boolean fromShadeToKeyguard = statusBarState == KEYGUARD
                     && (oldState == SHADE || oldState == SHADE_LOCKED);

@@ -31,9 +31,11 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
@@ -890,6 +892,31 @@ public class NotificationStackScrollLayoutControllerTest extends SysuiTestCase {
 
         // THEN: The event should fall through to the NSSL scroll interceptor
         verify(mNotificationStackScrollLayout).onInterceptTouchEventScroll(event);
+    }
+
+    @Test
+    public void testMaxAlphaForQuickQs_respectsIndependentCaps() {
+        initController(/* viewIsAttached= */ true);
+        clearInvocations(mNotificationStackScrollLayout);
+
+        // Height updates must not brighten notifications while keyguard is fading out.
+        mController.setMaxAlphaForKeyguard(0.4f, "test");
+        mController.setMaxAlphaFromView(0.6f);
+        mController.setMaxAlphaForQuickQs(1.0f);
+        mController.setMaxAlphaForQuickQs(0.0f);
+        mController.setMaxAlphaForQuickQs(1.0f);
+
+        // Releasing Quick-QS must also preserve the brightness mirror's independent cap.
+        mController.setMaxAlphaForKeyguard(1.0f, "test");
+        mController.setMaxAlphaForQuickQs(0.0f);
+        mController.setMaxAlphaForQuickQs(1.0f);
+        mController.setMaxAlphaFromView(1.0f);
+
+        ArgumentCaptor<Float> alpha = ArgumentCaptor.forClass(Float.class);
+        verify(mNotificationStackScrollLayout, times(8)).setAlpha(alpha.capture());
+        assertThat(alpha.getAllValues())
+                .containsExactly(0.4f, 0.4f, 0.0f, 0.4f, 0.6f, 0.0f, 0.6f, 1.0f)
+                .inOrder();
     }
 
     private LogMaker logMatcher(int category, int type) {
