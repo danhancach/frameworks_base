@@ -290,6 +290,8 @@ sealed class IslandEvent(open val priority: Int, val id: String) : Comparable<Is
         val packageName: String = "",
         val notificationKey: String = "",
         val sbn: StatusBarNotification? = null,
+        /** A retained timebase does not confirm the run survived a visit to Clock. */
+        val awaitingOwnerRepost: Boolean = false,
     ) : IslandEvent(priority = 44, id = "stopwatch") {
         // Ongoing stopwatch — khong autoDismiss
         override val behavior = EventBehavior(autoDismissMs = null)

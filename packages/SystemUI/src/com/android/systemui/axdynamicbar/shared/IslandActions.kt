@@ -42,6 +42,13 @@ interface IslandActions {
         get() = null
     fun collapseIsland()
     fun dismissEvent(event: IslandEvent)
+    /**
+     * Vuot ngang the stack: an dung su kien do, roi thu overlay neu con the stack.
+     * Mac dinh chi dismiss (caller chua override).
+     */
+    fun dismissEventFromExpandedSwipe(event: IslandEvent) {
+        dismissEvent(event)
+    }
     /** Pin event theo id (stack expand doi panel). Mac dinh no-op. */
     fun pinEventById(eventId: String) {}
     /** Pin alert theo sbn.key (stack overlay doi the). Mac dinh no-op. */

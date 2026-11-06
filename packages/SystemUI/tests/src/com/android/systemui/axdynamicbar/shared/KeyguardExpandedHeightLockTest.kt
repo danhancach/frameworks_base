@@ -95,6 +95,31 @@ class KeyguardExpandedHeightLockTest : SysuiTestCase() {
             .isEqualTo(0)
     }
 
+    /** task-031: cache natural owner moi thang bridge lastExpanded (top nho != under cao). */
+    @Test
+    fun statusBar_ownerSwitch_prefersCachedOwnerNatural_overLastExpanded() {
+        val locked = LockedTargetHeight(heightPx = 300, owner = "event:under_tall")
+        assertThat(
+                statusBarMorphTargetHeightPx(
+                    locked,
+                    owner = "event:top_short",
+                    lastExpandedHPx = 300,
+                    cachedOwnerNaturalHPx = 100,
+                )
+            )
+            .isEqualTo(100)
+        // Khong cache → van bridge (tranh pill bounce mid-switch).
+        assertThat(
+                statusBarMorphTargetHeightPx(
+                    locked,
+                    owner = "event:top_short",
+                    lastExpandedHPx = 300,
+                    cachedOwnerNaturalHPx = 0,
+                )
+            )
+            .isEqualTo(300)
+    }
+
     @Test
     fun statusBar_sameOwner_followsNaturalHeight() {
         var cur = LockedTargetHeight(heightPx = 500, owner = "event:timer_1")

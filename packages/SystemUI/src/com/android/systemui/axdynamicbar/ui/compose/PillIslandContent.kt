@@ -159,25 +159,33 @@ private fun CompactChronometerText(
     }
 }
 
-/** Ve ring + soft fill giong CircleChip (stroke theo minDimension). */
+/**
+ * Ve ring + soft fill giong CircleChip (stroke theo minDimension).
+ * [glassAlpha]: Task-054 soft-fill / track glass fraction (blurAlpha); FG arc/icon
+ * giu alpha day du — khong nhan staged vao icon/progress.
+ */
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCircleChipRing(
     accent: Color,
     contentColor: Color,
     progress: Float?,
+    glassAlpha: Float = 1f,
 ) {
     val strokePx = size.minDimension * CircleChipStrokeFrac
     val inset = strokePx / 2f
     val ringSize = Size(size.width - strokePx, size.height - strokePx)
     val topLeft = Offset(inset, inset)
+    val g = glassAlpha.coerceIn(0f, 1f)
 
+    // Soft fill = native glass proxy (Row islandBlur) — scale theo glassAlpha.
     drawCircle(
-        color = accent.copy(alpha = 0.4f),
+        color = accent.copy(alpha = 0.4f * g),
         radius = (size.minDimension - strokePx) / 2f,
     )
 
     if (progress != null) {
+        // Track ring nhe theo glass; fill arc = FG (live progress) full.
         drawArc(
-            color = lerp(accent, contentColor, 0.2f).copy(alpha = 0.7f),
+            color = lerp(accent, contentColor, 0.2f).copy(alpha = 0.7f * g),
             startAngle = -90f,
             sweepAngle = 360f,
             useCenter = false,
@@ -195,8 +203,9 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCircleChipRing(
             size = ringSize,
         )
     } else {
+        // Idle ring stroke: glass rim (khong co progress FG).
         drawArc(
-            color = accent.copy(alpha = 0.5f),
+            color = accent.copy(alpha = 0.5f * g),
             startAngle = -90f,
             sweepAngle = 360f,
             useCenter = false,
@@ -214,13 +223,15 @@ internal fun CircleChip(
     contentColor: Color,
     progress: Float?,
     modifier: Modifier = Modifier,
+    /** Task-054: soft-fill/track glass fraction; icon + progress fill giu α=1. */
+    blurAlpha: Float = 1f,
 ) {
     Box(
         modifier = modifier.size(CircleChipSize),
         contentAlignment = Alignment.Center,
     ) {
         Canvas(modifier = Modifier.matchParentSize()) {
-            drawCircleChipRing(accent, contentColor, progress)
+            drawCircleChipRing(accent, contentColor, progress, glassAlpha = blurAlpha)
         }
 
         Box(modifier = Modifier.size(CircleChipIconSize), contentAlignment = Alignment.Center) {
@@ -1313,11 +1324,17 @@ internal fun PillEventText(
     modifier: Modifier,
     notifCount: Int = 0,
     overrideColor: Color? = null,
-    /** true: tat marquee/ticker — dung cho overlay dummy snapshot. */
+    /** true: tat marquee / transition text — freezeMotion (khong dong nghia freeze gia tri). */
     static: Boolean = false,
-    /** Chronometer ms freeze @p0 (timer/stopwatch); null = compute 1 lan khi static. */
+    /**
+     * Task-053: chrono/media value live. null = !static (tuong thich cu).
+     * freezeMotion+liveValue: marquee tat, ticker van chay.
+     */
+    liveValue: Boolean? = null,
+    /** Chronometer ms freeze @p0 (timer/stopwatch); null khi liveValue. */
     frozenChronometerMs: Long? = null,
 ) {
+    val valuesLive = liveValue ?: !static
     when (event) {
         is IslandEvent.AudioRecording ->
             AudioRecText(event, modifier, overrideColor, static = static)
@@ -1360,16 +1377,16 @@ internal fun PillEventText(
                 event,
                 modifier,
                 overrideColor,
-                static = static,
-                frozenMs = frozenChronometerMs,
+                liveValue = valuesLive,
+                frozenMs = if (valuesLive) null else frozenChronometerMs,
             )
         is IslandEvent.Stopwatch ->
             StopwatchText(
                 event,
                 modifier,
                 overrideColor,
-                static = static,
-                frozenMs = frozenChronometerMs,
+                liveValue = valuesLive,
+                frozenMs = if (valuesLive) null else frozenChronometerMs,
             )
         is IslandEvent.RingerMode ->
             MarqueeLabel(
@@ -1394,7 +1411,8 @@ internal fun PillEventText(
             )
         is IslandEvent.Call -> {
             if (event.callStartTimeMs > 0L) {
-                CallTimerText(event, modifier, overrideColor, static = static)
+                // liveValue: ticker; freezeMotion chi anh huong marquee path khac.
+                CallTimerText(event, modifier, overrideColor, static = !valuesLive)
             } else {
                 NotifBellBadge(modifier, notifCount)
             }
@@ -1687,7 +1705,8 @@ private fun TimerText(
     event: IslandEvent.Timer,
     modifier: Modifier,
     overrideColor: Color? = null,
-    static: Boolean = false,
+    /** Task-053: true = ticker live; false = snapshot frozenMs (dummy/morph). */
+    liveValue: Boolean = true,
     frozenMs: Long? = null,
 ) {
     val hasTime = event.endTimeMs > 0L || event.pausedRemainingMs > 0L ||
@@ -1702,7 +1721,7 @@ private fun TimerText(
                 event.endElapsedRealtimeMs,
             )
         val remainingMs =
-            if (static) {
+            if (!liveValue) {
                 remember(identityKey, frozenMs) {
                     frozenMs ?: event.displayedRemainingMs()
                 }
@@ -1721,7 +1740,7 @@ private fun TimerText(
             event.label.ifEmpty { stringResource(R.string.ax_dynamic_bar_timer) },
             overrideColor ?: toneFor(event).tint,
             modifier,
-            static = static,
+            static = !liveValue,
         )
     }
 }
@@ -1731,7 +1750,8 @@ private fun StopwatchText(
     event: IslandEvent.Stopwatch,
     modifier: Modifier,
     overrideColor: Color? = null,
-    static: Boolean = false,
+    /** Task-053: true = ticker live; false = snapshot frozenMs (dummy/morph). */
+    liveValue: Boolean = true,
     frozenMs: Long? = null,
 ) {
     val color = overrideColor ?: if (event.isRunning) toneFor(event).tint else SubtleGray
@@ -1743,7 +1763,7 @@ private fun StopwatchText(
             event.pausedElapsedMs,
         )
     val elapsedMs =
-        if (static) {
+        if (!liveValue) {
             remember(identityKey, frozenMs) {
                 frozenMs ?: event.displayedElapsedMs()
             }

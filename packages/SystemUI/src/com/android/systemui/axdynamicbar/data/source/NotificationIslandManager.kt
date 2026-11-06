@@ -20,6 +20,24 @@ import android.widget.Chronometer
 import android.widget.FrameLayout
 import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.model.RecordingState
+import com.android.systemui.axdynamicbar.shared.DESK_CLOCK_REASON_UNKNOWN
+import com.android.systemui.axdynamicbar.shared.DeskClockNotifKind
+import com.android.systemui.axdynamicbar.shared.DeskClockNotifRemovalDecision
+import com.android.systemui.axdynamicbar.shared.DeskClockOwnerGapEffect
+import com.android.systemui.axdynamicbar.shared.DeskClockOwnerGapRetention
+import com.android.systemui.axdynamicbar.shared.DeskClockPostedDisposition
+import com.android.systemui.axdynamicbar.shared.DeskClockStopwatchRunRelation
+import com.android.systemui.axdynamicbar.shared.DeskClockStopwatchVisualDismissFgEffect
+import com.android.systemui.axdynamicbar.shared.DeskClockStopwatchVisualDismissGate
+import com.android.systemui.axdynamicbar.shared.classifyDeskClockPosted
+import com.android.systemui.axdynamicbar.shared.deskClockEventToken
+import com.android.systemui.axdynamicbar.shared.deskClockNotifRemovalDecision
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchApplyPostToVisualDismissGate
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchRunIdentity
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchVisualDismissGateOf
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchVisualDismissOnForegroundChanged
+import com.android.systemui.axdynamicbar.shared.islandEventOwnerPackages
+import com.android.systemui.axdynamicbar.shared.statusBarAppPillLogClockNotif
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.statusbar.notification.collection.NotificationEntry
@@ -173,7 +191,22 @@ constructor(
     private var recorderGraceJob: Job? = null
     private var recording: IslandEvent.AudioRecording? = null
     private var recordingDismissed = false
-    private var stopwatchDismissedKey: String? = null
+    /**
+     * Visual swipe-hide stopwatch (khong stop Clock that). Stateful gate —
+     * rejected posts cap nhat latestObserved (pause/resume continuation).
+     */
+    private var stopwatchVisualDismissGate: DeskClockStopwatchVisualDismissGate? = null
+    private var stopwatchDismissedPackage: String? = null
+    private val stopwatchDismissedKey: String?
+        get() = stopwatchVisualDismissGate?.notificationKey
+    private val stopwatchAwaitOwnerRevisit: Boolean
+        get() = stopwatchVisualDismissGate?.awaitOwnerRevisit == true
+    private var stopwatchOwnerRevisitArmed: Boolean
+        get() = stopwatchVisualDismissGate?.ownerRevisitArmed == true
+        set(value) {
+            val g = stopwatchVisualDismissGate ?: return
+            stopwatchVisualDismissGate = g.copy(ownerRevisitArmed = value)
+        }
     private val dismissedPromotedKeys = mutableSetOf<String>()
     private val dismissedSportsKeys = mutableSetOf<String>()
     private var alarmNotificationKey: String? = null
@@ -183,7 +216,26 @@ constructor(
 
     var activeMediaPackageProvider: (() -> Set<String>)? = null
 
+    /**
+     * FG package hien tai (AppTracking) — dung policy owner-gap Clock.
+     * Interactor gan khi init; null = coi nhu khong owner FG.
+     */
+    var foregroundPackageProvider: (() -> String?)? = null
+
     private val seenSignatures = mutableMapOf<String, Long>()
+
+    /**
+     * Retention SSOT — absolute deadline + generation (test inject clock qua
+     * DeskClockOwnerGapRetention rieng; production dung instance nay).
+     */
+    private val deskClockOwnerGapRetention = DeskClockOwnerGapRetention()
+
+    /** Stopwatch dang giu qua owner-gap (notif vang tam). */
+    private var stopwatchOwnerGapKey: String? = null
+    private var stopwatchGapJob: Job? = null
+    /** Timer keys dang giu qua owner-gap. */
+    private val timerOwnerGapKeys = ConcurrentHashMap.newKeySet<String>()
+    private val timerGapJobs = ConcurrentHashMap<String, Job>()
 
     var onTimerEvent: ((IslandEvent.Timer) -> Unit)? = null
     var onAlarmEvent: ((IslandEvent.Alarm) -> Unit)? = null
@@ -228,75 +280,54 @@ constructor(
     private val scrimListener =
         object : ScrimUtils.ScrimEventListener {
             override fun onNotificationRemoved(sbn: StatusBarNotification) {
-                activeSbns.remove(sbn.key)
-                _activeNotifications.update { it - sbn.key }
-                val pkg = sbn.packageName ?: return
-                seenSignatures.remove(sbn.key)
+                handleNotificationRemoved(sbn, DESK_CLOCK_REASON_UNKNOWN)
+            }
 
-                if (_timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbn.key) }) {
-                    removeTimersForNotificationKey(sbn.key)
-                }
-                if (sbn.key == stopwatchNotificationKey) {
-                    stopwatchNotificationKey = null
-                    stopwatchDismissedKey = null
-                    _stopwatchEvent.value = null
-                }
-                dismissedPromotedKeys.remove(sbn.key)
-                dismissedSportsKeys.remove(sbn.key)
+            override fun onNotificationRemoved(sbn: StatusBarNotification, reason: Int) {
+                handleNotificationRemoved(sbn, reason)
+            }
 
-                if (sbn.key == recorderNotifKey) {
-                    recorderNotifKey = null
-                    val currentState = recording?.state
-                    if (currentState == RecordingState.SAVED) {
-                        clearAudioRecording()
-                    } else if (currentState != null) {
-                        recorderGraceJob?.cancel()
-                        recorderGraceJob =
-                            applicationScope.launch {
-                                delay(RECORDER_REMOVAL_GRACE_MS)
-                                if (recorderNotifKey == null &&
-                                    recording?.state != RecordingState.SAVED
-                                ) {
-                                    clearAudioRecording()
-                                }
-                            }
-                    }
-                }
-
-                if (sbn.key == alarmNotificationKey) {
-                    alarmNotificationKey = null
-                    _alarmEvent.value = null
-                }
-
-                _callEvents.value =
-                    _callEvents.value.filter { it.sbn.key != sbn.key }
-
-                _promotedOngoingEvents.value =
-                    _promotedOngoingEvents.value.filter { it.sbn.key != sbn.key }
-
-                _sportsEvents.value =
-                    _sportsEvents.value.filter { it.key != sbn.key }
-
-                if (_nowPlayingEvent.value?.key == sbn.key) {
-                    _nowPlayingEvent.value = null
-                }
-
-                _notificationEvents.value =
-                    _notificationEvents.value.filter { it.sbn.key != sbn.key }
-
-                notificationRemovedFlow.tryEmit(sbn.key)
+            override fun onUserChanged() {
+                // User switch — drop moi owner-gap retained (khong ghost cross-user).
+                dropAllDeskClockOwnerGaps(cause = "user_changed")
             }
 
             override fun onNotificationPosted(sbn: StatusBarNotification) {
                 activeSbns[sbn.key] = sbn
                 _activeNotifications.update { it + (sbn.key to sbn) }
-                val pkg = sbn.packageName ?: return
-                val extras = sbn.notification?.extras ?: return
+                val pkg = sbn.packageName
+                // pkg null: chi reconcile neu dang track gap cung key (khong biet CLOCK).
+                if (pkg == null) {
+                    if (hasTrackedDeskClockSameKeyGap(sbn.key)) {
+                        reconcileDeskClockNonMatchingPost(sbn.key)
+                    }
+                    return
+                }
 
                 if (pkg in CLOCK_PACKAGES) {
-                    // Autogroup summary (Timers+Stopwatch) channel=Timers — khong tao timer gia.
                     val clockFlags = sbn.notification?.flags ?: 0
-                    if (clockFlags and Notification.FLAG_GROUP_SUMMARY != 0) return
+                    val isGroupSummary =
+                        clockFlags and Notification.FLAG_GROUP_SUMMARY != 0
+                    val extras = sbn.notification?.extras
+                    val hasGap = hasTrackedDeskClockSameKeyGap(sbn.key)
+                    val prevKind = trackedDeskClockKindForKey(sbn.key)
+
+                    // Summary / extras null: classify truoc early-return (P3).
+                    if (isGroupSummary || extras == null) {
+                        val early =
+                            classifyDeskClockPosted(
+                                hasTrackedSameKeyGap = hasGap,
+                                previousTrackedKind = prevKind,
+                                isGroupSummary = isGroupSummary,
+                                extrasAvailable = extras != null,
+                                classifiedKind = DeskClockNotifKind.NONE,
+                                typeEnabled = true,
+                            )
+                        if (early == DeskClockPostedDisposition.RECONCILE_DROP_RETAINED) {
+                            reconcileDeskClockNonMatchingPost(sbn.key)
+                        }
+                        return
+                    }
 
                     val channelId = sbn.notification?.channelId?.lowercase() ?: ""
                     val actionLabels =
@@ -311,32 +342,78 @@ constructor(
                     val hasTimerIntent = actionIntents.any {
                         DeskClockActions.isTimerAction(it)
                     }
-                    // EN + VI: Lap / Vòng — PendingIntent action thuong null tren Clock moi
+                    // EN + VI: Lap / Vong — PendingIntent action thuong null tren Clock moi
                     val hasLap =
                         actionLabels.any {
                             it.contains("lap") || it.contains("vòng") || it.contains("vong")
                         }
                     val isCountDown = extras.getBoolean("android.chronometerCountDown", false)
 
-                    val isStopwatch = hasStopwatchIntent || channelId.contains("stopwatch") || hasLap
-                    val isTimer = !isStopwatch && (
-                        hasTimerIntent ||
-                            channelId.contains("timer") ||
-                            channelId.contains("firing") ||
-                            isCountDown ||
-                            actionLabels.any { it.contains("+1") || it.contains("add") }
-                    )
+                    val isStopwatch =
+                        hasStopwatchIntent || channelId.contains("stopwatch") || hasLap
+                    val isTimer =
+                        !isStopwatch &&
+                            (hasTimerIntent ||
+                                channelId.contains("timer") ||
+                                channelId.contains("firing") ||
+                                isCountDown ||
+                                actionLabels.any { it.contains("+1") || it.contains("add") })
 
-                    if (isStopwatch && "stopwatch" !in disabledTypes) {
-                        handleStopwatch(sbn, extras, actionLabels, actionIntents)
-                        return
+                    val classifiedKind =
+                        when {
+                            isStopwatch -> DeskClockNotifKind.STOPWATCH
+                            isTimer -> DeskClockNotifKind.TIMER
+                            else -> DeskClockNotifKind.NONE
+                        }
+                    val typeEnabled =
+                        when (classifiedKind) {
+                            DeskClockNotifKind.STOPWATCH -> "stopwatch" !in disabledTypes
+                            DeskClockNotifKind.TIMER -> "timer" !in disabledTypes
+                            DeskClockNotifKind.NONE -> true
+                        }
+                    val disposition =
+                        classifyDeskClockPosted(
+                            hasTrackedSameKeyGap = hasGap,
+                            previousTrackedKind = prevKind,
+                            isGroupSummary = false,
+                            extrasAvailable = true,
+                            classifiedKind = classifiedKind,
+                            typeEnabled = typeEnabled,
+                        )
+                    when (disposition) {
+                        DeskClockPostedDisposition.HANDLE_VALIDATED -> {
+                            when (classifiedKind) {
+                                DeskClockNotifKind.STOPWATCH ->
+                                    handleStopwatch(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.TIMER ->
+                                    handleTimer(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.NONE -> Unit
+                            }
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
+                        DeskClockPostedDisposition.CROSS_TYPE_DROP_THEN_HANDLE -> {
+                            // Drop kind cu + clear retention truoc rebind kind moi.
+                            dropTrackedDeskClockKindBeforeCrossType(sbn.key, prevKind)
+                            when (classifiedKind) {
+                                DeskClockNotifKind.STOPWATCH ->
+                                    handleStopwatch(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.TIMER ->
+                                    handleTimer(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.NONE -> Unit
+                            }
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
+                        DeskClockPostedDisposition.RECONCILE_DROP_RETAINED -> {
+                            reconcileDeskClockNonMatchingPost(sbn.key)
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
+                        DeskClockPostedDisposition.IGNORE -> {
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
                     }
-                    if (isTimer && "timer" !in disabledTypes) {
-                        handleTimer(sbn, extras, actionLabels, actionIntents)
-                        return
-                    }
-                    if (isStopwatch || isTimer) return
                 }
+
+                val extras = sbn.notification?.extras ?: return
 
                 val isAlarmCategory = sbn.notification?.category == Notification.CATEGORY_ALARM
                 if ((isAlarmCategory || pkg in ALARM_PACKAGES) && sbn.isOngoing) {
@@ -691,9 +768,526 @@ constructor(
             }
 
             override fun onEntryRemoved(entry: NotificationEntry, reason: Int) {
-                entry.sbn?.let { scrimListener.onNotificationRemoved(it) }
+                // Collection da co reason — khong drop qua Scrim path khong reason.
+                entry.sbn?.let { handleNotificationRemoved(it, reason) }
             }
         }
+
+    /**
+     * FG doi (Interactor) — doi max-gap <-> leave-grace cho event dang KEEP.
+     * Absolute deadline khong gia han khi flip-flop; chi re-arm phan con lai.
+     * Home + event retained → APP_SHOW ngay (khong doi Clock post).
+     * Visual-dismiss stopwatch: owner-gap chi khi retained nonnull; restore sau
+     * chuoi vao Clock → roi (Home) — khong resurrect moi tick.
+     */
+    fun onForegroundPackageChanged(foregroundPackage: String?) {
+        val sw = _stopwatchEvent.value
+        val swKey = stopwatchOwnerGapKey
+        if (swKey != null && sw != null) {
+            val inOwner =
+                !foregroundPackage.isNullOrEmpty() &&
+                    foregroundPackage in islandEventOwnerPackages(sw)
+            applyDeskClockOwnerGapEffect(
+                deskClockOwnerGapRetention.onOwnerForegroundChanged(swKey, inOwner),
+                kind = DeskClockGapKind.STOPWATCH,
+            )
+        } else {
+            // Event null sau swipe-hide — owner-gap khong chay; visual-dismiss restore.
+            applyStopwatchVisualDismissForeground(foregroundPackage)
+        }
+        for (key in timerOwnerGapKeys.toList()) {
+            val timer =
+                _timerEvents.value.firstOrNull {
+                    isTimerKeyForNotification(it.notificationKey, key)
+                }
+            if (timer == null) {
+                clearTimerOwnerGap(key)
+                continue
+            }
+            val inOwner =
+                !foregroundPackage.isNullOrEmpty() &&
+                    foregroundPackage in islandEventOwnerPackages(timer)
+            applyDeskClockOwnerGapEffect(
+                deskClockOwnerGapRetention.onOwnerForegroundChanged(key, inOwner),
+                kind = DeskClockGapKind.TIMER,
+            )
+        }
+    }
+
+    private fun stopwatchVisualDismissOwnerPackages(): Set<String> {
+        val pkg = stopwatchDismissedPackage
+        return if (!pkg.isNullOrEmpty()) {
+            CLOCK_PACKAGES + pkg
+        } else {
+            CLOCK_PACKAGES
+        }
+    }
+
+    private fun applyStopwatchVisualDismissForeground(foregroundPackage: String?) {
+        when (
+            deskClockStopwatchVisualDismissOnForegroundChanged(
+                dismissedKey = stopwatchDismissedKey,
+                awaitOwnerRevisit = stopwatchAwaitOwnerRevisit,
+                ownerRevisitArmed = stopwatchOwnerRevisitArmed,
+                foregroundPackage = foregroundPackage,
+                ownerPackages = stopwatchVisualDismissOwnerPackages(),
+            )
+        ) {
+            DeskClockStopwatchVisualDismissFgEffect.NONE -> Unit
+            DeskClockStopwatchVisualDismissFgEffect.ARM_OWNER_REVISIT -> {
+                stopwatchOwnerRevisitArmed = true
+            }
+            DeskClockStopwatchVisualDismissFgEffect.RESTORE_AFTER_LEAVE -> {
+                val key = stopwatchDismissedKey
+                clearStopwatchVisualDismissGate()
+                if (key != null) {
+                    rebindStopwatchFromActiveNotification(key)
+                }
+            }
+        }
+    }
+
+    private fun clearStopwatchVisualDismissGate() {
+        stopwatchVisualDismissGate = null
+        stopwatchDismissedPackage = null
+    }
+
+    /** Rebind stopwatch tu SBN ongoing sau deliberate owner revisit / new-run gate clear. */
+    private fun rebindStopwatchFromActiveNotification(key: String) {
+        val sbn = getSbn(key) ?: return
+        val extras = sbn.notification?.extras ?: return
+        val actionLabels =
+            sbn.notification?.actions?.map { it.title?.toString()?.lowercase() ?: "" }
+                ?: emptyList()
+        val actionIntents =
+            sbn.notification?.actions?.map { actionIntentString(it) ?: "" } ?: emptyList()
+        handleStopwatch(sbn, extras, actionLabels, actionIntents)
+    }
+
+    private fun currentForegroundPackage(): String? =
+        try {
+            foregroundPackageProvider?.invoke()
+        } catch (_: RuntimeException) {
+            null
+        }
+
+    private fun handleNotificationRemoved(sbn: StatusBarNotification, reason: Int) {
+        activeSbns.remove(sbn.key)
+        _activeNotifications.update { it - sbn.key }
+        seenSignatures.remove(sbn.key)
+
+        val fg = currentForegroundPackage()
+
+        if (_timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbn.key) }) {
+            handleTimerNotificationRemoved(sbn, reason, fg)
+        }
+        if (sbn.key == stopwatchNotificationKey || sbn.key == stopwatchOwnerGapKey) {
+            handleStopwatchNotificationRemoved(sbn, reason, fg)
+        }
+
+        // Media / non-clock: giu hanh vi cu — clear ngay (khong owner-gap Clock).
+        dismissedPromotedKeys.remove(sbn.key)
+        dismissedSportsKeys.remove(sbn.key)
+
+        if (sbn.key == recorderNotifKey) {
+            recorderNotifKey = null
+            val currentState = recording?.state
+            if (currentState == RecordingState.SAVED) {
+                clearAudioRecording()
+            } else if (currentState != null) {
+                recorderGraceJob?.cancel()
+                recorderGraceJob =
+                    applicationScope.launch {
+                        delay(RECORDER_REMOVAL_GRACE_MS)
+                        if (recorderNotifKey == null &&
+                            recording?.state != RecordingState.SAVED
+                        ) {
+                            clearAudioRecording()
+                        }
+                    }
+            }
+        }
+
+        if (sbn.key == alarmNotificationKey) {
+            alarmNotificationKey = null
+            _alarmEvent.value = null
+        }
+
+        _callEvents.value = _callEvents.value.filter { it.sbn.key != sbn.key }
+
+        _promotedOngoingEvents.value =
+            _promotedOngoingEvents.value.filter { it.sbn.key != sbn.key }
+
+        _sportsEvents.value = _sportsEvents.value.filter { it.key != sbn.key }
+
+        if (_nowPlayingEvent.value?.key == sbn.key) {
+            _nowPlayingEvent.value = null
+        }
+
+        _notificationEvents.value =
+            _notificationEvents.value.filter { it.sbn.key != sbn.key }
+
+        notificationRemovedFlow.tryEmit(sbn.key)
+    }
+
+    private fun handleStopwatchNotificationRemoved(
+        sbn: StatusBarNotification,
+        reason: Int,
+        foregroundPackage: String?,
+    ) {
+        val existing = _stopwatchEvent.value
+        val owners = existing?.let { islandEventOwnerPackages(it) }.orEmpty()
+        val ownerAssoc =
+            !foregroundPackage.isNullOrEmpty() && foregroundPackage in owners
+        val decision = deskClockNotifRemovalDecision(reason, ownerAssoc)
+        val tb =
+            existing?.let {
+                if (it.isRunning) it.startElapsedRealtimeMs else it.pausedElapsedMs
+            } ?: 0L
+        statusBarAppPillLogClockNotif(
+            cause = "remove",
+            reason = reason,
+            decision =
+                if (decision == DeskClockNotifRemovalDecision.KEEP_OWNER_GAP) "keep"
+                else "drop",
+            ownerAssoc = ownerAssoc,
+            eventKind = "stopwatch",
+            eventToken = deskClockEventToken(sbn.key),
+            timebaseAnchor = tb,
+        )
+        // DROP thang KEEP tren duplicate Scrim+collection; KEEP trung khong reset deadline.
+        val effect =
+            deskClockOwnerGapRetention.applyRemovalDecision(
+                key = sbn.key,
+                decision = decision,
+                ownerInForeground = ownerAssoc,
+            )
+        when (decision) {
+            DeskClockNotifRemovalDecision.KEEP_OWNER_GAP -> {
+                // Retain run data, but require a repost before presenting it again.
+                stopwatchOwnerGapKey = sbn.key
+                // Key van tro toi event retained (post tre cung key rebind).
+                stopwatchNotificationKey = sbn.key
+                val current = _stopwatchEvent.value
+                if (current != null && !current.awaitingOwnerRepost) {
+                    _stopwatchEvent.value = current.copy(awaitingOwnerRepost = true)
+                }
+                applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.STOPWATCH)
+            }
+            DeskClockNotifRemovalDecision.DROP_ENDED -> {
+                // Chi drop neu key van so huu event hien tai (stale old-key khong xoa moi).
+                val currentKey =
+                    _stopwatchEvent.value?.notificationKey ?: stopwatchOwnerGapKey
+                if (currentKey == null || currentKey == sbn.key) {
+                    dropStopwatchEvent(cause = "removal")
+                } else {
+                    deskClockOwnerGapRetention.clearKey(sbn.key)
+                }
+            }
+        }
+    }
+
+    private fun handleTimerNotificationRemoved(
+        sbn: StatusBarNotification,
+        reason: Int,
+        foregroundPackage: String?,
+    ) {
+        val matched =
+            _timerEvents.value.filter { isTimerKeyForNotification(it.notificationKey, sbn.key) }
+        if (matched.isEmpty()) return
+        val owners = matched.flatMap { islandEventOwnerPackages(it) }.toSet()
+        val ownerAssoc =
+            !foregroundPackage.isNullOrEmpty() && foregroundPackage in owners
+        val decision = deskClockNotifRemovalDecision(reason, ownerAssoc)
+        val tb = matched.firstOrNull()?.endElapsedRealtimeMs ?: 0L
+        statusBarAppPillLogClockNotif(
+            cause = "remove",
+            reason = reason,
+            decision =
+                if (decision == DeskClockNotifRemovalDecision.KEEP_OWNER_GAP) "keep"
+                else "drop",
+            ownerAssoc = ownerAssoc,
+            eventKind = "timer",
+            eventToken = deskClockEventToken(sbn.key),
+            timebaseAnchor = tb,
+        )
+        val effect =
+            deskClockOwnerGapRetention.applyRemovalDecision(
+                key = sbn.key,
+                decision = decision,
+                ownerInForeground = ownerAssoc,
+            )
+        when (decision) {
+            DeskClockNotifRemovalDecision.KEEP_OWNER_GAP -> {
+                timerOwnerGapKeys.add(sbn.key)
+                applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.TIMER)
+            }
+            DeskClockNotifRemovalDecision.DROP_ENDED -> {
+                clearTimerOwnerGap(sbn.key)
+                removeTimersForNotificationKey(sbn.key)
+            }
+        }
+    }
+
+    private enum class DeskClockGapKind {
+        STOPWATCH,
+        TIMER,
+    }
+
+    private fun applyDeskClockOwnerGapEffect(
+        effect: DeskClockOwnerGapEffect,
+        kind: DeskClockGapKind,
+    ) {
+        when (effect) {
+            is DeskClockOwnerGapEffect.None -> Unit
+            is DeskClockOwnerGapEffect.Drop -> {
+                when (kind) {
+                    DeskClockGapKind.STOPWATCH -> dropStopwatchEvent(cause = effect.cause)
+                    DeskClockGapKind.TIMER -> {
+                        clearTimerOwnerGap(effect.key)
+                        removeTimersForNotificationKey(effect.key)
+                        statusBarAppPillLogClockNotif(
+                            cause = "drop:${effect.cause}",
+                            reason = DESK_CLOCK_REASON_UNKNOWN,
+                            decision = "drop",
+                            ownerAssoc = false,
+                            eventKind = "timer",
+                            eventToken = deskClockEventToken(effect.key),
+                            timebaseAnchor = 0L,
+                        )
+                    }
+                }
+            }
+            is DeskClockOwnerGapEffect.ArmTimer -> armDeskClockOwnerGapJob(effect, kind)
+        }
+    }
+
+    private fun armDeskClockOwnerGapJob(
+        arm: DeskClockOwnerGapEffect.ArmTimer,
+        kind: DeskClockGapKind,
+    ) {
+        when (kind) {
+            DeskClockGapKind.STOPWATCH -> {
+                cancelStopwatchGapJobs()
+                stopwatchOwnerGapKey = arm.key
+                stopwatchGapJob =
+                    applicationScope.launch {
+                        delay(arm.delayMs)
+                        val drop =
+                            deskClockOwnerGapRetention.onArmedTimeout(
+                                key = arm.key,
+                                generation = arm.generation,
+                                armSequence = arm.armSequence,
+                                dueDeadlineElapsedMs = arm.dueDeadlineElapsedMs,
+                            )
+                        if (drop is DeskClockOwnerGapEffect.Drop) {
+                            dropStopwatchEvent(cause = arm.cause)
+                        }
+                    }
+            }
+            DeskClockGapKind.TIMER -> {
+                timerGapJobs.remove(arm.key)?.cancel()
+                timerOwnerGapKeys.add(arm.key)
+                timerGapJobs[arm.key] =
+                    applicationScope.launch {
+                        delay(arm.delayMs)
+                        val drop =
+                            deskClockOwnerGapRetention.onArmedTimeout(
+                                key = arm.key,
+                                generation = arm.generation,
+                                armSequence = arm.armSequence,
+                                dueDeadlineElapsedMs = arm.dueDeadlineElapsedMs,
+                            )
+                        if (drop is DeskClockOwnerGapEffect.Drop) {
+                            clearTimerOwnerGap(arm.key)
+                            removeTimersForNotificationKey(arm.key)
+                            statusBarAppPillLogClockNotif(
+                                cause = "drop:${arm.cause}",
+                                reason = DESK_CLOCK_REASON_UNKNOWN,
+                                decision = "drop",
+                                ownerAssoc = false,
+                                eventKind = "timer",
+                                eventToken = deskClockEventToken(arm.key),
+                                timebaseAnchor = 0L,
+                            )
+                        }
+                    }
+            }
+        }
+    }
+
+    /** Co retention/event dang track cung notification key. */
+    private fun hasTrackedDeskClockSameKeyGap(sbnKey: String): Boolean {
+        if (deskClockOwnerGapRetention.hasGap(sbnKey)) return true
+        if (stopwatchOwnerGapKey == sbnKey) return true
+        if (_stopwatchEvent.value?.notificationKey == sbnKey) return true
+        if (sbnKey in timerOwnerGapKeys) return true
+        return _timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+    }
+
+    /** Kind dang retained cho key — STOPWATCH/TIMER/NONE. */
+    private fun trackedDeskClockKindForKey(sbnKey: String): DeskClockNotifKind {
+        val sw =
+            stopwatchOwnerGapKey == sbnKey ||
+                _stopwatchEvent.value?.notificationKey == sbnKey
+        val tm =
+            sbnKey in timerOwnerGapKeys ||
+                _timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+        return when {
+            sw && !tm -> DeskClockNotifKind.STOPWATCH
+            tm && !sw -> DeskClockNotifKind.TIMER
+            sw && tm -> DeskClockNotifKind.STOPWATCH // hiem — uu tien SW roi cross-type drop
+            else -> DeskClockNotifKind.NONE
+        }
+    }
+
+    /** Cross-type: drop kind cu + clear retention truoc handle kind moi. */
+    private fun dropTrackedDeskClockKindBeforeCrossType(
+        sbnKey: String,
+        prevKind: DeskClockNotifKind,
+    ) {
+        deskClockOwnerGapRetention.reconcileNonMatchingSameKeyPost(sbnKey)
+        when (prevKind) {
+            DeskClockNotifKind.STOPWATCH -> dropStopwatchEvent(cause = "cross_type_switch")
+            DeskClockNotifKind.TIMER -> {
+                clearTimerOwnerGap(sbnKey)
+                removeTimersForNotificationKey(sbnKey)
+                statusBarAppPillLogClockNotif(
+                    cause = "drop:cross_type_switch",
+                    reason = DESK_CLOCK_REASON_UNKNOWN,
+                    decision = "drop",
+                    ownerAssoc = false,
+                    eventKind = "timer",
+                    eventToken = deskClockEventToken(sbnKey),
+                    timebaseAnchor = 0L,
+                )
+            }
+            DeskClockNotifKind.NONE -> {
+                // Gap record khong gan kind — chi clear retention.
+                deskClockOwnerGapRetention.clearKey(sbnKey)
+            }
+        }
+    }
+
+    private fun reconcileDeskClockNonMatchingPost(sbnKey: String) {
+        val wasStopwatchGap =
+            stopwatchOwnerGapKey == sbnKey ||
+                _stopwatchEvent.value?.notificationKey == sbnKey
+        val wasTimerGap =
+            sbnKey in timerOwnerGapKeys ||
+                _timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+        if (!wasStopwatchGap &&
+            !wasTimerGap &&
+            !deskClockOwnerGapRetention.hasGap(sbnKey)
+        ) {
+            return
+        }
+        val effect = deskClockOwnerGapRetention.reconcileNonMatchingSameKeyPost(sbnKey)
+        if (effect !is DeskClockOwnerGapEffect.Drop) {
+            // Van can drop UI neu chi co event ma retention da mat.
+            if (wasStopwatchGap) dropStopwatchEvent(cause = "nonmatching_replace")
+            if (wasTimerGap) {
+                clearTimerOwnerGap(sbnKey)
+                removeTimersForNotificationKey(sbnKey)
+            }
+            return
+        }
+        if (wasStopwatchGap) {
+            applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.STOPWATCH)
+        }
+        if (wasTimerGap) {
+            applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.TIMER)
+        }
+        // Retention gap ma chua gan SW/TM flag — effect Drop da xoa record.
+    }
+
+    private fun dropStopwatchEvent(cause: String) {
+        cancelStopwatchGapJobs()
+        val gapKey = stopwatchOwnerGapKey
+        if (gapKey != null) deskClockOwnerGapRetention.clearKey(gapKey)
+        stopwatchOwnerGapKey = null
+        stopwatchNotificationKey = null
+        clearStopwatchVisualDismissGate()
+        if (_stopwatchEvent.value != null) {
+            statusBarAppPillLogClockNotif(
+                cause = "drop:$cause",
+                reason = DESK_CLOCK_REASON_UNKNOWN,
+                decision = "drop",
+                ownerAssoc = false,
+                eventKind = "stopwatch",
+                eventToken = deskClockEventToken(_stopwatchEvent.value?.notificationKey),
+                timebaseAnchor = _stopwatchEvent.value?.startElapsedRealtimeMs ?: 0L,
+            )
+        }
+        _stopwatchEvent.value = null
+    }
+
+    private fun dropAllDeskClockOwnerGaps(cause: String) {
+        deskClockOwnerGapRetention.clearAll()
+        if (stopwatchOwnerGapKey != null || _stopwatchEvent.value != null) {
+            dropStopwatchEvent(cause = cause)
+        }
+        for (key in timerOwnerGapKeys.toList()) {
+            clearTimerOwnerGap(key)
+            removeTimersForNotificationKey(key)
+        }
+        timerOwnerGapKeys.clear()
+    }
+
+    private fun cancelStopwatchGapJobs() {
+        stopwatchGapJob?.cancel()
+        stopwatchGapJob = null
+    }
+
+    private fun clearTimerOwnerGap(notificationKey: String) {
+        timerOwnerGapKeys.remove(notificationKey)
+        timerGapJobs.remove(notificationKey)?.cancel()
+        deskClockOwnerGapRetention.clearKey(notificationKey)
+    }
+
+    private fun markStopwatchGapClearedOnPost(sbnKey: String, timebaseAnchor: Long) {
+        val oldGap = stopwatchOwnerGapKey
+        if (oldGap != null || deskClockOwnerGapRetention.hasGap(sbnKey)) {
+            statusBarAppPillLogClockNotif(
+                cause = "post",
+                reason = DESK_CLOCK_REASON_UNKNOWN,
+                decision = "rebind",
+                ownerAssoc =
+                    currentForegroundPackage()?.let { fg ->
+                        _stopwatchEvent.value?.let { fg in islandEventOwnerPackages(it) }
+                    } == true,
+                eventKind = "stopwatch",
+                eventToken = deskClockEventToken(sbnKey),
+                timebaseAnchor = timebaseAnchor,
+            )
+        }
+        // Valid matching rebind: clear old + new key; stale timer gen cu khong drop.
+        if (oldGap != null) deskClockOwnerGapRetention.clearOnValidatedMatchingPost(oldGap)
+        if (oldGap != sbnKey) deskClockOwnerGapRetention.clearOnValidatedMatchingPost(sbnKey)
+        cancelStopwatchGapJobs()
+        stopwatchOwnerGapKey = null
+    }
+
+    private fun markTimerGapClearedOnPost(sbnKey: String, timebaseAnchor: Long) {
+        if (sbnKey in timerOwnerGapKeys || deskClockOwnerGapRetention.hasGap(sbnKey)) {
+            statusBarAppPillLogClockNotif(
+                cause = "post",
+                reason = DESK_CLOCK_REASON_UNKNOWN,
+                decision = "rebind",
+                ownerAssoc =
+                    currentForegroundPackage()?.let { fg ->
+                        _timerEvents.value
+                            .firstOrNull { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+                            ?.let { fg in islandEventOwnerPackages(it) }
+                    } == true,
+                eventKind = "timer",
+                eventToken = deskClockEventToken(sbnKey),
+                timebaseAnchor = timebaseAnchor,
+            )
+        }
+        deskClockOwnerGapRetention.clearOnValidatedMatchingPost(sbnKey)
+        clearTimerOwnerGap(sbnKey)
+    }
 
     fun startListening() {
         if (listening) return
@@ -729,9 +1323,15 @@ constructor(
         timerJobs.values.forEach { it.cancel() }
         timerJobs.clear()
         timerOriginalDurations.clear()
+        timerGapJobs.values.forEach { it.cancel() }
+        timerGapJobs.clear()
+        timerOwnerGapKeys.clear()
+        deskClockOwnerGapRetention.clearAll()
         _timerEvents.value = emptyList()
+        cancelStopwatchGapJobs()
+        stopwatchOwnerGapKey = null
         stopwatchNotificationKey = null
-        stopwatchDismissedKey = null
+        clearStopwatchVisualDismissGate()
         _stopwatchEvent.value = null
         dismissedPromotedKeys.clear()
         dismissedSportsKeys.clear()
@@ -784,9 +1384,15 @@ constructor(
             timerJobs.values.forEach { it.cancel() }
             timerJobs.clear()
             timerOriginalDurations.clear()
+            timerGapJobs.values.forEach { it.cancel() }
+            timerGapJobs.clear()
+            val gapKeys = timerOwnerGapKeys.toList()
+            timerOwnerGapKeys.clear()
+            gapKeys.forEach { deskClockOwnerGapRetention.clearKey(it) }
             _timerEvents.value = emptyList()
         } else {
-            removeTimer(notificationKey)
+            clearTimerOwnerGap(notificationKey)
+            removeTimersForNotificationKey(notificationKey)
         }
     }
 
@@ -821,7 +1427,45 @@ constructor(
     }
 
     fun clearStopwatch() {
-        stopwatchDismissedKey = stopwatchNotificationKey
+        // Visual swipe-hide pill — KHONG stop stopwatch that / KHONG owner-gap.
+        // Stateful gate: rejected posts cap nhat latest (pause/resume).
+        val existing = _stopwatchEvent.value
+        val key =
+            existing?.notificationKey?.takeIf { it.isNotEmpty() }
+                ?: stopwatchNotificationKey
+                ?: stopwatchOwnerGapKey
+        stopwatchVisualDismissGate =
+            if (key != null && existing != null) {
+                deskClockStopwatchVisualDismissGateOf(
+                    deskClockStopwatchRunIdentity(
+                        notificationKey = key,
+                        isRunning = existing.isRunning,
+                        startElapsedRealtimeMs = existing.startElapsedRealtimeMs,
+                        pausedElapsedMs = existing.pausedElapsedMs,
+                        displayedElapsedMs = existing.displayedElapsedMs(),
+                    ),
+                )
+            } else if (key != null) {
+                deskClockStopwatchVisualDismissGateOf(
+                    deskClockStopwatchRunIdentity(
+                        notificationKey = key,
+                        isRunning = false,
+                        startElapsedRealtimeMs = 0L,
+                        pausedElapsedMs = 0L,
+                        displayedElapsedMs = 0L,
+                    ),
+                )
+            } else {
+                null
+            }
+        stopwatchDismissedPackage =
+            existing?.packageName?.takeIf { it.isNotEmpty() }
+        cancelStopwatchGapJobs()
+        stopwatchOwnerGapKey?.let { deskClockOwnerGapRetention.clearKey(it) }
+        stopwatchOwnerGapKey = null
+        if (key != null) {
+            stopwatchNotificationKey = key
+        }
         _stopwatchEvent.value = null
     }
 
@@ -968,6 +1612,10 @@ constructor(
                 }
             val insertAt = if (firstIdx >= 0) firstIdx.coerceAtMost(remaining.size) else 0
             _timerEvents.value = remaining.take(insertAt) + newEvents + remaining.drop(insertAt)
+            markTimerGapClearedOnPost(
+                sbnKey = key,
+                timebaseAnchor = newEvents.firstOrNull()?.endElapsedRealtimeMs ?: 0L,
+            )
             newEvents.forEach {
                 Log.i(
                     TAG,
@@ -1006,6 +1654,10 @@ constructor(
             )
         val insertAt = if (firstIdx >= 0) firstIdx.coerceAtMost(remaining.size) else 0
         _timerEvents.value = remaining.take(insertAt) + listOf(event) + remaining.drop(insertAt)
+        markTimerGapClearedOnPost(
+            sbnKey = key,
+            timebaseAnchor = event.endElapsedRealtimeMs,
+        )
         Log.i(
             TAG,
             "handleTimer fallback label=${event.label} endTimeMs=${event.endTimeMs} paused=${event.isPaused}",
@@ -1850,10 +2502,37 @@ constructor(
                 packageName = sbn.packageName.orEmpty(),
                 notificationKey = sbn.key,
                 sbn = sbn,
+                awaitingOwnerRepost = false,
             )
         stopwatchNotificationKey = sbn.key
-        if (sbn.key != stopwatchDismissedKey) {
+        val postIdentity =
+            deskClockStopwatchRunIdentity(
+                notificationKey = sbn.key,
+                isRunning = event.isRunning,
+                startElapsedRealtimeMs = event.startElapsedRealtimeMs,
+                pausedElapsedMs = event.pausedElapsedMs,
+                displayedElapsedMs = event.displayedElapsedMs(),
+            )
+        val apply =
+            deskClockStopwatchApplyPostToVisualDismissGate(
+                gate = stopwatchVisualDismissGate,
+                post = postIdentity,
+            )
+        stopwatchVisualDismissGate = apply.nextGate
+        if (apply.allowEvent &&
+            (apply.relation == DeskClockStopwatchRunRelation.ALLOW_NEW_RUN ||
+                apply.relation == DeskClockStopwatchRunRelation.ALLOW_DIFFERENT_KEY)
+        ) {
+            stopwatchDismissedPackage = null
+        }
+        if (apply.allowEvent) {
             _stopwatchEvent.value = event
+            // Cung key/replacement sau owner-gap: rebind, khong restart timebase (existing).
+            markStopwatchGapClearedOnPost(
+                sbnKey = sbn.key,
+                timebaseAnchor =
+                    if (event.isRunning) event.startElapsedRealtimeMs else event.pausedElapsedMs,
+            )
             Log.i(
                 TAG,
                 "handleStopwatch label=${event.label} isRunning=${event.isRunning} " +

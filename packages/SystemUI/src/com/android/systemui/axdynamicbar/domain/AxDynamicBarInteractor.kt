@@ -15,7 +15,12 @@ import com.android.systemui.axdynamicbar.model.IslandState
 import com.android.systemui.axdynamicbar.model.IslandUiState
 import com.android.systemui.axdynamicbar.model.RecordingState
 import com.android.systemui.axdynamicbar.shared.IslandActions
+import com.android.systemui.axdynamicbar.shared.islandEventShouldHideForForeground
+import com.android.systemui.axdynamicbar.shared.islandEventSupportsForegroundHide
 import com.android.systemui.axdynamicbar.shared.sendWithBal
+import com.android.systemui.axdynamicbar.shared.statusBarAppPillEventKindOf
+import com.android.systemui.axdynamicbar.shared.statusBarAppPillFgPkgToken
+import com.android.systemui.axdynamicbar.shared.statusBarAppPillLogUiOwner
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.haptics.slider.compose.ui.SliderHapticsViewModel
@@ -84,7 +89,6 @@ constructor(
 
     private var isInitialized = false
 
-    @Volatile private var panelBlocking = false
     private val _isPanelExpanded = MutableStateFlow(false)
     
     val isPanelExpanded: StateFlow<Boolean> = _isPanelExpanded.asStateFlow()
@@ -134,6 +138,10 @@ constructor(
         repository.system.onClipboardCopied = { scheduleAutoDismiss(it) }
 
         repository.notification.activeMediaPackageProvider = { repository.media.activeMediaPackages }
+        // Clock owner-gap: so FG de KEEP/DROP + leave-grace.
+        repository.notification.foregroundPackageProvider = {
+            repository.appTracking.foregroundPackage.value
+        }
         repository.notification.onAlarmEvent = {
             scheduleAutoDismiss(it, if (it.isRinging) 30_000L else 5_000L)
         }
@@ -268,20 +276,45 @@ constructor(
                 Triple(raw.filter { settings.isEventEnabled(it) }, kg, foregroundPkg)
             }.collect { (rawEvents, onKeyguard, foregroundPkg) ->
                 if (!settings.isEnabled.value) return@collect
+                // Cap nhat reconciliation owner-gap Clock truoc khi tinh suppress/UI.
+                repository.notification.onForegroundPackageChanged(foregroundPkg)
                 dismissedEventIds.removeAll { id -> rawEvents.none { it.id == id } }
-                // An media chi khi app so huu dang foreground.
-                // NowPlaying Quick Look khong gan owner thi khong an theo foreground.
-                val hideMediaForApp = !onKeyguard && !foregroundPkg.isNullOrEmpty()
+                // Home may precede the combined event update. Consult both the snapshot
+                // and source, but retain the event so APP_HIDE/SHOW keeps its composition.
+                val pendingConfirmationIds =
+                    rawEvents.filterIsInstance<IslandEvent.Stopwatch>()
+                        .filter {
+                            it.awaitingOwnerRepost ||
+                                repository.notification.stopwatchEvent.value
+                                    ?.awaitingOwnerRepost == true
+                        }
+                        .map { it.id }
+                        .toSet()
+                // Giu day du event (timer/media timebase + pin); FG-hide = suppress id
+                // — khong remove khoi repo / khong coi la dismiss hay owner-end.
                 val events = rawEvents.filter { e ->
                     e.id !in dismissedEventIds &&
+                        // Keyguard has its own presentation; never expose an unconfirmed run.
+                        !(onKeyguard && e.id in pendingConfirmationIds) &&
                         !(onKeyguard && e is IslandEvent.Notification) &&
                         !(onKeyguard && e is IslandEvent.Charging) &&
                         !(onKeyguard && e is IslandEvent.AppSwitch) &&
                         !(onKeyguard && e is IslandEvent.Clipboard) &&
-                        !(!onKeyguard && e is IslandEvent.KeyguardIndication) &&
-                        !(hideMediaForApp && e is IslandEvent.Media &&
-                            e.packageName.isNotEmpty() && e.packageName == foregroundPkg)
+                        !(!onKeyguard && e is IslandEvent.KeyguardIndication)
                 }
+                val fgSuppressedIds =
+                    if (onKeyguard || foregroundPkg.isNullOrEmpty()) {
+                        emptySet()
+                    } else {
+                        events
+                            .asSequence()
+                            .filter {
+                                islandEventSupportsForegroundHide(it) &&
+                                    islandEventShouldHideForForeground(it, foregroundPkg)
+                            }
+                            .map { it.id }
+                            .toSet()
+                    }
 
                 val current = _uiState.value
 
@@ -308,7 +341,7 @@ constructor(
                 val newState =
                     when {
                         events.isEmpty() -> IslandState.HIDDEN
-                        panelBlocking || statusBlocking -> IslandState.HIDDEN
+                        statusBlocking -> IslandState.HIDDEN
                         else -> IslandState.CHIP
                     }
 
@@ -339,9 +372,11 @@ constructor(
                         userInitiatedRefresh -> 0
                         else -> resolveByIdOrFallback(prevPinnedId, events, current)
                     }
+                // P1B: GIU pinnedEventIndex qua FG suppress tam — khong doi pin user.
+                // Visible fallback = IslandUiState.topEvent (loc suppressed); Home van A.
                 val shouldReset = hasNewEvents || userInitiatedRefresh || hasSignificantChange
 
-                _uiState.value =
+                val next =
                     IslandUiState(
                         events = events,
                         islandState = newState,
@@ -350,7 +385,31 @@ constructor(
                         forceVisible = false,
                         notificationAlerts = current.notificationAlerts,
                         pinnedAlertIndex = current.pinnedAlertIndex,
+                        foregroundSuppressedIds = fgSuppressedIds,
+                        pendingConfirmationIds =
+                            pendingConfirmationIds.intersect(events.map { it.id }.toSet()),
+                        foregroundPackage = foregroundPkg,
                     )
+                // Diag delay Home: emit sequence khi FG ownership / suppress doi.
+                if (
+                    current.foregroundPackage != next.foregroundPackage ||
+                        current.foregroundSuppressedIds != next.foregroundSuppressedIds ||
+                        current.pendingConfirmationIds != next.pendingConfirmationIds
+                ) {
+                    val ownerHidden =
+                        next.visuallySuppressedIds.isNotEmpty() &&
+                            next.visibleEvents.isEmpty() &&
+                            next.notificationAlert == null &&
+                            next.events.any { it.id in next.visuallySuppressedIds }
+                    statusBarAppPillLogUiOwner(
+                        cause = "interactor.emit",
+                        ownerHidden = ownerHidden,
+                        suppressedCount = next.visuallySuppressedIds.size,
+                        fgToken = statusBarAppPillFgPkgToken(next.foregroundPackage),
+                        eventKind = statusBarAppPillEventKindOf(next.topEvent),
+                    )
+                }
+                _uiState.value = next
 
             }
         }
@@ -450,6 +509,17 @@ constructor(
             is IslandEvent.KeyguardIndication -> repository.clearIndicationEvent(event.indicationType)
             is IslandEvent.AospChip -> {}
         }
+    }
+
+    override fun dismissEventFromExpandedSwipe(event: IslandEvent) {
+        dismissEvent(event)
+        // Stack mo rong = event khong notif / khong AospChip. Con the trong stack
+        // thi thu overlay. Rong hoac chi Aosp: flow terminal / LaunchedEffect xu ly.
+        val stackRemains =
+            _uiState.value.events.any {
+                it !is IslandEvent.Notification && it !is IslandEvent.AospChip
+            }
+        if (stackRemains) collapseIsland()
     }
 
     fun getTopEvent(): IslandEvent? = _uiState.value.topEvent
@@ -641,7 +711,7 @@ constructor(
     private fun showNotificationAlert(
         notification: IslandEvent.Notification,
     ) {
-        if (panelBlocking || statusBlocking || _isOnKeyguard.value) return
+        if (_isPanelExpanded.value || statusBlocking || _isOnKeyguard.value) return
         if (shouldSuppressForDndOrRinger(notification)) return
         val current = _uiState.value
         val alerts = current.notificationAlerts
@@ -817,15 +887,15 @@ constructor(
     override fun killApp(taskId: Int) = repository.appTracking.killApp(taskId)
 
     fun onPanelExpandedChanged(expanded: Boolean) {
-        panelBlocking = expanded
         _isPanelExpanded.value = expanded
         if (expanded) dismissNotificationAlert()
-        updateChipVisibility()
+        // QS/shade blocks alerts and expanded cards, not the persistent status-bar pill.
+        // Keep its composition and occupied slot across panel open/close.
     }
 
     private fun updateChipVisibility() {
         val current = _uiState.value
-        val shouldHide = panelBlocking || statusBlocking
+        val shouldHide = statusBlocking
         if (shouldHide && current.islandState == IslandState.CHIP) {
             _uiState.value = current.copy(islandState = IslandState.HIDDEN)
         } else if (!shouldHide && current.events.isNotEmpty() && current.islandState == IslandState.HIDDEN && !current.manuallyHidden) {

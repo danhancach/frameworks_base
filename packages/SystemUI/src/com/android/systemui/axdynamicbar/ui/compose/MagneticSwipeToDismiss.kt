@@ -31,6 +31,7 @@ import kotlin.math.abs
 import kotlin.math.sign
 import kotlinx.coroutines.launch
 import com.android.systemui.axdynamicbar.shared.LocalBlurAlpha
+import com.android.systemui.axdynamicbar.shared.stackExpandedContentTranslationYPx
 
 /**
  * A child (e.g. media seekbar) can set this to `true` to prevent
@@ -97,8 +98,8 @@ internal fun MagneticSwipeToDismiss(
     allowDownDrag: Boolean = false,
     gesturesEnabled: Boolean = true,
     /**
-     * Vuot ngang dismiss island. Media = false: de UMO carousel / QS media
-     * nhan swipe doi session (khong nuot AXIS_HORIZONTAL).
+     * Vuot ngang dismiss island. false = khong claim ngang (vd. alert compact).
+     * Media homescreen: true; SeekBar dung LocalDismissSwipeLock khi scrub.
      */
     allowHorizontalDismiss: Boolean = true,
     /** Keo xuong doi panel stack; null = tat (chi dismiss ngang/len). */
@@ -121,9 +122,12 @@ internal fun MagneticSwipeToDismiss(
      * Dich visual noi dung (vd. stack dragY) — CHI tren content ben trong
      * pointerInput. Neu dich ca ancestor chua pointer → feedback toa do local
      * (change.position - down) → rung. Pattern: StackedExpandedPanels
-     * (contentOffsetY, khong boc translationY).
+     * (contentOffsetY, khong boc translationY tren ancestor pointer).
+     *
+     * Lambda doc LIVE trong graphicsLayer (vd. { dragY }) — tranh Float param
+     * tre 1 frame so voi shared glass / state pointer.
      */
-    contentOffsetY: Float = 0f,
+    contentOffsetY: () -> Float = { 0f },
     content: @Composable () -> Unit,
 ) {
     val density = LocalDensity.current
@@ -472,8 +476,12 @@ internal fun MagneticSwipeToDismiss(
                         val absOff = maxOf(abs(vx), abs(vy))
                         val progress = (absOff / (detachPx * 4f)).coerceIn(0f, 1f)
                         translationX = vx
-                        // contentOffsetY: dich hinh, khong dich hit-test / pointer.
-                        translationY = vy + contentOffsetY
+                        // Doc LIVE — cung frame pointer/dragY (khong capture Float stale).
+                        translationY =
+                            stackExpandedContentTranslationYPx(
+                                magneticVyPx = vy,
+                                contentOffsetYPx = contentOffsetY(),
+                            )
                         alpha = 1f - progress * 0.5f
                         scaleX = 1f - progress * 0.04f
                         scaleY = 1f - progress * 0.04f

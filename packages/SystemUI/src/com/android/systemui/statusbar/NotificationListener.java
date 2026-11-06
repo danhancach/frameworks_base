@@ -181,7 +181,8 @@ public class NotificationListener extends NotificationListenerWithPlugins implem
                 for (NotificationHandler handler : mNotificationHandlers) {
                     handler.onNotificationRemoved(sbn, rankingMap, reason);
                 }
-                ScrimUtils.get().onNotificationRemoved(sbn);
+                // Truyen reason — AxDynamicBar Clock lifecycle (owner-gap vs end).
+                ScrimUtils.get().onNotificationRemoved(sbn, reason);
             });
         } else if (!isKeyInRankingMap(key, rankingMap)) {
             Log.wtf(TAG, "Plugin prevented removal but removed ranking " + key

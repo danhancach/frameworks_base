@@ -33,9 +33,25 @@ import kotlinx.coroutines.launch
 data class AxDynamicBarChipState(
     val event: IslandEvent,
     val eventCount: Int,
+    /** Persistent user pin — khong doi khi FG suppress tam. */
     val pinnedIndex: Int,
+    /**
+     * Index UI visible (topEvent) — co the khac [pinnedIndex] khi pin dang suppress.
+     */
+    val visibleSelectedIndex: Int = pinnedIndex,
     val allEvents: List<IslandEvent>,
     val notificationAlert: IslandEvent.Notification? = null,
+    /**
+     * Hidden for owner foreground or pending run confirmation; composition survives.
+     * Khac event remove / dummy↔real handoff.
+     */
+    val ownerAppVisualHidden: Boolean = false,
+    /** Number of IDs suppressed by actual foreground ownership. */
+    val foregroundSuppressedCount: Int = 0,
+    /** Package FG that (raw) — Chip tokenize khi log AxDbAppPill. */
+    val foregroundPackage: String? = null,
+    /** Total visually suppressed IDs; owner and pending sets can overlap. */
+    val visuallySuppressedCount: Int = foregroundSuppressedCount,
 )
 
 data class KeyguardBatteryInfo(
@@ -82,15 +98,31 @@ constructor(
     val chipState: StateFlow<AxDynamicBarChipState?> =
         interactor.uiState
             .map { uiState ->
-                if (!uiState.shouldShow) return@map null
                 val alert = uiState.notificationAlert
-                val topEvent = uiState.topEvent ?: alert ?: return@map null
+                val ownerAppHidden =
+                    uiState.visuallySuppressedIds.isNotEmpty() &&
+                        uiState.visibleEvents.isEmpty() &&
+                        alert == null &&
+                        uiState.events.any { it.id in uiState.visuallySuppressedIds }
+                // Keep the same composition while hidden or awaiting Clock confirmation.
+                if (!uiState.shouldShow && !ownerAppHidden) return@map null
+                if (!uiState.hasUnderlyingChipEvents && alert == null) return@map null
+                val topEvent =
+                    uiState.topEvent
+                        ?: alert
+                        ?: uiState.events.firstOrNull { it.id in uiState.visuallySuppressedIds }
+                        ?: return@map null
                 AxDynamicBarChipState(
                     event = topEvent,
                     eventCount = uiState.activeEvents.size,
                     pinnedIndex = uiState.pinnedEventIndex,
+                    visibleSelectedIndex = uiState.visibleSelectedIndex,
                     allEvents = uiState.events,
                     notificationAlert = alert,
+                    ownerAppVisualHidden = ownerAppHidden,
+                    foregroundSuppressedCount = uiState.foregroundSuppressedIds.size,
+                    foregroundPackage = uiState.foregroundPackage,
+                    visuallySuppressedCount = uiState.visuallySuppressedIds.size,
                 )
             }
             .distinctUntilChanged()

@@ -31,4 +31,6 @@ internal fun Modifier.underPeekClip(peekPx: () -> Float): Modifier = drawWithCon
     if (height > 0f) {
         clipRect(bottom = height) { this@drawWithContent.drawContent() }
     }
+    // peek=0: KHONG drawContent — AxBlurSurface SideEffect phai setAlpha(0) rieng
+    // (BlurEngine native), khong doi pass ve con.
 }

@@ -80,7 +80,8 @@ object NotificationIconContainerViewBinder {
                 StatusBarIconViewBinder.bindIconColors(sbiv, iconColors, contrastColorUtil)
             }
         }
-        launch { viewModel.animationsEnabled.bindAnimationsEnabled(view) }
+        // Status-bar: AND Ax slot-reflow suspend voi desired AOSP (khong hardcode true).
+        launch { viewModel.animationsEnabled.bindStatusBarAnimationsEnabled(view) }
     }
 
     @JvmStatic
@@ -137,9 +138,21 @@ object NotificationIconContainerViewBinder {
         launch { viewModel.areContainerChangesAnimated.bindAnimationsEnabled(view) }
     }
 
-    /** Binds to [NotificationIconContainer.setAnimationsEnabled] */
+    /** Binds to [NotificationIconContainer.setAnimationsEnabled] (AOD / non-status-bar). */
     private suspend fun Flow<Boolean>.bindAnimationsEnabled(view: NotificationIconContainer) {
         collectTracingEach("NIC#bindAnimationsEnabled", view::setAnimationsEnabled)
+    }
+
+    /**
+     * Status-bar only: desired Flow AND [StatusBarNicSlotReflowSuspend].
+     * Mid-flight desired=true khong pha gate; restore dung lastDesired.
+     */
+    private suspend fun Flow<Boolean>.bindStatusBarAnimationsEnabled(
+        view: NotificationIconContainer,
+    ) {
+        collectTracingEach("NIC#bindStatusBarAnimationsEnabled") { desired ->
+            StatusBarNicSlotReflowSuspend.applyDesired(view, desired)
+        }
     }
 
     /**

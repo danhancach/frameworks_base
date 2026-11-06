@@ -16,9 +16,26 @@
 
 package com.android.systemui.axdynamicbar.ui
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import com.android.systemui.axdynamicbar.domain.AxDynamicBarInteractor
 import com.android.systemui.axdynamicbar.model.IslandEvent
+import com.android.systemui.axdynamicbar.shared.StatusBarCollapseHandoffController
+import com.android.systemui.axdynamicbar.shared.StatusBarCollapseHandoffMeasuredLayout
+import com.android.systemui.axdynamicbar.shared.StatusBarCollapseHandoffPhase
+import com.android.systemui.axdynamicbar.shared.StatusBarCollapseHandoffSnapshot
+import com.android.systemui.axdynamicbar.shared.StatusBarCollapseProbeController
+import com.android.systemui.axdynamicbar.shared.StatusBarCollapseProbePhase
+import com.android.systemui.axdynamicbar.shared.StatusBarPillFrame
+import com.android.systemui.axdynamicbar.shared.StatusBarNeighborMotionEmitter
+import com.android.systemui.axdynamicbar.shared.StatusBarNeighborMotionRequest
+import com.android.systemui.axdynamicbar.shared.StatusBarNeighborTrigger
 import com.android.systemui.axdynamicbar.shared.StatusBarPillFrameTracker
+import com.android.systemui.axdynamicbar.shared.statusBarCollapseHandoffTryCompleteCleanup
+import com.android.systemui.axdynamicbar.shared.statusBarNeighborTriggerForCardSlot
+import com.android.systemui.axdynamicbar.shared.statusBarNeighborTriggerOf
 import com.android.systemui.axdynamicbar.shared.expandOnlyEventIdFor
 import com.android.systemui.axdynamicbar.ui.compose.StatusBarPillPresentation
 import com.android.systemui.axdynamicbar.ui.compose.collapseChronometerTickDelayMs
@@ -32,9 +49,11 @@ import com.android.systemui.axdynamicbar.ui.compose.statusBarPillPresentationOf
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,6 +81,8 @@ constructor(
     private val _intent = MutableStateFlow(false)
     // Chronometer: chi mo dung 1 event.id (multi-timer tach chip). null = stack nhu cu.
     private val _expandOnlyEventId = MutableStateFlow<String?>(null)
+    // Confirmed card ID bridges the asynchronous pinned-top flow (including media -> media).
+    private var confirmedExpandedOwnerId: String? = null
 
     val isExpanded: StateFlow<Boolean> =
         combine(_intent, interactor.isOnKeyguard) { intent, onKg -> intent && !onKg }
@@ -79,33 +100,393 @@ constructor(
     val pillSuppressed: StateFlow<Boolean> = _pillSuppressed.asStateFlow()
 
     /**
-     * Reclaim width slot Ax chip (khong GONE ComposeView clock/date) sau overlay
-     * handoff — notif icons fill cho trong. Collapse: false TRUOC morph ve dest.
+     * Reclaim width slot Ax chip (khong GONE ComposeView clock/date) khi pill
+     * suppress (morph handoff) — notif icons fill cho trong. Collapse: false
+     * TRUOC morph ve dest.
      */
     private val _chipSlotReclaimed = MutableStateFlow(false)
     val chipSlotReclaimed: StateFlow<Boolean> = _chipSlotReclaimed.asStateFlow()
+
+    /**
+     * SSOT linear t∈[0,1] SLOT only (Snapshot — KHONG StateFlow/frame spam).
+     * Clock nudge DOC LAP (spring 2 pha) — khong sample chung t.
+     */
+    var slotMotionLinearT by mutableFloatStateOf(1f)
+        private set
+
+    /** Huong run dang publish (true=EXPAND reclaim). */
+    var slotMotionReclaiming by mutableStateOf(false)
+        private set
+
+    /** true khi dang tween slot. */
+    var slotMotionRunning by mutableStateOf(false)
+        private set
+
+    /**
+     * Outer pill occupied slot width (px) — telemetry slot natural; KHONG = host width.
+     * NIC reflow thuc te: Chip layout modifier width + localView.requestLayout (khong doc Int nay).
+     */
+    var slotMotionSlotWidthPx by mutableFloatStateOf(0f)
+        private set
+
+    /** DensityDpi luc publish. */
+    var slotMotionDensityDpi by mutableFloatStateOf(450f)
+        private set
+
+    /**
+     * Neighbor trigger dang chay — CARD vs APP interpolator / nudge eligibility.
+     */
+    var slotNeighborTrigger by mutableStateOf(StatusBarNeighborTrigger.CARD_CLOSE)
+        private set
+
+    /**
+     * Compose modern clock translationX — writer duy nhat tu chip nudge springs.
+     * Classic View clock dung StatusBarClockNudgeController (khong dual-write).
+     */
+    var clockNudgeTranslationX by mutableFloatStateOf(0f)
+        private set
+
+    /** true khi spring nudge dang chay (Compose clock). */
+    var clockNudgeRunning by mutableStateOf(false)
+        private set
+
+    /** Owner-app FG dang an pill — slot APP_HIDE/SHOW (khac morph CARD). */
+    private val _ownerAppFgHidden = MutableStateFlow(false)
+    val ownerAppFgHidden: StateFlow<Boolean> = _ownerAppFgHidden.asStateFlow()
+
+    /**
+     * Explicit neighbor motion request (monotonic seq + previous state).
+     * Chip collect — KHONG infer APP_SHOW tu destination boolean sau khi FG cleared.
+     * SSOT decision: [neighborMotionEmitter] (testable production path).
+     */
+    private val neighborMotionEmitter = StatusBarNeighborMotionEmitter()
+    private val _neighborMotionRequest =
+        MutableStateFlow<StatusBarNeighborMotionRequest?>(null)
+    val neighborMotionRequest: StateFlow<StatusBarNeighborMotionRequest?> =
+        _neighborMotionRequest.asStateFlow()
+
+    /** Goi moi frame tu AxDynamicBarChip slot driver (telemetry T/trigger — khong publish host width). */
+    fun publishSlotMotion(
+        linearT: Float,
+        reclaiming: Boolean,
+        slotWidthPx: Float = slotMotionSlotWidthPx,
+        densityDpi: Float = slotMotionDensityDpi,
+        trigger: StatusBarNeighborTrigger =
+            _neighborMotionRequest.value?.trigger
+                ?: statusBarNeighborTriggerOf(
+                    reclaiming,
+                    appForeground = _ownerAppFgHidden.value && !_pillSuppressed.value,
+                ),
+    ) {
+        slotMotionLinearT = linearT.coerceIn(0f, 1f)
+        slotMotionReclaiming = reclaiming
+        slotNeighborTrigger = trigger
+        if (slotWidthPx > 0f && slotWidthPx.isFinite()) {
+            slotMotionSlotWidthPx = slotWidthPx
+        }
+        if (densityDpi > 0f && densityDpi.isFinite()) {
+            slotMotionDensityDpi = densityDpi
+        }
+        slotMotionRunning = true
+    }
+
+    /** Ket thuc / snap idle — t=1. */
+    fun settleSlotMotion(reclaimed: Boolean) {
+        slotMotionLinearT = 1f
+        slotMotionReclaiming = reclaimed
+        slotMotionRunning = false
+    }
+
+    fun publishClockNudgeTranslationX(tx: Float) {
+        clockNudgeTranslationX = tx
+        clockNudgeRunning = true
+    }
+
+    fun settleClockNudge() {
+        clockNudgeTranslationX = 0f
+        clockNudgeRunning = false
+    }
+
+    /** Dong bo StateFlow slot/FG tu emitter sau moi decision. */
+    private fun publishEmitterState(req: StatusBarNeighborMotionRequest?) {
+        _ownerAppFgHidden.value = neighborMotionEmitter.ownerAppFgHidden
+        _chipSlotReclaimed.value = neighborMotionEmitter.chipSlotReclaimed
+        if (req != null) {
+            _neighborMotionRequest.value = req
+        }
+    }
+
+    /**
+     * Ap slot reclaim + emit request tai ownership decision (mot writer / emitter).
+     */
+    private fun applyChipSlotReclaimed(
+        reclaiming: Boolean,
+        trigger: StatusBarNeighborTrigger,
+        previousOwnerAppFgHidden: Boolean = neighborMotionEmitter.ownerAppFgHidden,
+        previousPillSuppressed: Boolean = neighborMotionEmitter.pillSuppressed,
+    ): StatusBarNeighborMotionRequest? {
+        neighborMotionEmitter.setPillSuppressed(_pillSuppressed.value)
+        val req =
+            neighborMotionEmitter.applyChipSlotReclaimed(
+                reclaiming = reclaiming,
+                trigger = trigger,
+                previousOwnerAppFgHidden = previousOwnerAppFgHidden,
+                previousPillSuppressed = previousPillSuppressed,
+            )
+        publishEmitterState(req)
+        return req
+    }
+
+    /**
+     * Dong bo reclaim KHONG emit request — expand seed / collapse settled
+     * (motion da emit o collapse start).
+     */
+    private fun syncChipSlotReclaimed(reclaiming: Boolean) {
+        neighborMotionEmitter.setPillSuppressed(_pillSuppressed.value)
+        neighborMotionEmitter.syncChipSlotReclaimed(reclaiming)
+        _chipSlotReclaimed.value = neighborMotionEmitter.chipSlotReclaimed
+        _ownerAppFgHidden.value = neighborMotionEmitter.ownerAppFgHidden
+    }
+
+    /**
+     * Dong bo FG owner hide → slot reclaim APP (khong doi morph pillSuppressed).
+     * Emit APP_SHOW/HIDE theo huong doi — KHONG infer sau khi flag destination da clear.
+     * Khi morph dang suppress: morph ownership slot; FG flag van set.
+     *
+     * @return request APP_* neu emit (test production path); null neu no-op / morph owns.
+     */
+    fun setOwnerAppFgHidden(hidden: Boolean): StatusBarNeighborMotionRequest? {
+        neighborMotionEmitter.setPillSuppressed(_pillSuppressed.value)
+        val req = neighborMotionEmitter.setOwnerAppFgHidden(hidden)
+        // Luon sync FG flag (ke ca khi morph owns slot — emit null).
+        _ownerAppFgHidden.value = neighborMotionEmitter.ownerAppFgHidden
+        if (req != null) {
+            _chipSlotReclaimed.value = neighborMotionEmitter.chipSlotReclaimed
+            _neighborMotionRequest.value = req
+        } else if (!_pillSuppressed.value) {
+            // no-op duplicate: van sync reclaim tu emitter
+            _chipSlotReclaimed.value = neighborMotionEmitter.chipSlotReclaimed
+        }
+        return req
+    }
 
     private val _collapseSettled = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val collapseSettled: SharedFlow<Unit> = _collapseSettled.asSharedFlow()
 
     /**
-     * Chip StatusBar bao live pill da ve sau unsuppress (task-043/044 handback).
-     * StateFlow giu latest — Panel doc som (truoc collect) khong mat early ack (FAIL#2).
-     * Stale gen/owner reject o [CollapseHandbackHoldController.acknowledgeLiveDrawn].
+     * Lifecycle collapse handoff (chat-1103212515 task-001).
+     * Mot controller authoritative — Chip/Panel doc [collapseHandoffSnapshot].
+     * Legacy drawn/progress/forceReveal giu stub bridge (khong staged ramp).
      */
+    private val collapseHandoffCtrl = StatusBarCollapseHandoffController()
+    internal val collapseProbeCtrl = StatusBarCollapseProbeController()
+    private val _collapseHandoffSnapshot =
+        MutableStateFlow(StatusBarCollapseHandoffSnapshot())
+    val collapseHandoffSnapshot: StateFlow<StatusBarCollapseHandoffSnapshot> =
+        _collapseHandoffSnapshot.asStateFlow()
+
+    private fun publishHandoffSnapshot() {
+        _collapseHandoffSnapshot.value = collapseHandoffCtrl.snapshot
+    }
+
+    /**
+     * Collapse START — bat Prepare/Collapse session (morph con chay).
+     * Cung layoutGen → no-op exactly-once; settle sau chi mark Ready (khong reset).
+     */
+    fun beginCollapseHandoffSession(layoutGeneration: Int, expectedOwnerId: String?): Int {
+        val started = collapseHandoffCtrl.beginPrepare(layoutGeneration, expectedOwnerId)
+        if (started) {
+            collapseHandoffCtrl.enterCollapse(collapseHandoffCtrl.sessionGeneration)
+            _collapseHandbackSession.value =
+                CollapseHandbackSession(
+                    holdGeneration = collapseHandoffCtrl.sessionGeneration,
+                    layoutGeneration = layoutGeneration,
+                    expectedOwnerId = expectedOwnerId,
+                )
+        }
+        publishHandoffSnapshot()
+        return collapseHandoffCtrl.sessionGeneration
+    }
+
+    /** Morph @rest — Ready (cung session; dummy van owns den transfer). */
+    fun markCollapseHandoffSettled(sessionGeneration: Int): Boolean {
+        val ok = collapseHandoffCtrl.markCollapseSettled(sessionGeneration)
+        publishHandoffSnapshot()
+        return ok
+    }
+
+    /**
+     * Chip: real attach+layout ready / revoke (khong = SF PRESENT).
+     * prepared=false revoke; null owner + prepared=true reject.
+     * layoutWidth/Height/attached luu readiness record — transfer revalidate.
+     */
+    fun reportCollapseHandoffRealPrepared(
+        sessionGeneration: Int,
+        layoutGeneration: Int,
+        ownerId: String?,
+        prepared: Boolean,
+        layoutWidthPx: Int = -1,
+        layoutHeightPx: Int = -1,
+        attached: Boolean = true,
+    ): Boolean {
+        val ok =
+            collapseHandoffCtrl.reportRealPrepared(
+                sessionGen = sessionGeneration,
+                layoutGen = layoutGeneration,
+                ownerId = ownerId,
+                prepared = prepared,
+                layoutWidthPx = layoutWidthPx,
+                layoutHeightPx = layoutHeightPx,
+                attached = attached,
+            )
+        publishHandoffSnapshot()
+        if (ok && prepared) {
+            _collapseHandbackDrawn.value =
+                CollapseHandbackDrawnSignal(ownerId, layoutGeneration)
+        }
+        return ok
+    }
+
+    /** Current-owner retarget mid-flight — clear prepared, doi report lai. */
+    fun retargetCollapseHandoffOwner(
+        sessionGeneration: Int,
+        ownerId: String?,
+    ): Boolean {
+        val ok = collapseHandoffCtrl.retargetExpectedOwner(sessionGeneration, ownerId)
+        if (ok) {
+            val session = _collapseHandbackSession.value
+            if (session != null && session.holdGeneration == sessionGeneration) {
+                _collapseHandbackSession.value = session.copy(expectedOwnerId = ownerId)
+            }
+            publishHandoffSnapshot()
+        }
+        return ok
+    }
+
+    /**
+     * Readiness record hien tai (Chip report) — Panel transfer revalidate.
+     * Detach sync revoke → null; khong dung state Compose tre.
+     */
+    fun collapseHandoffReadinessRecord(): StatusBarCollapseHandoffMeasuredLayout? =
+        collapseHandoffCtrl.readinessRecord
+
+    /**
+     * Transfer: show real roi retire dummy.
+     * CHI Ready + realPrepared that — [allowUnprepared] bi ignore (khong fabricate).
+     * Bat buoc measured record + live owner/layoutGen; size/attach tu arg hoac record.
+     * Null owner / missing record → reject (P1B); stale = no-op.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun transferCollapseHandoff(
+        sessionGeneration: Int,
+        allowUnprepared: Boolean = false,
+        currentSelectedOwnerId: String? = null,
+        currentLayoutGen: Int? = null,
+        layoutWidthPx: Int? = null,
+        layoutHeightPx: Int? = null,
+        attached: Boolean? = null,
+        chipExists: Boolean = true,
+    ): Boolean {
+        // Thieu size/attach live → dung record sync (detach da revoke ngay).
+        val rec = collapseHandoffCtrl.readinessRecord
+        val w = layoutWidthPx ?: rec?.widthPx
+        val h = layoutHeightPx ?: rec?.heightPx
+        val att = attached ?: rec?.attached
+        val ok =
+            collapseHandoffCtrl.transfer(
+                sessionGen = sessionGeneration,
+                allowUnprepared = false,
+                currentSelectedOwnerId = currentSelectedOwnerId,
+                currentLayoutGen = currentLayoutGen,
+                layoutWidthPx = w,
+                layoutHeightPx = h,
+                attached = att,
+                chipExists = chipExists,
+            )
+        publishHandoffSnapshot()
+        return ok
+    }
+
+    /**
+     * Overlay hide → Cleanup → Idle.
+     * Guard session + layout; beginCleanup fail / stale = total no-op (khong mutate legacy).
+     */
+    fun completeCollapseHandoffCleanup(
+        sessionGeneration: Int,
+        layoutGeneration: Int = _layoutGeneration.get(),
+    ): Boolean {
+        val ok =
+            statusBarCollapseHandoffTryCompleteCleanup(
+                ctrl = collapseHandoffCtrl,
+                sessionGen = sessionGeneration,
+                layoutGen = layoutGeneration,
+            )
+        if (!ok) {
+            // Stale / lifecycle sai — khong publish/clear session moi hon.
+            return false
+        }
+        _collapseHandbackComplete.value =
+            CollapseHandbackCompleteSignal(
+                holdGeneration = sessionGeneration,
+                layoutGeneration = layoutGeneration,
+                abort = false,
+            )
+        _collapseHandbackSession.value = null
+        _collapseHandbackProgress.value = null
+        publishHandoffSnapshot()
+        return true
+    }
+
+    fun cancelCollapseHandoff() {
+        collapseHandoffCtrl.cancel()
+        _collapseHandbackDrawn.value = null
+        _collapseHandbackProgress.value = null
+        _collapseHandbackSession.value = null
+        _collapseHandbackComplete.value =
+            CollapseHandbackCompleteSignal(
+                holdGeneration = -1,
+                layoutGeneration = _layoutGeneration.get(),
+                abort = true,
+            )
+        publishHandoffSnapshot()
+    }
+
+    // --- Legacy bridge (signature cu; uy quyen controller moi) ---
+
     data class CollapseHandbackDrawnSignal(
         val ownerId: String?,
         val layoutGeneration: Int,
     )
 
-    /**
-     * Overlay chrome da an / host sap release — Chip moi release staticMode (phase5).
-     * [abort]=true: collapseImmediate / reverse — chip bo keepStatic ngay.
-     */
     data class CollapseHandbackCompleteSignal(
         val holdGeneration: Int,
         val layoutGeneration: Int,
         val abort: Boolean = false,
+    )
+
+    /** Legacy staged complementary — transfer atomic thay the. */
+    data class CollapseHandbackProgress(
+        val holdGeneration: Int,
+        val layoutGeneration: Int,
+        val ownerId: String?,
+        val revealRequested: Boolean,
+        val trueLayerFraction: Float,
+        val drawCredible: Boolean,
+        val handoverProgress: Float = 0f,
+    )
+
+    /** Legacy force-reveal stub — blind transfer bypass DISABLED (task-002 B3). */
+    data class CollapseHandbackForceReveal(
+        val requestId: Long,
+        val holdGeneration: Int,
+        val layoutGeneration: Int,
+        val forceFullRecovery: Boolean = false,
+    )
+
+    data class CollapseHandbackSession(
+        val holdGeneration: Int,
+        val layoutGeneration: Int,
+        val expectedOwnerId: String?,
     )
 
     private val _collapseHandbackDrawn =
@@ -118,40 +499,115 @@ constructor(
     val collapseHandbackComplete: StateFlow<CollapseHandbackCompleteSignal?> =
         _collapseHandbackComplete.asStateFlow()
 
-    /** Goi tu AxDynamicBarChip sau OnDraw credible (hoac no-owner). */
+    private val _collapseHandbackProgress =
+        MutableStateFlow<CollapseHandbackProgress?>(null)
+    val collapseHandbackProgress: StateFlow<CollapseHandbackProgress?> =
+        _collapseHandbackProgress.asStateFlow()
+
+    private val forceRevealRequestSeq = AtomicLong(0)
+    private val _collapseHandbackForceReveal =
+        MutableSharedFlow<CollapseHandbackForceReveal>(
+            extraBufferCapacity = 8,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
+    val collapseHandbackForceReveal: SharedFlow<CollapseHandbackForceReveal> =
+        _collapseHandbackForceReveal.asSharedFlow()
+
+    private val _collapseHandbackSession =
+        MutableStateFlow<CollapseHandbackSession?>(null)
+    val collapseHandbackSession: StateFlow<CollapseHandbackSession?> =
+        _collapseHandbackSession.asStateFlow()
+
     fun reportCollapseHandbackLiveDrawn(ownerId: String?, layoutGeneration: Int) {
-        _collapseHandbackDrawn.value =
-            CollapseHandbackDrawnSignal(
-                ownerId = ownerId,
+        val snap = collapseHandoffCtrl.snapshot
+        if (snap.phase != StatusBarCollapseHandoffPhase.Idle) {
+            // Null owner = revoke (chip unmount), khong mark prepared.
+            reportCollapseHandoffRealPrepared(
+                sessionGeneration = snap.sessionGeneration,
                 layoutGeneration = layoutGeneration,
+                ownerId = ownerId,
+                prepared = ownerId != null,
             )
+        } else {
+            _collapseHandbackDrawn.value =
+                CollapseHandbackDrawnSignal(ownerId, layoutGeneration)
+        }
     }
 
-    /** Panel: chrome=0 + hide confirm — Chip phase5 release static. */
-    fun reportCollapseHandbackOverlayHidden(holdGeneration: Int, layoutGeneration: Int) {
-        _collapseHandbackComplete.value =
-            CollapseHandbackCompleteSignal(
+    fun reportCollapseHandbackProgress(progress: CollapseHandbackProgress) {
+        if (progress.holdGeneration < 0) return
+        val session = _collapseHandbackSession.value ?: return
+        if (progress.holdGeneration != session.holdGeneration) return
+        if (progress.layoutGeneration != session.layoutGeneration) return
+        _collapseHandbackProgress.value = progress
+        if (progress.drawCredible && progress.trueLayerFraction >= 0.99f) {
+            reportCollapseHandoffRealPrepared(
+                sessionGeneration = progress.holdGeneration,
+                layoutGeneration = progress.layoutGeneration,
+                ownerId = progress.ownerId,
+                prepared = true,
+            )
+        }
+    }
+
+    fun requestCollapseHandbackForceReveal(
+        holdGeneration: Int,
+        layoutGeneration: Int,
+        forceFullRecovery: Boolean = false,
+    ): Long {
+        // Blind transfer(allowUnprepared) DISABLED — giu LIVE dummy, khong fabricate prepared.
+        // Listener legacy van nhan emit; recovery that = retarget + doi prepared / owner-end cancel.
+        val requestId = forceRevealRequestSeq.incrementAndGet()
+        _collapseHandbackForceReveal.tryEmit(
+            CollapseHandbackForceReveal(
+                requestId = requestId,
                 holdGeneration = holdGeneration,
                 layoutGeneration = layoutGeneration,
-                abort = false,
+                forceFullRecovery = forceFullRecovery,
             )
+        )
+        return requestId
     }
 
-    /** Xoa latch drawn/complete — settle moi / expand / abort. */
+    fun beginCollapseHandbackSession(
+        holdGeneration: Int,
+        layoutGeneration: Int,
+        expectedOwnerId: String?,
+    ) {
+        if (collapseHandoffCtrl.snapshot.phase == StatusBarCollapseHandoffPhase.Idle) {
+            beginCollapseHandoffSession(layoutGeneration, expectedOwnerId)
+        } else {
+            _collapseHandbackSession.value =
+                CollapseHandbackSession(
+                    holdGeneration = collapseHandoffCtrl.sessionGeneration,
+                    layoutGeneration = layoutGeneration,
+                    expectedOwnerId = expectedOwnerId,
+                )
+        }
+    }
+
+    fun reportCollapseHandbackOverlayHidden(holdGeneration: Int, layoutGeneration: Int) {
+        // Guard ca session + layout — stale layoutGen = no-op.
+        completeCollapseHandoffCleanup(
+            sessionGeneration = holdGeneration,
+            layoutGeneration = layoutGeneration,
+        )
+    }
+
     fun clearCollapseHandbackSignals() {
         _collapseHandbackDrawn.value = null
         _collapseHandbackComplete.value = null
+        _collapseHandbackProgress.value = null
+        _collapseHandbackSession.value = null
+        // Reset controller neu con hold sot — tranh beginPrepare no-op cung layoutGen.
+        if (collapseHandoffCtrl.phase != StatusBarCollapseHandoffPhase.Idle) {
+            collapseHandoffCtrl.cancel()
+            publishHandoffSnapshot()
+        }
     }
 
-    /** collapseImmediate / reverse: ep Chip bo keepStatic, khong stuck staticMode. */
     fun abortCollapseHandbackStatic() {
-        _collapseHandbackDrawn.value = null
-        _collapseHandbackComplete.value =
-            CollapseHandbackCompleteSignal(
-                holdGeneration = -1,
-                layoutGeneration = _layoutGeneration.get(),
-                abort = true,
-            )
+        cancelCollapseHandoff()
     }
 
     /**
@@ -171,10 +627,15 @@ constructor(
     private val pillFrames = StatusBarPillFrameTracker()
     private val _capturedPillFrame = MutableStateFlow(PillFrame())
     val capturedPillFrame: StateFlow<PillFrame> = _capturedPillFrame.asStateFlow()
+    /** Owner id cua morph/capture frame — collapse retarget same-owner. */
+    private val _capturedPillOwnerId = MutableStateFlow<String?>(null)
+    val capturedPillOwnerId: StateFlow<String?> = _capturedPillOwnerId.asStateFlow()
 
     private fun publishMorphFrame() {
+        // Cap atomic morphFrame+morphOwnerId — khong relabel bang lastObservedOwnerId.
         val m = pillFrames.morphFrame
         _capturedPillFrame.value = PillFrame(m.left, m.top, m.width, m.height)
+        _capturedPillOwnerId.value = pillFrames.morphOwnerId
     }
 
     /**
@@ -219,6 +680,7 @@ constructor(
 
     /** Invalidate that — unmount / keyguard / rotation-config / destroyed owner. */
     fun clearCapturedPillFrame() {
+        collapseProbeCtrl.cancelForRestore(closeAfterRestore = false)
         pillFrames.invalidate()
         publishMorphFrame()
     }
@@ -314,8 +776,7 @@ constructor(
     private fun ensureFrozenMatchesCurrentSelection() {
         val frozen = _frozenPillPresentation.value ?: return
         if (frozen.isAlert) return
-        val state = interactor.uiState.value
-        val preferred = _expandOnlyEventId.value ?: state.topEvent?.id
+        val preferred = liveCollapseOwnerId()
         applyFrozenPillSelectionSync(preferredEventId = preferred)
     }
 
@@ -356,9 +817,11 @@ constructor(
     fun notifyCollapseSettled(expectedGeneration: Int = _layoutGeneration.get()) {
         if (_layoutGeneration.get() != expectedGeneration) return
         if (_intent.value) return
-        // Slot da restore o collapse(); giu false. Pill VISIBLE @settle.
-        _chipSlotReclaimed.value = false
+        // Neighbor motion da emit o collapse(); sync reclaim, KHONG duplicate request.
+        val reclaim = _ownerAppFgHidden.value
+        syncChipSlotReclaimed(reclaim)
         _pillSuppressed.value = false
+        neighborMotionEmitter.setPillSuppressed(false)
         pillFrames.notifyCollapseSettled()
         publishMorphFrame()
         // Clear frozen 1 lan sau handback — khong clear o collapse().
@@ -372,12 +835,19 @@ constructor(
             .launchIn(applicationScope)
 
         interactor.uiState
+            .onEach { state ->
+                val pending = confirmedExpandedOwnerId
+                if (pending != null &&
+                    (state.topEvent?.id == pending || state.events.none { it.id == pending })
+                ) confirmedExpandedOwnerId = null
+            }
             .map { state ->
                 state.events.isEmpty() || state.events.all { it is IslandEvent.AospChip }
             }
             .distinctUntilChanged()
             .onEach { shouldCollapse ->
-                if (shouldCollapse) collapse()
+                // Terminal: khong morph toi fabricated (0, topPad) sau clear capture.
+                if (shouldCollapse) collapseTerminalNoDestination()
             }
             .launchIn(applicationScope)
 
@@ -392,6 +862,7 @@ constructor(
     }
 
     fun expand(onlyEventId: String? = null) {
+        collapseProbeCtrl.cancelForRestore(closeAfterRestore = false)
         val state = interactor.uiState.value
         if (state.events.isEmpty() || state.events.all { it is IslandEvent.AospChip }) return
         stopCollapseChronometerRefresh()
@@ -402,6 +873,7 @@ constructor(
             state.notificationAlert
                 ?: onlyEventId?.let { id -> state.events.firstOrNull { it.id == id } }
                 ?: state.topEvent
+        confirmedExpandedOwnerId = null
         val chipStyle = interactor.settings.chipStyle.value
         if (display != null) {
             _frozenPillPresentation.value =
@@ -417,7 +889,8 @@ constructor(
         pillFrames.seedMorphFromObserved()
         publishMorphFrame()
         // Slot reclaim chi SAU confirmPillSuppressed (overlay handoff).
-        _chipSlotReclaimed.value = false
+        // expand() seed layout reclaim=false — KHONG emit (tranh APP_SHOW→CARD_CLOSE).
+        syncChipSlotReclaimed(reclaiming = false)
         // Khong suppress ngay — doi overlay ve shell p≈0 aligned roi
         // [confirmPillSuppressed] (tranh blank 1 frame / double lech bounds).
         _expandOnlyEventId.value = onlyEventId
@@ -426,25 +899,64 @@ constructor(
 
     /**
      * An pill that sau khi overlay temp shell da khop bounds pill @p≈0.
+     * Dong thoi reclaim width slot → notif icons / clock reflow (500ms hide).
      * Chi khi intent con expand — khong suppress som luc collapse.
-     * Sau handoff: reclaim width slot → notif icons reflow.
      */
     fun confirmPillSuppressed() {
         if (!_intent.value) return
         _pillSuppressed.value = true
-        _chipSlotReclaimed.value = true
+        neighborMotionEmitter.setPillSuppressed(true)
+        applyChipSlotReclaimed(
+            reclaiming = true,
+            trigger = statusBarNeighborTriggerForCardSlot(reclaiming = true),
+        )
     }
 
     fun collapse() {
+        // Repeated close guard: neu probe dang chay cho cung session thi khong restart probe
+        if (collapseProbeCtrl.phase != StatusBarCollapseProbePhase.Idle) {
+            return
+        }
         // Safeguard: sync frozen → CURRENT selection TRUOC khi ha intent / clear
         // expandOnly (immediate collapse / SNAP_LEAVE sau commit van dung B).
         ensureFrozenMatchesCurrentSelection()
         // task-048: refresh chrono HIEN TAI @collapse-start (cung owner) — dummy
         // khong giu 4m11s stale roi jump 4m16s luc handback. Khong rebuild owner.
         refreshFrozenPillChronometer()
+
+        val selectedOwner = liveCollapseOwnerId()
+        val isSuppressedExpanded = _intent.value && _pillSuppressed.value
+        val morphOwner = pillFrames.morphOwnerId
+        val hasValidMorph = pillFrames.morphFrame.isValid
+        val needsProbe =
+            isSuppressedExpanded && !_ownerAppFgHidden.value &&
+                !selectedOwner.isNullOrEmpty() &&
+                (!hasValidMorph || morphOwner != selectedOwner)
+
+        if (needsProbe && selectedOwner != null) {
+            val requested =
+                collapseProbeCtrl.requestProbe(
+                    targetOwnerId = selectedOwner,
+                    layoutGeneration = layoutGeneration,
+                )
+            if (requested) {
+                // Phase 1: Giu _intent=true va giu slot reclaimed; cho probe layout chay.
+                // Morph va slot animation chua chay o phase nay.
+                return
+            }
+        }
+
+        executeStandardCollapse()
+    }
+
+    private fun executeStandardCollapse() {
         // Restore layout slot TRUOC overlay morph ve dest (Samsung INVISIBLE reclaim).
-        // KHONG clear frozen / pillSuppressed o day — giu den notifyCollapseSettled.
-        _chipSlotReclaimed.value = false
+        // Neu owner FG dang an pill → giu reclaim (APP_HIDE), khong force show slot.
+        val reclaim = _ownerAppFgHidden.value
+        val trigger =
+            if (reclaim) StatusBarNeighborTrigger.APP_HIDE
+            else statusBarNeighborTriggerForCardSlot(reclaiming = false)
+        applyChipSlotReclaimed(reclaiming = reclaim, trigger = trigger)
         _intent.value = false
         _expandOnlyEventId.value = null
         // Ticker ~1Hz sau khi intent=false — chi luc dummy collapse (khong expanded idle).
@@ -452,13 +964,69 @@ constructor(
         // Giu pillSuppressed + capturedPillFrame + frozen den notifyCollapseSettled.
     }
 
-    /** Roi keyguard / bat buoc: tat suppress ngay, khong cho morph SB. */
+    internal fun liveCollapseOwnerId(): String? {
+        val state = interactor.uiState.value
+        val confirmed = confirmedExpandedOwnerId?.takeIf { id ->
+            _intent.value && state.events.any { it.id == id && it !is IslandEvent.AospChip }
+        }
+        return state.notificationAlert?.id
+            ?: _expandOnlyEventId.value
+            ?: confirmed
+            ?: state.topEvent?.id
+    }
+
+    internal fun isProbeDestinationLive(): Boolean {
+        val request = collapseProbeCtrl.snapshot.value
+        return _intent.value && !_ownerAppFgHidden.value &&
+            request.layoutGeneration == layoutGeneration &&
+            request.targetOwnerId == liveCollapseOwnerId()
+    }
+
+    internal fun finishProbeCollapse(generation: Long, contextToken: Long): Boolean {
+        val result = collapseProbeCtrl.finishRestored(
+            generation, layoutGeneration, liveCollapseOwnerId(), contextToken,
+        ) ?: return false
+        if (!result.closeAfterRestore || !_intent.value) return true
+        val frame = result.frame
+        val owner = result.ownerId
+        if (frame != null && owner != null) {
+            pillFrames.setMorphFrameForCollapse(frame, owner)
+            publishMorphFrame()
+        }
+        executeStandardCollapse()
+        return true
+    }
+
+    internal fun abandonDetachedProbe() {
+        val request = collapseProbeCtrl.snapshot.value
+        collapseProbeCtrl.abort()
+        if (request.phase != StatusBarCollapseProbePhase.Idle &&
+            request.closeAfterRestore && _intent.value
+        ) executeStandardCollapse()
+    }
+
+    /**
+     * Last-event / empty / all-Aosp swipe-hide: ket thuc visual outgoing ngay.
+     * Khong morph/handback toi fabricated origin (0, topPad) sau chipExists clear
+     * capture — tranh ghost pill duoi left status clock.
+     */
+    fun collapseTerminalNoDestination() {
+        collapseImmediate()
+    }
+
+    /** Roi keyguard / bat buoc / terminal no-destination: tat suppress ngay. */
     private fun collapseImmediate() {
+        collapseProbeCtrl.cancelForRestore(closeAfterRestore = false)
         stopCollapseChronometerRefresh()
         _intent.value = false
         _expandOnlyEventId.value = null
-        _chipSlotReclaimed.value = false
+        val reclaim = _ownerAppFgHidden.value
+        val trigger =
+            if (reclaim) StatusBarNeighborTrigger.APP_HIDE
+            else statusBarNeighborTriggerForCardSlot(reclaiming = false)
+        applyChipSlotReclaimed(reclaiming = reclaim, trigger = trigger)
         _pillSuppressed.value = false
+        neighborMotionEmitter.setPillSuppressed(false)
         abortCollapseHandbackStatic()
         clearCapturedPillFrame()
         clearFrozenPillPresentation()
@@ -482,6 +1050,7 @@ constructor(
     fun onConfirmedStackSelection(eventId: String) {
         val state = interactor.uiState.value
         val selected = state.events.firstOrNull { it.id == eventId }
+        confirmedExpandedOwnerId = selected?.id?.takeIf { state.topEvent?.id != it }
         _expandOnlyEventId.value = selected?.let { expandOnlyEventIdFor(it) }
         syncFrozenPillPresentationToEventId(eventId)
     }

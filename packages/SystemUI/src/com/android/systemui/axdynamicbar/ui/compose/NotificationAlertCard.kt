@@ -274,7 +274,7 @@ fun NotificationAlertCard(
         onStackDragEnd = if (enableStackDrag) onStackDragEnd else null,
         maxStackDragPx = if (enableStackDrag) maxStackDragPx else 0f,
         elasticStackDrag = enableStackDrag,
-        contentOffsetY = stackVisualDragY,
+        contentOffsetY = { stackVisualDragY },
     ) {
         Column(
             modifier = Modifier.fillMaxWidth()

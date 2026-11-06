@@ -330,6 +330,43 @@ fun statusBarChipEventDisplayKey(event: IslandEvent, isAlert: Boolean): String =
     if (isAlert) "alert:${event.id}" else event.id
 
 /**
+ * Task-053: selected branch (cung contentKey) phai bind OUTER live event.
+ * AnimatedContent co the giu entry snapshot cu khi key on dinh — media title /
+ * timer anchor moi se khong toi StatusBarPillBody neu dung [branch] thuan.
+ * Outgoing (key khac) van giu [branch] — khong leak owner moi vao A.
+ */
+fun statusBarChipSelectedLiveEntry(
+    branch: StatusBarChipEventEntry,
+    outerCurrent: StatusBarChipEventEntry,
+): StatusBarChipEventEntry =
+    if (branch.key == outerCurrent.key) outerCurrent else branch
+
+/**
+ * freezeMotion (tat entry/exit/marquee ngan) — KHONG dong nghia freeze gia tri.
+ * Handoff phase Prepare/Collapse/Ready: freezeMotion=true, liveValue van true (dummy/real).
+ * Legacy [handbackKeepStatic] bridge phase hold.
+ */
+fun statusBarPillFreezeMotion(
+    pillSuppressed: Boolean,
+    handbackKeepStatic: Boolean,
+): Boolean = pillSuppressed || handbackKeepStatic
+
+/**
+ * liveValue — chrono/media/title.
+ * Real: live khi !pillSuppressed (ke ca truoc Transfer alpha0).
+ * Dummy collapse overlay: caller bat buoc liveValue=true (khong dung helper nay).
+ */
+fun statusBarPillLiveValue(pillSuppressed: Boolean): Boolean = !pillSuppressed
+
+/**
+ * Chronometer ms dua vao PillEventText: live → null (ticker SSOT); snapshot → frozen.
+ */
+fun statusBarPillChronometerMsForBody(
+    presentation: StatusBarPillPresentation,
+    liveValue: Boolean,
+): Long? = if (liveValue) null else presentation.frozenChronometerMs
+
+/**
  * Presentation cho DUNG branch AnimatedContent ([entry]), khong outer current.
  * Outgoing A phai ve A du outer da B.
  */
@@ -377,12 +414,15 @@ fun statusBarHandbackReadyForUnsuppress(
 /**
  * Than pill Row/Circle — SSOT visual cho StatusBar chip + overlay dummy.
  *
- * LIVE ([staticMode]=false): animateColor/Dp + AnimatedContent media/icon/text/alert
- * giong AxDynamicBarChip HEAD (truoc extract 018).
- * SNAPSHOT/DUMMY ([staticMode]=true): cung layout/body, khong motion/ticker/marquee;
- * chronometer dung [StatusBarPillPresentation.frozenChronometerMs].
+ * Task-053: tach [freezeMotion] (tat entry/exit/marquee ngan) vs [liveValue]
+ * (chrono/media/title phai cap nhat). [staticMode]=true = snapshot day du
+ * (freezeMotion+!liveValue) cho overlay dummy — giu API cu.
  *
- * [includeBlur]: islandBlur + clip (pill that). Overlay shell tu ve glass → false.
+ * Real pill sau unsuppress: freezeMotion co the true (handback) trong khi
+ * liveValue=true — KHONG KeepStatic vo han tren noi dung live.
+ *
+ * [includeBlur]: islandBlur + clip. Live pill = true. Morph Row pill chrome = false
+ * (FG-only; morph shell la mot owner blur/tint lien tuc tu p0 — tranh double/gap).
  * [includeProgress]: thanh progress day (Row) — dummy overlay van ve neu snapshot co.
  */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -392,14 +432,32 @@ internal fun StatusBarPillBody(
     modifier: Modifier = Modifier,
     includeBlur: Boolean = true,
     includeProgress: Boolean = true,
+    /** Snapshot day du (dummy) — true ⇒ freezeMotion + !liveValue. */
     staticMode: Boolean = false,
+    /**
+     * Tat transition/marquee ngan. null = theo [staticMode].
+     * Handback glass hold: true; khong khoa ticker khi [liveValue]=true.
+     */
+    freezeMotion: Boolean? = null,
+    /**
+     * Chrono/media/title live. null = !staticMode.
+     * Sau unsuppress bat buoc true du handbackKeepStatic con.
+     */
+    liveValue: Boolean? = null,
     blurAlpha: Float = 1f,
+    /**
+     * Pill-layer da ve (drawWithContent) — handback Phase3 uu tien hon root OnDraw.
+     * Goi sau drawContent khi size>0; caller dem epoch / await.
+     */
+    onPillLayerDrawn: (() -> Unit)? = null,
 ) {
+    val motionFrozen = freezeMotion ?: staticMode
+    val valuesLive = liveValue ?: !staticMode
     val event = presentation.event
     val motionScheme = MaterialTheme.motionScheme
     val accentTarget = chipAccentColorFor(event)
     val contentTarget = chipContentColorFor(event)
-    // Hook luon goi (Compose); staticMode chi chon target truc tiep — khong animate dummy.
+    // Hook luon goi (Compose); motionFrozen chi chon target truc tiep — khong animate dummy.
     val accentAnim by
         animateColorAsState(
             accentTarget,
@@ -412,10 +470,24 @@ internal fun StatusBarPillBody(
             motionScheme.fastEffectsSpec(),
             label = "content",
         )
-    val accent = if (staticMode) accentTarget else accentAnim
-    val contentColor = if (staticMode) contentTarget else contentAnim
+    val accent = if (motionFrozen) accentTarget else accentAnim
+    val contentColor = if (motionFrozen) contentTarget else contentAnim
     val progress = presentation.progress
     val chipTextMaxWidth = dimensionResource(R.dimen.ongoing_activity_chip_max_text_width)
+
+    // Pill-layer draw signal — sau blur/content (Circle + Row). size0 khong dem.
+    // Caller gate selected/handback/gen/owner (FAIL A3) — tranh storm + outgoing.
+    val pillLayerDrawMod =
+        if (onPillLayerDrawn != null) {
+            Modifier.drawWithContent {
+                drawContent()
+                if (size.width > 0f && size.height > 0f) {
+                    onPillLayerDrawn.invoke()
+                }
+            }
+        } else {
+            Modifier
+        }
 
     if (presentation.useCircleStyle) {
         Box(
@@ -423,12 +495,14 @@ internal fun StatusBarPillBody(
             contentAlignment = Alignment.Center,
         ) {
             // Capture / squish dat tren CircleChip glass that — khong cha fillMaxHeight.
+            // Task-054: blurAlpha = native glass fraction (soft fill); icon/progress FG full.
             CircleChip(
                 event = event,
                 accent = accent,
                 contentColor = contentColor,
                 progress = progress,
-                modifier = modifier,
+                blurAlpha = if (includeBlur) blurAlpha else 1f,
+                modifier = modifier.then(pillLayerDrawMod),
             )
         }
         return
@@ -447,8 +521,8 @@ internal fun StatusBarPillBody(
             motionScheme.defaultSpatialSpec(),
             label = "chip_corner",
         )
-    val chipHeightDp: Dp = if (staticMode) tier.chipHeight else heightAnim
-    val chipCorner: Dp = if (staticMode) tier.chipCornerRadius else cornerAnim
+    val chipHeightDp: Dp = if (motionFrozen) tier.chipHeight else heightAnim
+    val chipCorner: Dp = if (motionFrozen) tier.chipCornerRadius else cornerAnim
     val isChronometerEvent = event is IslandEvent.Timer || event is IslandEvent.Stopwatch
 
     Box(
@@ -497,6 +571,7 @@ internal fun StatusBarPillBody(
                             Modifier
                         },
                     )
+                    .then(pillLayerDrawMod)
                     .padding(start = SpaceSm, end = SpaceMd),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -504,7 +579,8 @@ internal fun StatusBarPillBody(
                 presentation = presentation,
                 contentColor = contentColor,
                 chipTextMaxWidth = chipTextMaxWidth,
-                staticMode = staticMode,
+                freezeMotion = motionFrozen,
+                liveValue = valuesLive,
             )
         }
     }
@@ -516,13 +592,15 @@ private fun RowScope.StatusBarPillRowContent(
     presentation: StatusBarPillPresentation,
     contentColor: Color,
     chipTextMaxWidth: Dp,
-    staticMode: Boolean,
+    freezeMotion: Boolean,
+    liveValue: Boolean,
 ) {
     val event = presentation.event
     val carrierName = presentation.carrierName
     val isAlert = presentation.isAlert
     val isChronometerEvent = event is IslandEvent.Timer || event is IslandEvent.Stopwatch
     val motionScheme = MaterialTheme.motionScheme
+    val chronoMs = statusBarPillChronometerMsForBody(presentation, liveValue)
 
     if (carrierName != null) {
         Text(
@@ -542,7 +620,7 @@ private fun RowScope.StatusBarPillRowContent(
     when {
         isAlert && event is IslandEvent.Notification -> {
             val notif = event
-            if (staticMode) {
+            if (freezeMotion) {
                 StatusBarAlertRow(notif, contentColor, chipTextMaxWidth, marquee = false)
             } else {
                 AnimatedContent(
@@ -572,12 +650,13 @@ private fun RowScope.StatusBarPillRowContent(
             StatusBarSportsTeamBadge(event.team2Name, event.team2Icon, contentColor)
         }
         event is IslandEvent.Media -> {
-            // Mot cay AnimatedContent — staticMode chi None + static text (043).
-            // Idle track switch van mediaTrackSwitchTransition khi !staticMode.
+            // Mot cay AnimatedContent — freezeMotion chi None + tat marquee.
+            // liveValue: title/progress theo event hien tai (cung mediaKey van cap nhat).
+            // Idle track switch van mediaTrackSwitchTransition khi !freezeMotion.
             AnimatedContent(
                 targetState = event,
                 transitionSpec = {
-                    if (staticMode) {
+                    if (freezeMotion) {
                         EnterTransition.None togetherWith ExitTransition.None
                     } else {
                         mediaTrackSwitchTransition(motionScheme).using(sizeTransform = null)
@@ -589,24 +668,28 @@ private fun RowScope.StatusBarPillRowContent(
                     Modifier.weight(1f, fill = false)
                         .widthIn(max = chipTextMaxWidth + 20.dp),
             ) { media ->
+                // Selected cung key: bind outer [event] live (tranh snapshot AC cu).
+                val liveMedia =
+                    if (mediaTrackSwitchKey(media) == mediaTrackSwitchKey(event)) event else media
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    PillEventIcon(media, tint = contentColor, animated = false)
+                    PillEventIcon(liveMedia, tint = contentColor, animated = false)
                     PillEventText(
-                        media,
+                        liveMedia,
                         Modifier.widthIn(max = chipTextMaxWidth),
                         overrideColor = contentColor,
-                        static = staticMode,
-                        frozenChronometerMs = presentation.frozenChronometerMs,
+                        static = freezeMotion,
+                        liveValue = liveValue,
+                        frozenChronometerMs = chronoMs,
                     )
                 }
             }
         }
         else -> {
-            // Icon/text: cung cay — static None; idle van fade khi !staticMode (043).
+            // Icon/text: cung cay — freezeMotion None; idle van fade khi !freezeMotion.
             AnimatedContent(
                 targetState = statusBarChipIconKey(event),
                 transitionSpec = {
-                    if (staticMode) {
+                    if (freezeMotion) {
                         EnterTransition.None togetherWith ExitTransition.None
                     } else {
                         (fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
@@ -625,14 +708,15 @@ private fun RowScope.StatusBarPillRowContent(
                     event,
                     Modifier,
                     overrideColor = contentColor,
-                    static = staticMode,
-                    frozenChronometerMs = presentation.frozenChronometerMs,
+                    static = freezeMotion,
+                    liveValue = liveValue,
+                    frozenChronometerMs = chronoMs,
                 )
             } else {
                 AnimatedContent(
                     targetState = textKeyFor(event),
                     transitionSpec = {
-                        if (staticMode) {
+                        if (freezeMotion) {
                             EnterTransition.None togetherWith ExitTransition.None
                         } else {
                             (fadeIn(motionScheme.defaultEffectsSpec()) togetherWith
@@ -649,8 +733,9 @@ private fun RowScope.StatusBarPillRowContent(
                         event,
                         Modifier.widthIn(max = chipTextMaxWidth),
                         overrideColor = contentColor,
-                        static = staticMode,
-                        frozenChronometerMs = presentation.frozenChronometerMs,
+                        static = freezeMotion,
+                        liveValue = liveValue,
+                        frozenChronometerMs = chronoMs,
                     )
                 }
             }

@@ -231,16 +231,20 @@ fun effectiveLockedTargetHeightPx(
 /**
  * STATUS BAR — H dich morph khi dang/da expand.
  * - Dung owner + da khoa → H khoa.
- * - Owner doi / chua do owner moi → GIU [lastExpandedHPx] (khong bounce pillH).
+ * - Owner doi: uu tien [cachedOwnerNaturalHPx] (do luc the do la under/top) —
+ *   KHONG bridge lastExpanded cua owner cu (tranh top nho bi H under cao).
+ * - Chua cache owner moi → GIU [lastExpandedHPx] (khong bounce pillH mid-switch).
  * - Chua tung co envelope → 0 (caller moi fallback pillH: chi first expand).
  */
 fun statusBarMorphTargetHeightPx(
     locked: LockedTargetHeight,
     owner: String?,
     lastExpandedHPx: Int,
+    cachedOwnerNaturalHPx: Int = 0,
 ): Int {
     val matched = effectiveLockedTargetHeightPx(locked, owner)
     if (matched > 0) return matched
+    if (cachedOwnerNaturalHPx > 0) return cachedOwnerNaturalHPx
     if (lastExpandedHPx > 0) return lastExpandedHPx
     return 0
 }
@@ -261,6 +265,268 @@ fun resolveStatusBarLockedTargetHeight(
     if (measuredHPx <= 0 || measuredHPx <= pillHPx) return current
     if (current.owner == owner && current.heightPx == measuredHPx) return current
     return LockedTargetHeight(heightPx = measuredHPx, owner = owner)
+}
+
+// --- Stack expanded: 4 loai H (task-031) — KHONG gop lam mot ---
+
+/**
+ * Bon loai chieu cao stack expanded STATUS BAR.
+ *
+ * 1. [cardNaturalHPx] — child card measured theo event.id (full, truoc draw-clip peek)
+ * 2. [paintedTopHPx] — shared glass / painted NEW TOP only
+ * 3. [stackHostEnvelopeHPx] — Box.wrapContentHeight max(layers)+pads
+ * 4. [touchInsetsEnvelopeHPx] — touch / insets host (co the >= painted)
+ */
+data class StatusBarStackHeightKinds(
+    val cardNaturalHPx: Int = 0,
+    val paintedTopHPx: Int = 0,
+    val stackHostEnvelopeHPx: Int = 0,
+    val touchInsetsEnvelopeHPx: Int = 0,
+)
+
+/**
+ * Host-lock H tu card natural + pads stack (SpaceXxs + EXPANDED_BOTTOM_PAD).
+ * Don vi khop lockNaturalSize (envelope co pads).
+ */
+fun statusBarStackHostHeightFromCardNaturalPx(
+    cardNaturalHPx: Int,
+    topPadPx: Int,
+    bottomPadPx: Int,
+): Int {
+    if (cardNaturalHPx <= 0) return 0
+    return cardNaturalHPx + topPadPx.coerceAtLeast(0) + bottomPadPx.coerceAtLeast(0)
+}
+
+/**
+ * Chon H khoa natural cho TOP khi stack wrapContent = max(top, under)+pads.
+ *
+ * - Co [topCardNaturalHPx] > pill → top+pads (KHONG dung under/max envelope).
+ * - Chua do top (first expand) → fallback [stackHostEnvelopeHPx].
+ * Do under natural chi de peek/reveal — cam ap min-H under len top.
+ */
+fun statusBarLockHeightPreferTopCardNaturalPx(
+    topCardNaturalHPx: Int,
+    stackHostEnvelopeHPx: Int,
+    topPadPx: Int,
+    bottomPadPx: Int,
+    pillHPx: Int,
+): Int {
+    val topHost =
+        statusBarStackHostHeightFromCardNaturalPx(topCardNaturalHPx, topPadPx, bottomPadPx)
+    if (topHost > pillHPx) return topHost
+    if (stackHostEnvelopeHPx > pillHPx) return stackHostEnvelopeHPx
+    return 0
+}
+
+/**
+ * Rest swap (expanded at-rest / owner doi): follow live lock H.
+ * Frozen morph run: giu frozen — uy quyen [statusBarMorphRunEndpointPx].
+ */
+fun statusBarExpandedRestOrFrozenHeightPx(
+    restLiveLockHPx: Int,
+    frozenEndpointHPx: Int,
+    pillHPx: Int,
+    morphTransitionRunning: Boolean,
+    morphExpandedAtRest: Boolean,
+): Int =
+    statusBarMorphRunEndpointPx(
+        frozenEndpointPx = frozenEndpointHPx,
+        liveTargetPx = restLiveLockHPx,
+        pillPx = pillHPx,
+        morphTransitionRunning = morphTransitionRunning,
+        morphExpandedAtRest = morphExpandedAtRest,
+    )
+
+/**
+ * Owner key STATUS BAR tu event.id — khop contentOwnerKey ExpandedPanel.
+ */
+fun statusBarStackEventOwnerKey(eventId: String): String = "event:$eventId"
+
+/**
+ * Measure-context anh huong natural height (task-032/033).
+ * [availableWidthPx] = envelope host width (KHONG so truc tiep = card W do padding);
+ * [densityDpi] bat rotation/density; [fontScale] bat H doi khi text scale.
+ * Token reject stale + validate lookup — KHONG re-label size cu bang effect.
+ */
+data class StatusBarCardNaturalMeasureContext(
+    val availableWidthPx: Int,
+    val densityDpi: Int,
+    val fontScale: Float = 1f,
+) {
+    val token: Int
+        get() =
+            statusBarCardNaturalMeasureContextToken(
+                availableWidthPx = availableWidthPx,
+                densityDpi = densityDpi,
+                fontScale = fontScale,
+            )
+}
+
+/** Token on dinh: envelopeW + densityDpi + fontScale (milli). */
+fun statusBarCardNaturalMeasureContextToken(
+    availableWidthPx: Int,
+    densityDpi: Int,
+    fontScale: Float = 1f,
+): Int {
+    var h = 17
+    h = 31 * h + availableWidthPx.coerceAtLeast(0)
+    h = 31 * h + densityDpi
+    // milli tranh float noise; cover H doi khi fontScale doi ma W/dpi giu.
+    h = 31 * h + (fontScale * 1000f).toInt()
+    return h
+}
+
+/**
+ * Cache entry natural: H + measured W + context token luc layout/measure.
+ * Lookup chi hop le khi token == active context.
+ */
+data class StatusBarCardNaturalCacheEntry(
+    val heightPx: Int,
+    val measuredWidthPx: Int,
+    val contextToken: Int,
+)
+
+/**
+ * Observation layer sau place/measure — provenance = context luc layout.
+ * Map remember qua context van giu ban ghi cu; active lookup can token khop.
+ */
+data class StatusBarCardNaturalLayerObservation(
+    val widthPx: Int,
+    val heightPx: Int,
+    val measuredContextToken: Int,
+)
+
+/**
+ * Cap nhat cache natural theo event identity + measure context (task-032).
+ * - h <=0 → bo qua (khong xoa bang measure transient).
+ * - reportContextToken != active → REJECT (late report old width/config).
+ * - Cung key + context: follow H moi (RemoteViews/content).
+ * - Tra key da ghi; null neu bo qua.
+ */
+fun statusBarPutCardNaturalSizeCache(
+    cache: MutableMap<String, StatusBarCardNaturalCacheEntry>,
+    eventId: String,
+    widthPx: Int,
+    heightPx: Int,
+    reportContextToken: Int,
+    activeContextToken: Int,
+): String? {
+    if (eventId.isEmpty() || heightPx <= 0) return null
+    if (reportContextToken != activeContextToken) return null
+    val key = statusBarStackEventOwnerKey(eventId)
+    val next =
+        StatusBarCardNaturalCacheEntry(
+            heightPx = heightPx,
+            measuredWidthPx = widthPx.coerceAtLeast(0),
+            contextToken = reportContextToken,
+        )
+    if (cache[key] != next) cache[key] = next
+    return key
+}
+
+/**
+ * Lookup natural H — chi khi entry dung active context token.
+ * Stale width/density/fontScale (token khac) → 0 (cho layout moi / bridge).
+ */
+fun statusBarLookupCardNaturalHeightPx(
+    cache: Map<String, StatusBarCardNaturalCacheEntry>,
+    ownerKey: String,
+    activeContextToken: Int,
+): Int {
+    if (ownerKey.isEmpty() || activeContextToken == 0) return 0
+    val entry = cache[ownerKey] ?: return 0
+    if (entry.contextToken != activeContextToken) return 0
+    return entry.heightPx.coerceAtLeast(0)
+}
+
+/** Lookup natural W — cung token policy voi height (task-037 rest rect). */
+fun statusBarLookupCardNaturalWidthPx(
+    cache: Map<String, StatusBarCardNaturalCacheEntry>,
+    ownerKey: String,
+    activeContextToken: Int,
+): Int {
+    if (ownerKey.isEmpty() || activeContextToken == 0) return 0
+    val entry = cache[ownerKey] ?: return 0
+    if (entry.contextToken != activeContextToken) return 0
+    return entry.measuredWidthPx.coerceAtLeast(0)
+}
+
+/**
+ * Observation con song qua context — chi dung khi da measure trong active.
+ * ContextB chua place → null (KHONG promote H tu contextA).
+ */
+fun statusBarCardNaturalObservationForActiveContext(
+    observation: StatusBarCardNaturalLayerObservation?,
+    activeContextToken: Int,
+): StatusBarCardNaturalLayerObservation? {
+    if (observation == null || activeContextToken == 0) return null
+    if (observation.heightPx <= 0) return null
+    if (observation.measuredContextToken != activeContextToken) return null
+    return observation
+}
+
+/**
+ * Producer sau onPlaced/onSizeChanged (task-033): bind size vao layoutContextToken.
+ * - h<=0 / token=0 → skip
+ * - entry == previous → null (khong write moi frame)
+ * - ke ca W/H bang previous nhung token moi (layout context moi) → publish
+ * KHONG copy raw map cu gan token moi bang effect.
+ */
+fun statusBarCardNaturalPublishAfterLayout(
+    previousPublished: StatusBarCardNaturalCacheEntry?,
+    widthPx: Int,
+    heightPx: Int,
+    layoutContextToken: Int,
+): StatusBarCardNaturalCacheEntry? {
+    if (heightPx <= 0 || layoutContextToken == 0) return null
+    val next =
+        StatusBarCardNaturalCacheEntry(
+            heightPx = heightPx,
+            measuredWidthPx = widthPx.coerceAtLeast(0),
+            contextToken = layoutContextToken,
+        )
+    return if (previousPublished != next) next else null
+}
+
+/**
+ * Xoa entry khong con live hoac sai active context.
+ */
+fun statusBarPruneCardNaturalCache(
+    cache: MutableMap<String, StatusBarCardNaturalCacheEntry>,
+    liveOwnerKeys: Collection<String>,
+    activeContextToken: Int,
+) {
+    if (cache.isEmpty()) return
+    val live = liveOwnerKeys.toHashSet()
+    val stale =
+        cache.keys.filter { key ->
+            key !in live || cache[key]?.contextToken != activeContextToken
+        }
+    stale.forEach { cache.remove(it) }
+}
+
+/**
+ * H khoa tu natural / first-expand envelope — KHONG permanently lock max
+ * under khi dang bridge doi natural (owner swap / context republish).
+ *
+ * - Co top natural → top+pads.
+ * - Chua natural + dang co bridge/lock → 0 (caller giu continuity, cho republish).
+ * - First expand (chua bridge) → cho phep stack envelope.
+ */
+fun statusBarLockHeightFromNaturalOrBridgePx(
+    topCardNaturalHPx: Int,
+    stackHostEnvelopeHPx: Int,
+    topPadPx: Int,
+    bottomPadPx: Int,
+    pillHPx: Int,
+    hasBridgeOrLockedHeight: Boolean,
+): Int {
+    val topHost =
+        statusBarStackHostHeightFromCardNaturalPx(topCardNaturalHPx, topPadPx, bottomPadPx)
+    if (topHost > pillHPx) return topHost
+    if (hasBridgeOrLockedHeight) return 0
+    if (stackHostEnvelopeHPx > pillHPx) return stackHostEnvelopeHPx
+    return 0
 }
 
 // --- Content alpha (keyguard + statusbar) — clamp 0..1, tach khoi overshoot scale ---
@@ -288,71 +554,17 @@ internal fun morphExpandContentAlpha(progress: Float, closing: Boolean): Float =
     }
 
 /**
- * Shell/temp chrome trong morph STATUS BAR — bu [morphExpandContentAlpha].
- * Mo: full khi content alpha~0 (tranh blank 0→0.4); tat dan khi per-card len.
- * Dong: shell tro lai truoc khi pill handoff. Fully expanded → 0 (khong CardBg vinh vien).
- *
- * StatusBar glass that: uu tien [statusBarMorphShellGlassAlpha] (ease, tranh double blur).
+ * Shell/temp chrome trong morph STATUS BAR — bu [morphExpandContentAlpha] (keyguard).
+ * StatusBar: dung [statusBarMorphShellGlassAlpha] track (StatusBarMorphTracks).
  */
 internal fun morphTempShellAlpha(expandContentAlpha: Float): Float =
     (1f - expandContentAlpha.coerceIn(0f, 1f)).coerceIn(0f, 1f)
 
-/**
- * Shell GLASS alpha StatusBar — tach khoi content handoff linear.
- * Open: full den Start; quadratic ve 0 trong [Start, End] (roi nhanh hon card)
- * de PrimaryCard blur khong chong frost shell. p>=End / p1 → 0 (card native).
- * Close: shell len lai (u^2) khi ve pill — card blur tat truoc, khong flash tint.
- * KHONG doi cua so content [0.35, 0.55].
- */
-internal fun statusBarMorphShellGlassAlpha(progress: Float, closing: Boolean): Float {
-    val p = progress.coerceIn(0f, 1f)
-    val start = StatusBarMorphContentHandoffStart
-    val end = StatusBarMorphContentHandoffEnd
-    val span = (end - start).coerceAtLeast(1e-4f)
-    return if (closing) {
-        when {
-            p >= end -> 0f
-            p <= start -> 1f
-            else -> {
-                val u = ((end - p) / span).coerceIn(0f, 1f)
-                (u * u).coerceIn(0f, 1f)
-            }
-        }
-    } else {
-        when {
-            p <= start -> 1f
-            p >= end -> 0f
-            else -> {
-                val t = ((p - start) / span).coerceIn(0f, 1f)
-                val remain = 1f - t
-                (remain * remain).coerceIn(0f, 1f)
-            }
-        }
-    }
-}
+// statusBarMorphShellGlassAlpha / ShellTintProgress / CardSurfaceBlurFactor
+// → SSOT StatusBarMorphTracks.kt (color + glass doc lap geom).
 
 /**
- * Tint/fallback shell → CardBg: smoothstep tren pCorner — bot nhay mau abrupt.
- */
-internal fun statusBarMorphShellTintProgress(shellLerp: Float): Float {
-    val t = shellLerp.coerceIn(0f, 1f)
-    return t * t * (3f - 2f * t)
-}
-
-/**
- * He so blur nested PrimaryCard/Media khi shell glass con — tranh double backdrop.
- * p1 / shell=0 → 1 (card native). Shell manh → giam blur card.
- */
-internal fun statusBarMorphCardSurfaceBlurFactor(
-    cardContentAlpha: Float,
-    shellGlassAlpha: Float,
-): Float {
-    if (cardContentAlpha <= 0.01f) return 0f
-    return (1f - shellGlassAlpha.coerceIn(0f, 1f)).coerceIn(0f, 1f)
-}
-
-/**
- * Collapse handback chrome overlay (task-043/044).
+ * Collapse handback chrome overlay (task-043/044/046).
  *
  * Truoc 043: hold && !suppressed → 0 ngay — overlay CONTENT α=0 tren window khac
  * luc real pill moi unsuppress → race both-hidden (A→A lan A→B).
@@ -360,6 +572,8 @@ internal fun statusBarMorphCardSurfaceBlurFactor(
  * Sau 043: giu chrome=1 den [liveDrawnAcked] (chip OnDraw / timeout failsafe).
  * Sau 044: staticMode release SAU overlay hide (phase5); early-ack StateFlow latch.
  * Sau 045: phase5 OnDraw wait bounded (≤100ms) — khong lock static vinh vien.
+ * Sau 046: chrome van 0/1 (ACK gate); material overlap dung complementary layer
+ * (khong 2×AlphaGlass=.9216 trong REVEALED_AWAITING_DRAW).
  */
 internal fun statusBarMorphCollapseOverlayChromeFactor(
     collapseHandbackHold: Boolean,
@@ -368,19 +582,454 @@ internal fun statusBarMorphCollapseOverlayChromeFactor(
 ): Float {
     if (!collapseHandbackHold) return 1f
     if (pillSuppressed) return 1f
-    // hold + unsuppress: giu dummy den khi live ack (khong α0 truoc real ve).
+    // hold + unsuppress: giu GLASS den khi live ack (khong α0 truoc real ve).
+    // Task-053: dummy FG tach — xem [statusBarMorphCollapseOverlayDummyFgAlpha].
     if (!liveDrawnAcked) return 1f
     return 0f
 }
+
+/**
+ * Legacy dummy FG alpha (pre task-001).
+ *
+ * SUPERSEDED: dung [statusBarCollapseHandoffDummyFgAlpha] / ownership phase.
+ * Unsuppress KHONG duoc an dummy ngay (both-hidden voi real alpha0) —
+ * dummy giu den Transfer. Helper nay giu signature test cu; production Panel
+ * khong goi path !pillSuppressed → 0 nua.
+ */
+internal fun statusBarMorphCollapseOverlayDummyFgAlpha(
+    pillFollowAlpha: Float,
+    collapseChromeFactor: Float,
+    pillSuppressed: Boolean,
+    forwardAwaitSuppress: Boolean,
+): Float {
+    if (forwardAwaitSuppress) return 0f
+    if (!pillSuppressed) return 0f
+    return (pillFollowAlpha * collapseChromeFactor).coerceIn(0f, 1f)
+}
+
+/**
+ * Task-053 policy: freezeMotion co the true trong khi liveValue true.
+ * Chung minh decouple — handbackKeepStatic khong khoa content.
+ */
+internal fun statusBarCollapseHandbackContentLiveWhileMotionFrozen(
+    pillSuppressed: Boolean,
+    handbackKeepStatic: Boolean,
+): Boolean {
+    val freezeMotion = pillSuppressed || handbackKeepStatic
+    val liveValue = !pillSuppressed
+    return liveValue && freezeMotion
+}
+
+/**
+ * Task-053: snapshot diag (owner/gen/suppress/keepStatic/freeze/live/dummyFg).
+ * Log khi doi trang thai — khong moi frame.
+ */
+data class StatusBarHandbackLivenessDiag(
+    val ownerId: String?,
+    val layoutGeneration: Int,
+    val pillSuppressed: Boolean,
+    val handbackKeepStatic: Boolean,
+    val freezeMotion: Boolean,
+    val liveValue: Boolean,
+    val dummyFgAlpha: Float,
+    val overlayChromeFactor: Float,
+)
+
+internal fun statusBarHandbackLivenessDiagOf(
+    ownerId: String?,
+    layoutGeneration: Int,
+    pillSuppressed: Boolean,
+    handbackKeepStatic: Boolean,
+    collapseHandbackHold: Boolean,
+    liveDrawnAcked: Boolean,
+    pillFollowAlpha: Float = 1f,
+): StatusBarHandbackLivenessDiag {
+    val chrome =
+        statusBarMorphCollapseOverlayChromeFactor(
+            collapseHandbackHold = collapseHandbackHold,
+            pillSuppressed = pillSuppressed,
+            liveDrawnAcked = liveDrawnAcked,
+        )
+    return StatusBarHandbackLivenessDiag(
+        ownerId = ownerId,
+        layoutGeneration = layoutGeneration,
+        pillSuppressed = pillSuppressed,
+        handbackKeepStatic = handbackKeepStatic,
+        freezeMotion = pillSuppressed || handbackKeepStatic,
+        liveValue = !pillSuppressed,
+        dummyFgAlpha =
+            statusBarMorphCollapseOverlayDummyFgAlpha(
+                pillFollowAlpha = pillFollowAlpha,
+                collapseChromeFactor = chrome,
+                pillSuppressed = pillSuppressed,
+                forwardAwaitSuppress = false,
+            ),
+        overlayChromeFactor = chrome,
+    )
+}
+
+/**
+ * Layer α staged (<0.1) luc await-draw — OnDraw traverse pill nonzero, khong full 1.
+ * Task-046: tranh true×.72 + overlay×.72 = .9216 flash.
+ */
+internal const val StatusBarHandbackStagedTrueLayerAlpha = 0.05f
+
+/**
+ * So frame ramp staged→1 sau credible OnDraw (frame-driven, khong sleep).
+ * ±1 SF frame OK; khong timer dai.
+ */
+internal const val StatusBarHandbackHandoverFrameSteps = 3
+
+/**
+ * Timeout primary (cung hide delay 50ms) het → force-reveal + doi readiness that.
+ * KHONG fabricate ACK khi α=0.
+ */
+internal const val StatusBarHandbackReadinessFailsafeMs = 200L
+
+/**
+ * So lan retry pill-layer draw/ready (drawWithContent / bounds) truoc recovery.
+ * Root OnDraw khong reliable — retry bounded, khong return som roi treo Panel.
+ */
+internal const val StatusBarHandbackPillLayerReadyMaxAttempts = 8
+
+/**
+ * Timeout moi lan await pill-layer draw (ms) — invalidate + doi signal.
+ */
+internal const val StatusBarHandbackPillLayerDrawAttemptMs = 48L
+
+/**
+ * Panel stall recovery: sau 2 failsafe van !acked — doi Chip force-full bounded.
+ * CAM snapshotFlow.first vo han (task-048 stuck dummy @p0).
+ */
+internal const val StatusBarHandbackStallRecoveryMs = 400L
+
+/**
+ * Overlay complementary layer y khi true layer = x:
+ * y = (1−x) / (1 − materialAlpha·x)  → effective material ≈ materialAlpha.
+ *
+ * x=0 → y=1; x=1 → y=0; x=staged(.05) → y≈0.985 (khong both-full .72+.72).
+ */
+internal fun statusBarMorphHandoffComplementaryOverlayLayer(
+    trueLayerFraction: Float,
+    materialAlpha: Float = AlphaGlass,
+): Float {
+    val x = trueLayerFraction.coerceIn(0f, 1f)
+    val a = materialAlpha.coerceIn(0f, 1f)
+    val denom = 1f - a * x
+    if (denom <= 1e-6f) return 0f
+    return ((1f - x) / denom).coerceIn(0f, 1f)
+}
+
+/**
+ * True-layer dua vao complementary overlay (Panel).
+ *
+ * ForceFull REQUEST co the muon α=1 de paint pill, nhung [drawCredible]=false
+ * KHONG duoc derive x=1→y=0 (blank flash). Giu staged → overlay material ≈AlphaGlass.
+ * COMMIT ownership (credible) moi dung published layer that.
+ */
+internal fun statusBarMorphHandoffOverlayTrueLayerForProgress(
+    publishedTrueLayer: Float,
+    drawCredible: Boolean,
+    revealRequested: Boolean,
+): Float {
+    if (!revealRequested) return 0f
+    if (!drawCredible) return StatusBarHandbackStagedTrueLayerAlpha
+    return publishedTrueLayer.coerceIn(0f, 1f)
+}
+
+/**
+ * Material overlay proxy luc await-draw (!credible) — single glass ≈AlphaGlass.
+ */
+internal fun statusBarMorphHandoffAwaitDrawOverlayMaterialAlpha(
+    materialAlpha: Float = AlphaGlass,
+): Float {
+    val y =
+        statusBarMorphHandoffComplementaryOverlayLayer(
+            trueLayerFraction = StatusBarHandbackStagedTrueLayerAlpha,
+            materialAlpha = materialAlpha,
+        )
+    return statusBarMorphMaterialTintAlpha(y, materialAlpha)
+}
+
+/**
+ * True layer fraction theo progress handoff shared (0=overlay owns, 1=true owns).
+ *
+ * - progress<=0 / chua reveal → 0
+ * - await-draw (stagedUntilReady) → [StatusBarHandbackStagedTrueLayerAlpha]
+ * - handover: lerp staged→1 theo progress (progress map 0..1 sau ready)
+ */
+internal fun statusBarMorphHandoffTrueLayerFromProgress(
+    progress: Float,
+    revealed: Boolean,
+    stagedUntilReady: Boolean,
+): Float {
+    if (!revealed) return 0f
+    val p = progress.coerceIn(0f, 1f)
+    if (stagedUntilReady) return StatusBarHandbackStagedTrueLayerAlpha
+    if (p <= 0f) return StatusBarHandbackStagedTrueLayerAlpha
+    // progress 0 → staged; 1 → full.
+    val staged = StatusBarHandbackStagedTrueLayerAlpha
+    return (staged + (1f - staged) * p).coerceIn(0f, 1f)
+}
+
+/**
+ * Task-054: FG visibility (outer graphicsLayer) — CHI full suppress / removal.
+ *
+ * - suppressed → 0
+ * - reverse hold chua reveal → 0
+ * - unsuppress + revealed → 1 (LIVE timer/title/icon/progress) — KHONG nhan staged .05
+ *
+ * Glass staged/ramp dung [statusBarMorphHandoffNativeGlassFraction] (blurAlpha).
+ * [trueLayerFraction] giu signature call-site cu; KHONG anh huong FG.
+ */
+@Suppress("UNUSED_PARAMETER")
+internal fun statusBarMorphHandoffTruePillAlpha(
+    pillSuppressed: Boolean,
+    handbackGlassRevealed: Boolean,
+    trueLayerFraction: Float = 1f,
+): Float {
+    if (pillSuppressed) return 0f
+    if (!handbackGlassRevealed) return 0f
+    return 1f
+}
+
+/**
+ * Task-054: native islandBlur / Circle soft-fill fraction (KHONG dim FG).
+ *
+ * - suppressed / !reveal → 0
+ * - unsuppress await → staged (.05); handover ramp→1; ACK → 1
+ * Overlay complementary match **fraction nay**, khong theo FG α.
+ */
+internal fun statusBarMorphHandoffNativeGlassFraction(
+    pillSuppressed: Boolean,
+    handbackGlassRevealed: Boolean,
+    trueLayerFraction: Float,
+): Float {
+    if (pillSuppressed) return 0f
+    if (!handbackGlassRevealed) return 0f
+    return trueLayerFraction.coerceIn(0f, 1f)
+}
+
+/**
+ * Overlay shared glass α gate.
+ *
+ * True owns ([!pillSuppressed] && ![collapseHandbackHold]) → 0 ke ca
+ * [isExpanded]=false / isMorphing van mount host (tranh latent double-glass).
+ * Hold + unsuppress + !acked:
+ * - chua reveal → persistent full (true=0)
+ * - revealed → complementary(trueLayer) × persistent (tranh 2×AlphaGlass)
+ * Hold / suppressed khac: [persistentShared] × chrome.
+ */
+@Suppress("UNUSED_PARAMETER")
+internal fun statusBarMorphHandoffOverlayGlassAlpha(
+    isExpanded: Boolean,
+    pillSuppressed: Boolean,
+    collapseHandbackHold: Boolean,
+    persistentSharedGlassAlpha: Float,
+    handbackGlassRevealed: Boolean = true,
+    trueLayerFraction: Float = 1f,
+    liveDrawnAcked: Boolean = false,
+    materialAlpha: Float = AlphaGlass,
+): Float {
+    // True pill owns — overlay glass off (host co the con mount / isMorphing).
+    // [isExpanded] giu signature call-site (forward/idle); gate !suppress&&!hold du.
+    if (!pillSuppressed && !collapseHandbackHold) return 0f
+    val base = persistentSharedGlassAlpha.coerceIn(0f, 1f)
+    // Hold + unsuppress + chua ACK: complementary theo true layer (shared progress).
+    if (collapseHandbackHold && !pillSuppressed && !liveDrawnAcked) {
+        if (!handbackGlassRevealed) return base
+        val y =
+            statusBarMorphHandoffComplementaryOverlayLayer(
+                trueLayerFraction = trueLayerFraction,
+                materialAlpha = materialAlpha,
+            )
+        return (base * y).coerceIn(0f, 1f)
+    }
+    return base
+}
+
+/**
+ * SRC_OVER effective α khi 2 lop (cung material) — proxy flash overlap.
+ * 1 owner: max(bottom,top)≈A; 2×A → A+A·(1−A) sang hon.
+ * Luu y: A=1 tautology (1+1·0=1) — dung [AlphaGlass] (.72) de do brightness that.
+ */
+internal fun statusBarMorphSrcOverEffectiveAlpha(bottom: Float, top: Float): Float {
+    val b = bottom.coerceIn(0f, 1f)
+    val t = top.coerceIn(0f, 1f)
+    return t + b * (1f - t)
+}
+
+/**
+ * Material tint α sau layer gate — [layerAlpha]×[materialAlpha] (AlphaGlass=.72 @p0).
+ */
+internal fun statusBarMorphMaterialTintAlpha(
+    layerAlpha: Float,
+    materialAlpha: Float = AlphaGlass,
+): Float = (layerAlpha.coerceIn(0f, 1f) * materialAlpha.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+
+/**
+ * SRC_OVER 2 lop material tint (vd. 2× AlphaGlass → .9216 > .72).
+ */
+internal fun statusBarMorphMaterialSrcOverEffective(
+    bottomLayerAlpha: Float,
+    topLayerAlpha: Float,
+    materialAlpha: Float = AlphaGlass,
+): Float =
+    statusBarMorphSrcOverEffectiveAlpha(
+        bottom = statusBarMorphMaterialTintAlpha(bottomLayerAlpha, materialAlpha),
+        top = statusBarMorphMaterialTintAlpha(topLayerAlpha, materialAlpha),
+    )
+
+/**
+ * Bang handoff: FG α, native glass fraction, overlay α, material — forward/reverse.
+ * Task-054: [truePillAlpha]=FG; [nativeGlassFraction]=blur/soft-fill; overlay complementary
+ * theo native glass (khong theo FG).
+ */
+internal data class StatusBarMorphHandoffAlphaSample(
+    /** FG visibility (outer layer) — 0 suppress / 1 unsuppress revealed. */
+    val truePillAlpha: Float,
+    val overlayGlassAlpha: Float,
+    val effectiveSrcOver: Float,
+    /** native×AlphaGlass (mac dinh). */
+    val trueMaterialAlpha: Float = 0f,
+    /** overlay×AlphaGlass. */
+    val overlayMaterialAlpha: Float = 0f,
+    /** SRC_OVER material — do brightness that (khong dung layer α=1 tautology). */
+    val effectiveMaterialSrcOver: Float = 0f,
+    /** Task-054: islandBlur / Circle soft-fill fraction (staged/ramp). */
+    val nativeGlassFraction: Float = 1f,
+)
+
+internal fun statusBarMorphHandoffAlphaSample(
+    pillSuppressed: Boolean,
+    handbackGlassRevealed: Boolean,
+    isExpanded: Boolean,
+    collapseHandbackHold: Boolean,
+    liveDrawnAcked: Boolean,
+    sharedGlassOwnerPresent: Boolean = true,
+    materialAlpha: Float = AlphaGlass,
+    /** Native glass sau reveal; await-draw staged (.05), handover ramp→1. */
+    trueLayerFraction: Float = 1f,
+): StatusBarMorphHandoffAlphaSample {
+    val chrome =
+        statusBarMorphCollapseOverlayChromeFactor(
+            collapseHandbackHold = collapseHandbackHold,
+            pillSuppressed = pillSuppressed,
+            liveDrawnAcked = liveDrawnAcked,
+        )
+    val persistent =
+        statusBarMorphPersistentSharedGlassAlpha(
+            sharedGlassOwnerPresent = sharedGlassOwnerPresent,
+            collapseChromeFactor = chrome,
+        )
+    val fgA =
+        statusBarMorphHandoffTruePillAlpha(
+            pillSuppressed = pillSuppressed,
+            handbackGlassRevealed = handbackGlassRevealed,
+            trueLayerFraction = trueLayerFraction,
+        )
+    val glassX =
+        statusBarMorphHandoffNativeGlassFraction(
+            pillSuppressed = pillSuppressed,
+            handbackGlassRevealed = handbackGlassRevealed,
+            trueLayerFraction = trueLayerFraction,
+        )
+    val overlay =
+        statusBarMorphHandoffOverlayGlassAlpha(
+            isExpanded = isExpanded,
+            pillSuppressed = pillSuppressed,
+            collapseHandbackHold = collapseHandbackHold,
+            persistentSharedGlassAlpha = persistent,
+            handbackGlassRevealed = handbackGlassRevealed,
+            trueLayerFraction = glassX,
+            liveDrawnAcked = liveDrawnAcked,
+            materialAlpha = materialAlpha,
+        )
+    val tMat = statusBarMorphMaterialTintAlpha(glassX, materialAlpha)
+    val oMat = statusBarMorphMaterialTintAlpha(overlay, materialAlpha)
+    return StatusBarMorphHandoffAlphaSample(
+        truePillAlpha = fgA,
+        overlayGlassAlpha = overlay,
+        effectiveSrcOver = statusBarMorphSrcOverEffectiveAlpha(glassX, overlay),
+        trueMaterialAlpha = tMat,
+        overlayMaterialAlpha = oMat,
+        effectiveMaterialSrcOver = statusBarMorphSrcOverEffectiveAlpha(tMat, oMat),
+        nativeGlassFraction = glassX,
+    )
+}
+
+/**
+ * Phase3 handback (task-043/046):
+ * HOLD_HIDDEN → REVEALED_AWAITING_DRAW (true staged α>0, complementary overlay)
+ * → HANDOVER (ramp complementary) → ACKED (overlay drop).
+ * Root OnDraw luc HOLD_HIDDEN = false-positive (pill invisible).
+ */
+internal enum class HandbackVisibleRevealPhase {
+    HOLD_HIDDEN,
+    REVEALED_AWAITING_DRAW,
+    HANDOVER,
+    ACKED,
+}
+
+internal fun statusBarCollapseHandbackVisibleRevealPhase(
+    handbackGlassRevealed: Boolean,
+    liveDrawnAcked: Boolean,
+    trueLayerFraction: Float = 1f,
+    drawCredible: Boolean = false,
+): HandbackVisibleRevealPhase =
+    when {
+        liveDrawnAcked -> HandbackVisibleRevealPhase.ACKED
+        !handbackGlassRevealed -> HandbackVisibleRevealPhase.HOLD_HIDDEN
+        drawCredible &&
+            trueLayerFraction > StatusBarHandbackStagedTrueLayerAlpha + 0.001f ->
+            HandbackVisibleRevealPhase.HANDOVER
+        else -> HandbackVisibleRevealPhase.REVEALED_AWAITING_DRAW
+    }
+
+/**
+ * Chi ACK overlay drop khi true pill α>0 + draw credible (khong ACK tu root OnDraw α=0).
+ * Staged α (.05) du de OnDraw credible — khong can full 1 truoc ACK path bat dau ramp.
+ */
+internal fun statusBarCollapseHandbackAckAfterVisibleLive(
+    truePillAlpha: Float,
+    handbackGlassRevealed: Boolean,
+    drawCredible: Boolean,
+): Boolean =
+    truePillAlpha > 0.01f && handbackGlassRevealed && drawCredible
+
+/**
+ * Root OnDraw chung minh visible pill glass? Chi khi da reveal (α>0).
+ * α=0 → OnDraw root van fire (SB chrome khac) — KHONG credible.
+ * Staged (.05) van prove (≠ fabricated readiness flag).
+ */
+internal fun statusBarCollapseHandbackRootDrawProvesVisiblePill(
+    handbackGlassRevealed: Boolean,
+    truePillAlpha: Float,
+): Boolean = handbackGlassRevealed && truePillAlpha > 0.01f
 
 /**
  * True khi ca hai surface an — bug handback (overlay chrome 0 + live chua ve).
  * Pure gate / test; khong thay sleep.
  */
 internal fun statusBarCollapseHandbackBothHidden(
-    overlayChromeFactor: Float,
+    overlayGlassOrChrome: Float,
     livePillAlpha: Float,
-): Boolean = overlayChromeFactor <= 0.01f && livePillAlpha <= 0.01f
+): Boolean = overlayGlassOrChrome <= 0.01f && livePillAlpha <= 0.01f
+
+/**
+ * Both-full material flash: 2× layer≈1 → SrcOver material .9216.
+ * Staged+complementary KHONG trigger.
+ */
+internal fun statusBarCollapseHandbackBrightDoubleMaterial(
+    trueLayer: Float,
+    overlayLayer: Float,
+    materialAlpha: Float = AlphaGlass,
+    epsilonAboveSingle: Float = 0.05f,
+): Boolean {
+    val eff =
+        statusBarMorphMaterialSrcOverEffective(trueLayer, overlayLayer, materialAlpha)
+    return eff > materialAlpha + epsilonAboveSingle
+}
 
 /**
  * Ordering an toan sau unsuppress: chrome phai con 1 neu chua liveDrawnAcked.
@@ -393,6 +1042,125 @@ internal fun statusBarCollapseHandbackOrderingSafe(
     if (pillSuppressed) return overlayChromeFactor >= 0.99f
     if (!liveDrawnAcked) return overlayChromeFactor >= 0.99f
     return overlayChromeFactor <= 0.01f
+}
+
+/**
+ * Nguong trueLayer ≈1 de ACK/drop overlay (task-045).
+ * Staged .05 / mid-ramp .36 → CAM — complementary con giu.
+ */
+internal const val StatusBarHandbackTrueLayerAckMin = 0.99f
+
+/**
+ * Timeout / failsafe duoc phep drop overlay?
+ *
+ * - Live owner: CHI trueLayer≈1 VA drawCredible OnDraw (owner/gen khop o caller)
+ * - Staged .05 / mid-ramp / !credible → CAM (khong alpha hole chrome0)
+ * - No-owner that (!liveOwnerExpected || !chipExists) → OK unstick
+ * - Cam fabricate readiness (fake no-owner / fake α=1)
+ */
+internal fun statusBarCollapseHandbackTimeoutMayDropOverlay(
+    handbackGlassRevealed: Boolean,
+    truePillAlpha: Float,
+    liveOwnerExpected: Boolean,
+    chipExists: Boolean = true,
+    drawCredible: Boolean = false,
+): Boolean {
+    if (!liveOwnerExpected || !chipExists) return true
+    if (!handbackGlassRevealed) return false
+    if (!drawCredible) return false
+    if (truePillAlpha < StatusBarHandbackTrueLayerAckMin) return false
+    return true
+}
+
+/**
+ * Phan biet request-reveal vs α>0 vs credible OnDraw (≠ SF present).
+ * ACK chi khi fraction≈1 + credible + gen/owner khop.
+ */
+internal data class HandbackReadinessSnapshot(
+    val revealRequested: Boolean,
+    val trueLayerFraction: Float,
+    val drawCredible: Boolean,
+    val ownerId: String?,
+    val holdGeneration: Int,
+    val layoutGeneration: Int = -1,
+)
+
+internal fun statusBarCollapseHandbackReadinessAllowsAck(
+    snap: HandbackReadinessSnapshot,
+    expectedHoldGeneration: Int,
+    expectedOwnerId: String?,
+    expectedLayoutGeneration: Int = -1,
+): Boolean {
+    if (snap.holdGeneration != expectedHoldGeneration) return false
+    if (
+        expectedLayoutGeneration >= 0 &&
+            snap.layoutGeneration >= 0 &&
+            snap.layoutGeneration != expectedLayoutGeneration
+    ) {
+        return false
+    }
+    if (!snap.revealRequested) return false
+    if (snap.trueLayerFraction < StatusBarHandbackTrueLayerAckMin) return false
+    if (!snap.drawCredible) return false
+    if (
+        snap.ownerId != null &&
+            expectedOwnerId != null &&
+            snap.ownerId != expectedOwnerId
+    ) {
+        return false
+    }
+    return true
+}
+
+/**
+ * Progress Chip→Panel SSOT: reject stale holdGen / layoutGen / owner.
+ * KHONG dung holdGeneration=-1.
+ */
+internal fun statusBarCollapseHandbackProgressMatchesSession(
+    progressHoldGeneration: Int,
+    progressLayoutGeneration: Int,
+    progressOwnerId: String?,
+    expectedHoldGeneration: Int,
+    expectedLayoutGeneration: Int,
+    expectedOwnerId: String?,
+): Boolean {
+    if (progressHoldGeneration < 0) return false
+    if (progressHoldGeneration != expectedHoldGeneration) return false
+    if (progressLayoutGeneration != expectedLayoutGeneration) return false
+    if (
+        expectedOwnerId != null &&
+            progressOwnerId != null &&
+            progressOwnerId != expectedOwnerId
+    ) {
+        return false
+    }
+    return true
+}
+
+/**
+ * Forward suppress toggle: cam both-full / both-hidden (cung gate reverse).
+ * trueOwns → overlay0; overlayOwns → true0; crossfade complementary OK.
+ * Task-054: both-hidden theo FG; bright-double theo [nativeGlassFraction] (khong FG=1).
+ */
+internal fun statusBarMorphHandoffForwardSingleOwnerSafe(
+    truePillAlpha: Float,
+    overlayGlassAlpha: Float,
+    materialAlpha: Float = AlphaGlass,
+    nativeGlassFraction: Float = truePillAlpha,
+): Boolean {
+    if (statusBarCollapseHandbackBothHidden(overlayGlassAlpha, truePillAlpha)) {
+        return false
+    }
+    if (
+        statusBarCollapseHandbackBrightDoubleMaterial(
+            trueLayer = nativeGlassFraction,
+            overlayLayer = overlayGlassAlpha,
+            materialAlpha = materialAlpha,
+        )
+    ) {
+        return false
+    }
+    return true
 }
 
 /**
@@ -484,6 +1252,225 @@ internal fun statusBarCollapseHandbackPhase5TimeoutDistinctFromPhase3Ack(
     phase5TimeoutMs: Long,
     phase3AckTimeoutMs: Long = statusBarOverlayHideDelayMs(alertExitGrace = false),
 ): Boolean = phase5TimeoutMs != phase3AckTimeoutMs && phase5TimeoutMs in 1L..100L
+
+/**
+ * Pill-layer draw/ready (task-048) — thay root OnDraw.
+ * attached + size>0 + layerDrawn (drawWithContent) + true α>0.
+ */
+internal fun statusBarCollapseHandbackPillLayerReady(
+    attachedToWindow: Boolean,
+    layoutWidthPx: Int,
+    layoutHeightPx: Int,
+    layerDrawn: Boolean,
+    truePillAlpha: Float,
+): Boolean {
+    if (!attachedToWindow) return false
+    if (layoutWidthPx <= 0 || layoutHeightPx <= 0) return false
+    if (!layerDrawn) return false
+    if (truePillAlpha <= 0.01f) return false
+    return true
+}
+
+/**
+ * Het retry pill-layer: van can own-layer draw (FAIL D task-050).
+ * Attached+bounds+staged THIEU [layerDrawn] → false (khong mark credible / drop overlay).
+ * Anti-stuck: ForceFull / post-stall doi own-layer callback that.
+ */
+internal fun statusBarCollapseHandbackPillLayerReadyAfterRetries(
+    attemptsUsed: Int,
+    maxAttempts: Int = StatusBarHandbackPillLayerReadyMaxAttempts,
+    attachedToWindow: Boolean,
+    layoutWidthPx: Int,
+    layoutHeightPx: Int,
+    truePillAlpha: Float,
+    layerDrawn: Boolean = false,
+): Boolean {
+    if (attemptsUsed < maxAttempts) return false
+    if (!attachedToWindow) return false
+    if (layoutWidthPx <= 0 || layoutHeightPx <= 0) return false
+    if (truePillAlpha <= 0.01f) return false
+    // FAIL D: cam ready chi vi attached — bat buoc own-layer callback.
+    if (!layerDrawn) return false
+    return true
+}
+
+/**
+ * Cap phat requestId monotonic cho ForceReveal — moi retry doc lap
+ * (StateFlow null-then-same se conflate; SharedFlow+id thi khong).
+ */
+internal fun statusBarCollapseHandbackNextForceRevealRequestId(
+    sequence: java.util.concurrent.atomic.AtomicLong,
+): Long = sequence.incrementAndGet()
+
+/** 3+ requestId tang dan, khong trung — chung minh retry observable. */
+internal fun statusBarCollapseHandbackForceRevealRequestIdsIndependent(
+    requestIds: LongArray,
+): Boolean {
+    if (requestIds.size < 3) return false
+    for (i in 1 until requestIds.size) {
+        if (requestIds[i] <= requestIds[i - 1]) return false
+    }
+    return requestIds.toSet().size == requestIds.size
+}
+
+/** ForceReveal khop session hold/layout — stale gen reject. */
+internal fun statusBarCollapseHandbackForceRevealMatchesSession(
+    requestHoldGeneration: Int,
+    requestLayoutGeneration: Int,
+    sessionHoldGeneration: Int,
+    sessionLayoutGeneration: Int,
+): Boolean =
+    requestHoldGeneration == sessionHoldGeneration &&
+        requestLayoutGeneration == sessionLayoutGeneration
+
+/**
+ * onPillLayerDrawn post: revalidate gen/owner/size/α truoc ++epoch (FAIL C).
+ * Stale hold/layout/owner / size0 / α0 / detach session → false (khong ACK).
+ */
+internal fun statusBarCollapseHandbackPillLayerDrawPostMayIncrementEpoch(
+    keepStatic: Boolean,
+    pillSuppressed: Boolean,
+    sessionHoldGeneration: Int?,
+    sessionLayoutGeneration: Int?,
+    capturedHoldGeneration: Int,
+    capturedLayoutGeneration: Int,
+    currentLayoutGeneration: Int,
+    expectedOwnerId: String?,
+    drawnOwnerId: String,
+    layoutWidthPx: Int,
+    layoutHeightPx: Int,
+    trueLayerFraction: Float,
+): Boolean {
+    if (!keepStatic || pillSuppressed) return false
+    if (sessionHoldGeneration == null || sessionLayoutGeneration == null) return false
+    if (sessionHoldGeneration != capturedHoldGeneration) return false
+    if (sessionLayoutGeneration != capturedLayoutGeneration) return false
+    if (sessionLayoutGeneration != currentLayoutGeneration) return false
+    if (expectedOwnerId != null && drawnOwnerId != expectedOwnerId) return false
+    if (layoutWidthPx <= 0 || layoutHeightPx <= 0) return false
+    if (trueLayerFraction <= 0.01f) return false
+    return true
+}
+
+/**
+ * Panel: sau failsafe van !acked → co duoc goi stall recovery (force-full Chip)?
+ * Live owner + chua ACK → true (bounded); da ACK / gen stale → false.
+ */
+internal fun statusBarCollapseHandbackShouldRequestStallRecovery(
+    liveDrawnAcked: Boolean,
+    expectedOwnerPresent: Boolean,
+    holdStillActive: Boolean,
+): Boolean = holdStillActive && !liveDrawnAcked && expectedOwnerPresent
+
+/**
+ * Stall recovery: du dieu kien ACK sau ForceFull REQUEST α=1?
+ * No-owner → true (release). Size0 / detach / null owner+chip → false (KHONG ACK).
+ * Chi REQUEST α khong dung helper nay — doi pill-layer size>0 + draw.
+ */
+internal fun statusBarCollapseHandbackStallRecoveryMayForceFull(
+    attachedToWindow: Boolean,
+    layoutWidthPx: Int,
+    layoutHeightPx: Int,
+    ownerId: String?,
+    chipExists: Boolean,
+): Boolean {
+    if (!chipExists) return true // no-owner path — release
+    if (ownerId.isNullOrEmpty()) return true
+    if (!attachedToWindow) return false
+    // FAIL A1: size0 / unmeasured → KHONG ACK (root attach != pill paint).
+    if (layoutWidthPx <= 0 || layoutHeightPx <= 0) return false
+    return true
+}
+
+/**
+ * ForceFull ACK gate day du: MayForceFull + pill-layer ready + owner khop + credible.
+ * Root attach / cache size thieu layerDrawn → false.
+ */
+internal fun statusBarCollapseHandbackStallRecoveryForceFullMayAck(
+    mayForceFull: Boolean,
+    pillLayerReady: Boolean,
+    drawCredible: Boolean,
+    ownerMatchesSession: Boolean,
+): Boolean {
+    if (!mayForceFull) return false
+    if (!pillLayerReady) return false
+    if (!drawCredible) return false
+    if (!ownerMatchesSession) return false
+    return true
+}
+
+/** Post-stall: chu ky observe reactive (cancellable; KHONG first vo han). */
+internal const val StatusBarHandbackPostStallObservePeriodMs = 48L
+
+/** Post-stall: so lan retry force-full + observe truoc khi chi doi drawn signal. */
+internal const val StatusBarHandbackPostStallMaxForceRetries = 10
+
+/**
+ * Con doi reactive recovery? Owner live + hold + chua ACK → true.
+ * No-owner / da ACK / hold off → false (cho phep release / thoat).
+ */
+internal fun statusBarCollapseHandbackShouldContinuePostStallObserve(
+    liveDrawnAcked: Boolean,
+    expectedOwnerPresent: Boolean,
+    holdStillActive: Boolean,
+): Boolean = holdStillActive && !liveDrawnAcked && expectedOwnerPresent
+/**
+ * Shared glass translationY theo SSOT dragY — chi expanded-at-rest.
+ * Morph/settle: 0 (khong fake shift).
+ */
+internal fun statusBarMorphSharedGlassDragTranslationYPx(
+    dragYPx: Float,
+    morphExpandedAtRest: Boolean,
+): Float {
+    if (!morphExpandedAtRest) return 0f
+    return dragYPx
+}
+
+/**
+ * |screenY_fg − screenY_glass| sau cung dragY (rigid) — ky vong ≤1px.
+ */
+internal fun statusBarMorphFgGlassScreenYDeltaPx(
+    fgScreenYPx: Float,
+    glassScreenYPx: Float,
+): Float = kotlin.math.abs(fgScreenYPx - glassScreenYPx)
+
+/**
+ * Painted LRTB: khi |dragY|>eps → KHONG update frozen (tranh poison / jitter feedback).
+ */
+internal fun statusBarMorphPaintedLrtbUpdateAllowed(
+    dragYPx: Float,
+    settling: Boolean = false,
+    dragEpsilonPx: Float = 0.5f,
+): Boolean {
+    if (settling) return false
+    return kotlin.math.abs(dragYPx) <= dragEpsilonPx
+}
+
+/** LRTB window sau baseline-compensate dragY (pure test / reporter). */
+internal data class StatusBarMorphLrtbPx(
+    val leftPx: Float,
+    val topPx: Float,
+    val rightPx: Float,
+    val bottomPx: Float,
+)
+
+/**
+ * Baseline-compensate window bounds neu reporter van fire luc drag.
+ * window* da gom graphicsLayer translationY = dragY → tru de ve rest geometry.
+ */
+internal fun statusBarMorphPaintedBoundsBaselineCompensateDrag(
+    windowLeftPx: Float,
+    windowTopPx: Float,
+    windowRightPx: Float,
+    windowBottomPx: Float,
+    dragYPx: Float,
+): StatusBarMorphLrtbPx =
+    StatusBarMorphLrtbPx(
+        leftPx = windowLeftPx,
+        topPx = windowTopPx - dragYPx,
+        rightPx = windowRightPx,
+        bottomPx = windowBottomPx - dragYPx,
+    )
 
 /**
  * Latch latest drawn signal (StateFlow-like) — giu early ack truoc Panel subscribe.
@@ -612,10 +1599,32 @@ internal class CollapseHandbackHoldController {
         return true
     }
 
-    /** Timeout / interrupt failsafe — chrome duoc ve 0, khong stuck host. */
-    fun acknowledgeLiveDrawnTimeout(holdGeneration: Int): Boolean {
+    /**
+     * Timeout failsafe — CHI ack khi [statusBarCollapseHandbackTimeoutMayDropOverlay].
+     * Live owner: true≈1 + drawCredible; staged/mid-ramp → reject.
+     * No-owner that → mayDrop; CAM fabricate fake no-owner / fake α=1.
+     */
+    fun acknowledgeLiveDrawnTimeout(
+        holdGeneration: Int,
+        handbackGlassRevealed: Boolean = true,
+        truePillAlpha: Float = 1f,
+        liveOwnerExpected: Boolean = true,
+        chipExists: Boolean = true,
+        drawCredible: Boolean = false,
+    ): Boolean {
         if (!holdActive) return false
         if (holdGeneration != this.holdGeneration) return false
+        if (
+            !statusBarCollapseHandbackTimeoutMayDropOverlay(
+                handbackGlassRevealed = handbackGlassRevealed,
+                truePillAlpha = truePillAlpha,
+                liveOwnerExpected = liveOwnerExpected,
+                chipExists = chipExists,
+                drawCredible = drawCredible,
+            )
+        ) {
+            return false
+        }
         liveDrawnAcked = true
         return true
     }
@@ -659,14 +1668,18 @@ internal class CollapseHandbackHoldController {
 
 /**
  * Outer occupied width sau reclaim — layout NGOAI widthIn/padding.
- * naturalWidthPx = measure child (min 25 + pad); fraction=0 → 0 that (NIC reflow).
+ * [slotWidthFraction] da la layout fraction (>=0, co the >1 overshoot).
+ * KHONG map lai raw (tranh double-amplify). Compose width nonnegative.
  */
 internal fun statusBarChipOuterOccupiedWidthPx(
     naturalWidthPx: Int,
     slotWidthFraction: Float,
+    densityDpi: Float = StatusBarChipSlotDefaultDensityDpi,
 ): Int {
     if (naturalWidthPx <= 0) return 0
-    val f = slotWidthFraction.coerceIn(0f, 1f)
+    if (!slotWidthFraction.isFinite()) return 0
+    // densityDpi giu signature; floor 0 — Compose khong am width.
+    val f = slotWidthFraction.coerceAtLeast(0f)
     return (naturalWidthPx * f).roundToInt().coerceAtLeast(0)
 }
 
@@ -823,63 +1836,8 @@ internal class OwnerBoundGlassCacheState {
 }
 
 /**
- * Cua so handoff noi dung STATUS BAR (progress 0..1) — geometry-relative, KHONG 239dp.
- * Dummy di cung overlay den [Start], roi crossfade overlapping/adjacent voi card den [End].
- */
-internal const val StatusBarMorphContentHandoffStart = 0.35f
-internal const val StatusBarMorphContentHandoffEnd = 0.55f
-
-/**
- * Dummy pill CONTENT alpha trong overlay STATUS BAR.
- * Open: 1 @p0..Start, crossfade → 0 @End; Close: 0 @End..1, crossfade → 1 @Start..0.
- * Khong alias [morphPillContentAlpha] (fade som → gap empty truoc card).
- */
-internal fun statusBarMorphDummyContentAlpha(progress: Float, closing: Boolean): Float {
-    val p = progress.coerceIn(0f, 1f)
-    val start = StatusBarMorphContentHandoffStart
-    val end = StatusBarMorphContentHandoffEnd
-    val span = (end - start).coerceAtLeast(1e-4f)
-    return if (closing) {
-        when {
-            p >= end -> 0f
-            p <= start -> 1f
-            else -> ((end - p) / span).coerceIn(0f, 1f)
-        }
-    } else {
-        when {
-            p <= start -> 1f
-            p >= end -> 0f
-            else -> ((end - p) / span).coerceIn(0f, 1f)
-        }
-    }
-}
-
-/**
- * Card expanded CONTENT alpha — StatusBar morph (tach keyguard [morphExpandContentAlpha]).
- * Open/Close cung cua so [Start, End] voi dummy → complementary, khong empty middle.
- */
-internal fun statusBarMorphCardContentAlpha(progress: Float, closing: Boolean): Float {
-    val p = progress.coerceIn(0f, 1f)
-    val start = StatusBarMorphContentHandoffStart
-    val end = StatusBarMorphContentHandoffEnd
-    val span = (end - start).coerceAtLeast(1e-4f)
-    return if (closing) {
-        when {
-            p >= end -> 1f
-            p <= start -> 0f
-            else -> ((p - start) / span).coerceIn(0f, 1f)
-        }
-    } else {
-        when {
-            p <= start -> 0f
-            p >= end -> 1f
-            else -> ((p - start) / span).coerceIn(0f, 1f)
-        }
-    }
-}
-
-/**
  * Bu anisotropic host sx≠sy: child scaleX=1/sx, scaleY=1/sy → man hinh isotropic = pill size.
+ * Dummy CONTENT visual: [statusBarMorphDummyLayerScale] theo shell growth — KHONG * spring dummyScale.
  */
 internal fun statusBarMorphInverseContentScale(sx: Float, sy: Float): Pair<Float, Float> {
     val safeSx = sx.coerceAtLeast(1e-4f)
@@ -887,26 +1845,48 @@ internal fun statusBarMorphInverseContentScale(sx: Float, sy: Float): Pair<Float
     return (1f / safeSx) to (1f / safeSy)
 }
 
+// Dummy/card alpha + handoff windows → StatusBarMorphTracks.kt (track 2/3, elapsed ms).
+
+// Pill chrome: CHI morph Bezier 500/600 + inverse scale — KHONG spring/prelude/landing.
+// (task-015: bo elastic 006/007/010/011; morph/handback ACK giu nguyen.)
+
 /**
- * Continuity handoff: dummy+card phai cover (sum >= nguong) — KHONG tautology shell>0→true.
- * [shellAlpha] giu signature cu; KHONG bypass gap (shell-only ≠ content handoff).
+ * Row morph glass alpha — MOT owner blur = shell (khong nhan (1-chrome)).
+ * Truoc: g*(1-c) → glass tat khi pill opaque du geom lon → nhay mau/blur @handoff.
+ * Sau: pass-through shell; pill chrome FG-only (includeBlur=false trong morph).
+ * [pillChromeAlpha] giu signature / complementary test — khong giam glass.
+ */
+internal fun statusBarMorphRowMorphGlassAlpha(
+    morphGlassAlpha: Float,
+    pillChromeAlpha: Float,
+): Float {
+    // chrome khong tru glass (tranh gap/flash); param giu API.
+    if (pillChromeAlpha < 0f) return 0f
+    return morphGlassAlpha.coerceIn(0f, 1f)
+}
+
+/**
+ * Continuity handoff F741N: dummy+card HOAC shell glass (content gap Samsung OK).
+ * Shell-only mid (dummy fade xong, panel chua width-gate) KHONG coi la fail.
  */
 internal fun statusBarMorphContentHandoffCoherent(
     dummyAlpha: Float,
     cardAlpha: Float,
     shellAlpha: Float = 0f,
 ): Boolean {
-    // shellAlpha khong tham gia — tranh tautology shell>0 → true (task-018 sai).
     if (shellAlpha < 0f) return false
     val d = dummyAlpha.coerceIn(0f, 1f)
     val c = cardAlpha.coerceIn(0f, 1f)
-    // Complementary / overlapping: luon co it nhat ~1 kenh noi dung.
+    val s = shellAlpha.coerceIn(0f, 1f)
     if (d + c >= 0.95f) return true
-    // Adjacent edge: mot kenh con >0.
+    if (s >= 0.95f) return true
     return d > 0.05f || c > 0.05f
 }
 
-/** Quet progress: khong co diem nao dummy+card deu ~0 (empty middle). */
+/**
+ * Quet linearT: moi moc phai cover bang dummy+card HOAC shell glass.
+ * 1-owner: shell luon co luc flight (track 4 glass).
+ */
 internal fun statusBarMorphContentHandoffNoEmptyGap(
     closing: Boolean,
     samples: Int = 21,
@@ -916,7 +1896,8 @@ internal fun statusBarMorphContentHandoffNoEmptyGap(
         val p = i / (samples - 1).toFloat()
         val dummy = statusBarMorphDummyContentAlpha(p, closing)
         val card = statusBarMorphCardContentAlpha(p, closing)
-        if (dummy + card < 0.05f) return false
+        val shell = statusBarMorphShellGlassAlpha(p, closing)
+        if (!statusBarMorphContentHandoffCoherent(dummy, card, shell)) return false
     }
     return true
 }
@@ -938,6 +1919,7 @@ internal const val StatusBarExpandedTopPadDp = 2
 /**
  * morphVisualTargetW = layoutTargetW − 2*sidePad, coerce ≥ pillW.
  * Envelope (widthIn max) van dung measure/host; shell chi ve card painted ngang.
+ * UU TIEN [statusBarMorphResolveVisualTargetWPx] khi co measured painted.
  */
 internal fun statusBarMorphVisualTargetWPx(
     layoutTargetWPx: Int,
@@ -948,6 +1930,198 @@ internal fun statusBarMorphVisualTargetWPx(
     val visual = layoutTargetWPx - 2 * sidePadPx.coerceAtLeast(0)
     return visual.coerceAtLeast(safePill)
 }
+
+/**
+ * Chon visual W: measured painted top-card (honest) thang side-pad estimate.
+ * [paintedWPx] <=0 → fallback strip sidePad (co the lech right-edge).
+ */
+internal fun statusBarMorphResolveVisualTargetWPx(
+    layoutTargetWPx: Int,
+    sidePadPx: Int,
+    pillWPx: Int,
+    paintedWPx: Int,
+): Int {
+    val safePill = pillWPx.coerceAtLeast(1)
+    if (paintedWPx > safePill) {
+        return paintedWPx.coerceAtMost(layoutTargetWPx.coerceAtLeast(safePill))
+    }
+    return statusBarMorphVisualTargetWPx(layoutTargetWPx, sidePadPx, pillWPx)
+}
+
+/**
+ * Side inset thuc te tu layout vs painted — thay SidePad 12dp khi da do.
+ * Khong am; neu chua do → sidePad fallback.
+ */
+internal fun statusBarMorphResolveSideInsetPx(
+    layoutTargetWPx: Int,
+    paintedWPx: Int,
+    fallbackSidePadPx: Int,
+): Int {
+    if (paintedWPx > 0 && layoutTargetWPx > paintedWPx) {
+        return ((layoutTargetWPx - paintedWPx) / 2).coerceAtLeast(0)
+    }
+    return fallbackSidePadPx.coerceAtLeast(0)
+}
+
+/**
+ * Visual H: painted thang strip top+bottom pad khi measured.
+ */
+internal fun statusBarMorphResolveVisualTargetHPx(
+    layoutTargetHPx: Int,
+    topPadPx: Int,
+    bottomPadPx: Int,
+    pillHPx: Int,
+    paintedHPx: Int,
+): Int {
+    val safePill = pillHPx.coerceAtLeast(1)
+    if (paintedHPx > safePill) {
+        return paintedHPx.coerceAtMost(layoutTargetHPx.coerceAtLeast(safePill))
+    }
+    return statusBarMorphVisualTargetHPx(layoutTargetHPx, topPadPx, bottomPadPx, pillHPx)
+}
+
+/**
+ * p=1 shell vs native painted — |Δ| ≤ epsilonPx moi canh (right edge quan trong).
+ */
+internal fun statusBarMorphShellMatchesPaintedBounds(
+    shellLeftPx: Float,
+    shellTopPx: Float,
+    shellWPx: Float,
+    shellHPx: Float,
+    paintedLeftPx: Float,
+    paintedTopPx: Float,
+    paintedWPx: Float,
+    paintedHPx: Float,
+    epsilonPx: Float = 1f,
+): Boolean {
+    val eps = epsilonPx.coerceAtLeast(0f)
+    if (kotlin.math.abs(shellLeftPx - paintedLeftPx) > eps) return false
+    if (kotlin.math.abs(shellTopPx - paintedTopPx) > eps) return false
+    if (kotlin.math.abs(shellWPx - paintedWPx) > eps) return false
+    if (kotlin.math.abs(shellHPx - paintedHPx) > eps) return false
+    val shellRight = shellLeftPx + shellWPx
+    val paintedRight = paintedLeftPx + paintedWPx
+    return kotlin.math.abs(shellRight - paintedRight) <= eps
+}
+
+/**
+ * Undo host sx/sy → card LOCAL trong host (KHONG + hostWindow origin).
+ *
+ * Truoc (sai): left = hostWindowLeft + (windowLeft-hostWindowLeft)/sx
+ * → WINDOW ABSOLUTE nhiem translation host dang animate (pill→expanded).
+ * Freeze luc host @pill → dest ~source-adjacent → right-edge jump.
+ *
+ * Sau: localLeft = (windowLeft-hostWindowLeft)/sx — on dinh moi frame host.
+ * window*Px trong [StatusBarPaintedCardReportPx] = LOCAL (khong screen).
+ * Dest screen = [statusBarMorphPaintedDestFromLocalInTargetHost].
+ */
+internal fun statusBarMorphPaintedBoundsUndoHostScale(
+    windowLeftPx: Float,
+    windowTopPx: Float,
+    windowRightPx: Float,
+    windowBottomPx: Float,
+    hostWindowLeftPx: Float,
+    hostWindowTopPx: Float,
+    hostSx: Float,
+    hostSy: Float,
+    ownerKey: String = "",
+    contextToken: Int = 0,
+): StatusBarPaintedCardReportPx {
+    val sx = hostSx.coerceAtLeast(1e-4f)
+    val sy = hostSy.coerceAtLeast(1e-4f)
+    val left = (windowLeftPx - hostWindowLeftPx) / sx
+    val top = (windowTopPx - hostWindowTopPx) / sy
+    val right = (windowRightPx - hostWindowLeftPx) / sx
+    val bottom = (windowBottomPx - hostWindowTopPx) / sy
+    val w = (right - left).coerceAtLeast(0f)
+    val h = (bottom - top).coerceAtLeast(0f)
+    return StatusBarPaintedCardReportPx(
+        layoutWPx = w.roundToInt().coerceAtLeast(0),
+        layoutHPx = h.roundToInt().coerceAtLeast(0),
+        windowLeftPx = left,
+        windowTopPx = top,
+        windowRightPx = right,
+        windowBottomPx = bottom,
+        ownerKey = ownerKey,
+        contextToken = contextToken,
+    )
+}
+
+/**
+ * TARGET host physical @ rest day du — tu layout constraints, KHONG moving window.
+ * Host requiredSize(layoutW×H) can TopCenter: left=(maxW−layoutW)/2, top=statusBar topPad.
+ */
+internal fun statusBarMorphExpandedTargetHostPlacementPx(
+    maxWidthPx: Float,
+    layoutTargetWPx: Float,
+    topPadPx: Float,
+): Pair<Float, Float> {
+    val layoutW = layoutTargetWPx.coerceAtLeast(0f)
+    val maxW = maxWidthPx.coerceAtLeast(layoutW)
+    return ((maxW - layoutW) * 0.5f) to topPadPx.coerceAtLeast(0f)
+}
+
+/**
+ * Production endpoint assembly: dest SCREEN = targetHostPlacement + localCardBounds.
+ * Inject vao test — KHONG tautology shellRectFromPainted.
+ * null neu W/H local chua hop le.
+ */
+internal fun statusBarMorphPaintedDestFromLocalInTargetHost(
+    targetHostLeftPx: Float,
+    targetHostTopPx: Float,
+    localLeftPx: Float,
+    localTopPx: Float,
+    localRightPx: Float,
+    localBottomPx: Float,
+): StatusBarMorphVisualRectPx? =
+    statusBarMorphPaintedDestinationOrNull(
+        paintedLeftPx = targetHostLeftPx + localLeftPx,
+        paintedTopPx = targetHostTopPx + localTopPx,
+        paintedRightPx = targetHostLeftPx + localRightPx,
+        paintedBottomPx = targetHostTopPx + localBottomPx,
+    )
+
+/**
+ * Freeze painted LRTB atomic: chi khi placement target san + local W/H > 1.
+ * Fallback: caller giu dest cu / NaN center — KHONG overwrite bang moving host.
+ */
+internal fun statusBarMorphPaintedDestReadyForFreeze(
+    targetHostPlacementReady: Boolean,
+    localLeftPx: Float,
+    localTopPx: Float,
+    localRightPx: Float,
+    localBottomPx: Float,
+): Boolean {
+    if (!targetHostPlacementReady) return false
+    val w = localRightPx - localLeftPx
+    val h = localBottomPx - localTopPx
+    return w > 1f && h > 1f && localLeftPx.isFinite() && localTopPx.isFinite()
+}
+
+/**
+ * Chon painted bounds the top (isTop && !isLeaving) — under bi loai.
+ * [candidates]: Pair(isSelectedTop, report); null neu khong co top.
+ */
+internal fun statusBarMorphSelectTopPaintedReport(
+    candidates: List<Pair<Boolean, StatusBarPaintedCardReportPx>>,
+): StatusBarPaintedCardReportPx? =
+    candidates.firstOrNull { it.first }?.second
+
+/**
+ * Shell p=1 rect tu painted LRTB host-local (khong tautology shellW==shellW).
+ */
+internal fun statusBarMorphShellRectFromPaintedHostLocal(
+    paintedLeftPx: Float,
+    paintedTopPx: Float,
+    paintedRightPx: Float,
+    paintedBottomPx: Float,
+): FloatArray =
+    floatArrayOf(
+        paintedLeftPx,
+        paintedTopPx,
+        (paintedRightPx - paintedLeftPx).coerceAtLeast(0f),
+        (paintedBottomPx - paintedTopPx).coerceAtLeast(0f),
+    )
 
 /**
  * morphVisualTargetH = layoutTargetH − topPad − bottomPad, coerce ≥ pillH.
@@ -1036,7 +2210,7 @@ internal fun statusBarMorphShellContentWidthContinuous(
 
 /**
  * Visible card bbox tren SCREEN (sau host scale): interpolate pill → card painted.
- * width/height = visualTarget * sx/sy. p=0 == pill; p=1 centered + [targetVisualTopPx].
+ * width/height = visualTarget * sx/sy. p=0 == pill; p=1 painted LRTB hoac center fallback.
  */
 internal data class StatusBarMorphVisualRectPx(
     val leftPx: Float,
@@ -1044,6 +2218,36 @@ internal data class StatusBarMorphVisualRectPx(
     val widthPx: Float,
     val heightPx: Float,
 )
+
+/**
+ * Dich p=1 tu frozen painted LRTB (production) — null neu chua do.
+ * Caller: currentVisualRect / test endpoint ≠ tautology self-copy.
+ */
+internal fun statusBarMorphPaintedDestinationOrNull(
+    paintedLeftPx: Float,
+    paintedTopPx: Float,
+    paintedRightPx: Float,
+    paintedBottomPx: Float,
+): StatusBarMorphVisualRectPx? {
+    val w = paintedRightPx - paintedLeftPx
+    val h = paintedBottomPx - paintedTopPx
+    if (!(w > 1f) || !(h > 1f)) return null
+    if (!paintedLeftPx.isFinite() || !paintedTopPx.isFinite()) return null
+    return StatusBarMorphVisualRectPx(
+        leftPx = paintedLeftPx,
+        topPx = paintedTopPx,
+        widthPx = w,
+        heightPx = h,
+    )
+}
+
+/**
+ * Guess center left (maxW − visualW)/2 — dung khi CHUA painted; negative test vs LRTB that.
+ */
+internal fun statusBarMorphGuessedCenterLeftPx(
+    maxWidthPx: Float,
+    visualTargetWPx: Float,
+): Float = (maxWidthPx - visualTargetWPx) * 0.5f
 
 internal fun statusBarMorphLerpVisualRectPx(
     pOffset: Float,
@@ -1057,13 +2261,32 @@ internal fun statusBarMorphLerpVisualRectPx(
     sy: Float,
     maxWidthPx: Float,
     targetVisualTopPx: Float,
+    /**
+     * Dich LEFT painted (host-relative). NaN = fallback center (maxW−visualTargetW)/2.
+     * Task-034: KHONG center khi da freeze LRTB — tranh right-edge jump.
+     */
+    paintedTargetLeftPx: Float = Float.NaN,
+    /** Dich TOP painted; NaN = [targetVisualTopPx]. */
+    paintedTargetTopPx: Float = Float.NaN,
 ): StatusBarMorphVisualRectPx {
     val vw = statusBarMorphVisibleWidthPx(visualTargetWPx, sx)
     val vh = statusBarMorphVisibleHeightPx(visualTargetHPx, sy)
     val left0 = pillLeftPx
     val top0 = pillTopPx
-    val left1 = (maxWidthPx - vw) * 0.5f
-    val top1 = targetVisualTopPx
+    // Neo left dich: painted L truoc; khong painted → center on dinh theo visualTargetW (p=1).
+    // Truoc: early p vw~pill → left1~center man → drift; task-033 ghi LRTB nhung khong doc.
+    val left1 =
+        if (paintedTargetLeftPx.isFinite()) {
+            paintedTargetLeftPx
+        } else {
+            statusBarMorphGuessedCenterLeftPx(maxWidthPx, visualTargetWPx)
+        }
+    val top1 =
+        if (paintedTargetTopPx.isFinite()) {
+            paintedTargetTopPx
+        } else {
+            targetVisualTopPx
+        }
     val left =
         when {
             pOffset >= 1f -> left1
@@ -1395,10 +2618,10 @@ internal fun morphOffsetTopLeftStatusBar(
     maxWidthPx: Float,
     targetTopPx: Float,
 ): Pair<Float, Float> {
-    val visualW = targetWPx * sx.coerceAtLeast(MorphScaleFloor)
+    // sx giu signature (host scale); left dich ON DINH theo targetW — khong (maxW-vw(p))/2.
     val left0 = originLeftPx
     val top0 = originTopPx
-    val left1 = (maxWidthPx - visualW) * 0.5f
+    val left1 = (maxWidthPx - targetWPx) * 0.5f
     val top1 = targetTopPx
     val left =
         when {
@@ -1413,4 +2636,386 @@ internal fun morphOffsetTopLeftStatusBar(
             else -> morphLerp(top0, top1, pOffset)
         }
     return left to top
+}
+
+// --- task-037: painted morph-frozen vs selected-rest (atomic owner+LRTB) ---
+
+/**
+ * Rect painted gan event owner + measure-context — W/H/LRTB atomic.
+ * Tach snapshot MOT morph run khoi selected rest / stack swap.
+ */
+data class StatusBarOwnedPaintedRectPx(
+    val ownerKey: String,
+    val contextToken: Int,
+    val leftPx: Float,
+    val topPx: Float,
+    val rightPx: Float,
+    val bottomPx: Float,
+) {
+    val widthPx: Float
+        get() = (rightPx - leftPx).coerceAtLeast(0f)
+    val heightPx: Float
+        get() = (bottomPx - topPx).coerceAtLeast(0f)
+    val widthInt: Int
+        get() = widthPx.roundToInt()
+    val heightInt: Int
+        get() = heightPx.roundToInt()
+
+    fun isValidAbovePill(pillWPx: Int, pillHPx: Int): Boolean =
+        widthInt > pillWPx.coerceAtLeast(1) && heightInt > pillHPx.coerceAtLeast(1)
+}
+
+/** Provenance shell visual — DEBUG/trace; khong claim runtime PASS. */
+enum class StatusBarPaintedRectProvenance {
+    MorphFrozenRun,
+    SelectedRest,
+    LiveContinuity,
+    None,
+}
+
+data class StatusBarShellPaintedRectChoice(
+    val rect: StatusBarOwnedPaintedRectPx?,
+    val provenance: StatusBarPaintedRectProvenance,
+)
+
+/**
+ * Reporter stale: under / sai owner / sai context → reject (khong overwrite).
+ * [reportContextToken]=0 → bo qua check token (legacy).
+ */
+fun statusBarAcceptPaintedCardReport(
+    reportOwnerKey: String,
+    reportContextToken: Int,
+    activeOwnerKey: String,
+    activeContextToken: Int,
+    isSelectedTop: Boolean,
+): Boolean {
+    if (!isSelectedTop) return false
+    if (reportOwnerKey.isEmpty() || activeOwnerKey.isEmpty()) return false
+    if (reportOwnerKey != activeOwnerKey) return false
+    if (
+        reportContextToken != 0 &&
+            activeContextToken != 0 &&
+            reportContextToken != activeContextToken
+    ) {
+        return false
+    }
+    return true
+}
+
+/**
+ * Co duoc ghi morph-frozen painted?
+ * - Expanded at-rest: KHONG (tranh stick the mo dau).
+ * - Morph running: chi Capture khi frozen chua valid (fill lan dau / reopen).
+ * - Staging (!running && !atRest): Capture (freeze truoc drive).
+ */
+enum class StatusBarMorphFrozenPaintedWrite {
+    Hold,
+    Capture,
+}
+
+fun statusBarMorphFrozenPaintedWritePolicy(
+    morphTransitionRunning: Boolean,
+    morphExpandedAtRest: Boolean,
+    morphFrozenValid: Boolean,
+): StatusBarMorphFrozenPaintedWrite {
+    if (morphExpandedAtRest) return StatusBarMorphFrozenPaintedWrite.Hold
+    if (morphTransitionRunning) {
+        return if (morphFrozenValid) {
+            StatusBarMorphFrozenPaintedWrite.Hold
+        } else {
+            StatusBarMorphFrozenPaintedWrite.Capture
+        }
+    }
+    return StatusBarMorphFrozenPaintedWrite.Capture
+}
+
+/**
+ * Roi at-rest vao morph (dong sau swap): rebind frozen tu selected hien tai.
+ * true → copy selectedRest → morphFrozen (atomic), khong giu frozen mo dau.
+ * [selectedRestValidForOwner] PHAI kem active context (xem
+ * [statusBarSelectedRestValidForRebind]) — continuity pending KHONG rebind.
+ */
+fun statusBarMorphFrozenRebindFromSelectedOnLeaveRest(
+    wasExpandedAtRest: Boolean,
+    morphExpandedAtRest: Boolean,
+    selectedRestValidForOwner: Boolean,
+): Boolean = wasExpandedAtRest && !morphExpandedAtRest && selectedRestValidForOwner
+
+/**
+ * contextToken khop active? Token 0 (legacy) → bo qua check.
+ */
+fun statusBarOwnedPaintedRectMatchesActiveContext(
+    rect: StatusBarOwnedPaintedRectPx?,
+    activeContextToken: Int,
+): Boolean {
+    if (rect == null) return false
+    if (activeContextToken == 0 || rect.contextToken == 0) return true
+    return rect.contextToken == activeContextToken
+}
+
+/**
+ * Exact selected-rest/live: owner + active context + W/H > pill.
+ * Sai context → null (caller dung continuity, khong mark ready).
+ */
+fun statusBarOwnedPaintedRectExactForOwner(
+    rect: StatusBarOwnedPaintedRectPx?,
+    selectedOwnerKey: String,
+    activeContextToken: Int,
+    pillWPx: Int,
+    pillHPx: Int,
+): StatusBarOwnedPaintedRectPx? =
+    rect?.takeIf {
+        it.ownerKey == selectedOwnerKey &&
+            it.isValidAbovePill(pillWPx, pillHPx) &&
+            statusBarOwnedPaintedRectMatchesActiveContext(it, activeContextToken)
+    }
+
+/**
+ * Destination do that cho frame vua mo xong va open-glass.
+ *
+ * Thu tu: selected-rest exact → live-painted exact; chua do thi KHONG ready.
+ * Natural/wrapper estimate **khong** truyen vao day — cam doi lot measuredExact
+ * (flash shared 990→1012→990 khi seed natural vao selectedRest store).
+ */
+data class StatusBarMeasuredSelectedDestination(
+    /** Surface do that (rest store hoac live painted) — shell/openGlass/ACK. */
+    val measuredExact: StatusBarOwnedPaintedRectPx?,
+) {
+    /** Chi ready khi co surface do that khop owner va context. */
+    val isMeasuredReady: Boolean
+        get() = measuredExact != null
+}
+
+/**
+ * SSOT OverlayContent: chon dest measured truoc moi natural estimate.
+ * Natural chi dung premeasure/layout ngoai ham nay — khong write selectedRest.
+ */
+fun statusBarResolveMeasuredSelectedDestination(
+    selectedRestOwned: StatusBarOwnedPaintedRectPx?,
+    livePaintedOwned: StatusBarOwnedPaintedRectPx?,
+    selectedOwnerKey: String,
+    activeContextToken: Int,
+    pillWPx: Int,
+    pillHPx: Int,
+): StatusBarMeasuredSelectedDestination {
+    val measuredExact =
+        statusBarOwnedPaintedRectExactForOwner(
+            rect = selectedRestOwned,
+            selectedOwnerKey = selectedOwnerKey,
+            activeContextToken = activeContextToken,
+            pillWPx = pillWPx,
+            pillHPx = pillHPx,
+        ) ?: statusBarOwnedPaintedRectExactForOwner(
+            rect = livePaintedOwned,
+            selectedOwnerKey = selectedOwnerKey,
+            activeContextToken = activeContextToken,
+            pillWPx = pillWPx,
+            pillHPx = pillHPx,
+        )
+    return StatusBarMeasuredSelectedDestination(measuredExact)
+}
+
+/**
+ * Rebind frozen khi leave rest — chi exact owner+context (khong freeze continuity).
+ */
+fun statusBarSelectedRestValidForRebind(
+    rect: StatusBarOwnedPaintedRectPx?,
+    selectedOwnerKey: String,
+    activeContextToken: Int,
+    pillWPx: Int,
+    pillHPx: Int,
+): Boolean =
+    statusBarOwnedPaintedRectExactForOwner(
+        rect = rect,
+        selectedOwnerKey = selectedOwnerKey,
+        activeContextToken = activeContextToken,
+        pillWPx = pillWPx,
+        pillHPx = pillHPx,
+    ) != null
+
+/**
+ * Cap nhat atomic record khi doi owner/context/LRTB (khong chi W/H).
+ */
+fun statusBarOwnedPaintedRectNeedsAtomicReplace(
+    current: StatusBarOwnedPaintedRectPx?,
+    candidate: StatusBarOwnedPaintedRectPx,
+): Boolean {
+    if (current == null) return true
+    return current.ownerKey != candidate.ownerKey ||
+        current.contextToken != candidate.contextToken ||
+        current.leftPx != candidate.leftPx ||
+        current.topPx != candidate.topPx ||
+        current.rightPx != candidate.rightPx ||
+        current.bottomPx != candidate.bottomPx
+}
+
+/**
+ * Chon rect shell visual: morph-frozen CHI khi morph run/staging;
+ * expanded rest → selected owner+context (hoac continuity pending), KHONG frozen mo dau.
+ *
+ * [activeContextToken]: SelectedRest/exact live PHAI khop; sai context → LiveContinuity
+ * (giu W/H tam, KHONG mark ready / KHONG freeze nhu dest moi).
+ * MorphFrozenRun: pin snapshot theo rules cu — KHONG validate moving context mid-run
+ * (tranh zero/pill snap).
+ */
+fun statusBarSelectShellPaintedRect(
+    morphTransitionRunning: Boolean,
+    morphExpandedAtRest: Boolean,
+    selectedOwnerKey: String,
+    morphFrozen: StatusBarOwnedPaintedRectPx?,
+    selectedRest: StatusBarOwnedPaintedRectPx?,
+    livePainted: StatusBarOwnedPaintedRectPx?,
+    pillWPx: Int,
+    pillHPx: Int,
+    activeContextToken: Int = 0,
+): StatusBarShellPaintedRectChoice {
+    fun valid(r: StatusBarOwnedPaintedRectPx?): StatusBarOwnedPaintedRectPx? =
+        r?.takeIf { it.isValidAbovePill(pillWPx, pillHPx) }
+
+    val frozen = valid(morphFrozen)
+    val rest = valid(selectedRest)
+    val live = valid(livePainted)
+    val restExact =
+        statusBarOwnedPaintedRectExactForOwner(
+            rest,
+            selectedOwnerKey,
+            activeContextToken,
+            pillWPx,
+            pillHPx,
+        )
+    val liveExact =
+        statusBarOwnedPaintedRectExactForOwner(
+            live,
+            selectedOwnerKey,
+            activeContextToken,
+            pillWPx,
+            pillHPx,
+        )
+
+    if (morphExpandedAtRest) {
+        when {
+            restExact != null ->
+                return StatusBarShellPaintedRectChoice(
+                    restExact,
+                    StatusBarPaintedRectProvenance.SelectedRest,
+                )
+            liveExact != null ->
+                return StatusBarShellPaintedRectChoice(
+                    liveExact,
+                    StatusBarPaintedRectProvenance.SelectedRest,
+                )
+            // Pending: owner moi / context moi chua measure — continuity, khong pill.
+            rest != null ->
+                return StatusBarShellPaintedRectChoice(
+                    rest,
+                    StatusBarPaintedRectProvenance.LiveContinuity,
+                )
+            live != null ->
+                return StatusBarShellPaintedRectChoice(
+                    live,
+                    StatusBarPaintedRectProvenance.LiveContinuity,
+                )
+            else ->
+                return StatusBarShellPaintedRectChoice(
+                    null,
+                    StatusBarPaintedRectProvenance.None,
+                )
+        }
+    }
+    if (morphTransitionRunning) {
+        // Pin frozen — khong doi activeContext mid-run.
+        return if (frozen != null) {
+            StatusBarShellPaintedRectChoice(
+                frozen,
+                StatusBarPaintedRectProvenance.MorphFrozenRun,
+            )
+        } else {
+            StatusBarShellPaintedRectChoice(null, StatusBarPaintedRectProvenance.None)
+        }
+    }
+    // Staging: prefer frozen (pin), else exact selected/live, else continuity.
+    when {
+        frozen != null ->
+            return StatusBarShellPaintedRectChoice(
+                frozen,
+                StatusBarPaintedRectProvenance.MorphFrozenRun,
+            )
+        restExact != null ->
+            return StatusBarShellPaintedRectChoice(
+                restExact,
+                StatusBarPaintedRectProvenance.SelectedRest,
+            )
+        rest != null ->
+            return StatusBarShellPaintedRectChoice(
+                rest,
+                StatusBarPaintedRectProvenance.LiveContinuity,
+            )
+        liveExact != null ->
+            return StatusBarShellPaintedRectChoice(
+                liveExact,
+                StatusBarPaintedRectProvenance.SelectedRest,
+            )
+        live != null ->
+            return StatusBarShellPaintedRectChoice(
+                live,
+                StatusBarPaintedRectProvenance.LiveContinuity,
+            )
+        else ->
+            return StatusBarShellPaintedRectChoice(
+                null,
+                StatusBarPaintedRectProvenance.None,
+            )
+    }
+}
+
+/** Tao owned rect tu LRTB atomic — null neu W/H khong hop le. */
+fun statusBarOwnedPaintedRectOrNull(
+    ownerKey: String,
+    contextToken: Int,
+    leftPx: Float,
+    topPx: Float,
+    rightPx: Float,
+    bottomPx: Float,
+): StatusBarOwnedPaintedRectPx? {
+    if (ownerKey.isEmpty()) return null
+    val dest =
+        statusBarMorphPaintedDestinationOrNull(leftPx, topPx, rightPx, bottomPx) ?: return null
+    return StatusBarOwnedPaintedRectPx(
+        ownerKey = ownerKey,
+        contextToken = contextToken,
+        leftPx = dest.leftPx,
+        topPx = dest.topPx,
+        rightPx = dest.leftPx + dest.widthPx,
+        bottomPx = dest.topPx + dest.heightPx,
+    )
+}
+
+/**
+ * Rest selected rect tu natural W/H (cache 031-033) + target host — khi painted
+ * con bi shell cu constrain. LRTB = host + card-local origin.
+ */
+fun statusBarSelectedRestRectFromNaturalOrNull(
+    ownerKey: String,
+    contextToken: Int,
+    naturalWPx: Int,
+    naturalHPx: Int,
+    targetHostLeftPx: Float,
+    targetHostTopPx: Float,
+    cardLocalLeftPx: Float,
+    cardLocalTopPx: Float,
+    pillWPx: Int,
+    pillHPx: Int,
+): StatusBarOwnedPaintedRectPx? {
+    if (ownerKey.isEmpty()) return null
+    if (naturalWPx <= pillWPx || naturalHPx <= pillHPx) return null
+    val left = targetHostLeftPx + cardLocalLeftPx
+    val top = targetHostTopPx + cardLocalTopPx
+    return statusBarOwnedPaintedRectOrNull(
+        ownerKey = ownerKey,
+        contextToken = contextToken,
+        leftPx = left,
+        topPx = top,
+        rightPx = left + naturalWPx.toFloat(),
+        bottomPx = top + naturalHPx.toFloat(),
+    )
 }

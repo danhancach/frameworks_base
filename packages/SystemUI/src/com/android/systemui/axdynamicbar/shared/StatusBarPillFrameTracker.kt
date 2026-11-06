@@ -36,6 +36,10 @@ internal data class StatusBarPillFrame(
 /**
  * Lifecycle rect pill StatusBar — tach lastObserved vs morph freeze.
  * Pure/state: test duoc khong can Interactor / Compose.
+ *
+ * morphFrame + morphOwnerId la cap atomic — CHI doi khi morphFrame doi
+ * (seed / collapse retarget / settle / invalidate / capture ghi morph).
+ * Cam relabel frozen geometry bang lastObservedOwnerId moi.
  */
 internal class StatusBarPillFrameTracker(
     private val maxWidthPx: Int = 400,
@@ -47,6 +51,9 @@ internal class StatusBarPillFrameTracker(
         private set
     /** Owner id lan capture thanh cong gan nhat — doi owner → chap nhan natural W moi. */
     var lastObservedOwnerId: String? = null
+        private set
+    /** Owner cua [morphFrame] — publish/same-owner guard dung cap nay, khong lastObserved. */
+    var morphOwnerId: String? = null
         private set
 
     fun capture(
@@ -82,29 +89,30 @@ internal class StatusBarPillFrameTracker(
         if (ownerId != null) {
             lastObservedOwnerId = ownerId
         }
+        val observedOwner = lastObservedOwnerId
 
         val cur = morphFrame
-        // Expand: freeze start rect — khong ghi de mid-flight.
+        // Expand: freeze start rect+owner — khong ghi de / relabel mid-flight.
         if (cur.isValid && intentExpanded) {
             return
         }
         // Collapse + slot an: remasure dest (placeholder co the shift).
         if (cur.isValid && pillSuppressed && !intentExpanded) {
-            morphFrame = next
+            setMorphOwnedFrame(next, observedOwner)
             return
         }
-        // Suppress + van intent (cho shell align): giu rect goc.
+        // Suppress + van intent (cho shell align): giu rect+owner goc.
         if (cur.isValid && pillSuppressed) {
             return
         }
-        morphFrame = next
+        setMorphOwnedFrame(next, observedOwner)
     }
 
     /** Truoc moi expand: seed morph tu lastObserved (ke ca khi OGP khong re-fire). */
     fun seedMorphFromObserved() {
         val obs = lastObserved
         if (obs.isValid) {
-            morphFrame = obs
+            setMorphOwnedFrame(obs, lastObservedOwnerId)
         }
     }
 
@@ -115,21 +123,40 @@ internal class StatusBarPillFrameTracker(
     fun notifyCollapseSettled() {
         val obs = lastObserved
         if (obs.isValid) {
-            morphFrame = obs
+            setMorphOwnedFrame(obs, lastObservedOwnerId)
         }
     }
 
     /** Unmount / keyguard / rotation-config / destroyed owner. */
     fun invalidate() {
         lastObserved = StatusBarPillFrame()
-        morphFrame = StatusBarPillFrame()
         lastObservedOwnerId = null
+        setMorphOwnedFrame(StatusBarPillFrame(), null)
+    }
+
+    /** Ghi morphFrame + morphOwnerId cung luc — publish atomic. */
+    private fun setMorphOwnedFrame(frame: StatusBarPillFrame, ownerId: String?) {
+        morphFrame = frame
+        morphOwnerId = ownerId
+    }
+
+    /**
+     * Commit truc tiep morphFrame + morphOwnerId tu ket qua probe layout thuc te cua B.
+     * Chi chap nhan khi frame hop le va ownerId khong rong.
+     */
+    fun setMorphFrameForCollapse(frame: StatusBarPillFrame, ownerId: String) {
+        if (!frame.isValid || ownerId.isEmpty()) return
+        setMorphOwnedFrame(frame, ownerId)
     }
 }
 
 /**
  * Origin pill trong host overlay — KHONG (maxW-pillW)/2 khi thieu capture
  * (tranh morph tu giua man khi OGP chua re-fire).
+ *
+ * Luu y: khi thieu capture tra (0, topPad) — CHI an toan cho expand wait.
+ * Collapse / owner-ended CAM dung fabricated nay (ghost pill duoi clock) —
+ * xem [statusBarMorphShouldTerminalDismissNoDestination].
  */
 internal fun statusBarMorphPillOriginInHostPx(
     capturedLeft: Int,
@@ -151,8 +178,68 @@ internal fun statusBarMorphPillOriginInHostPx(
 }
 
 /**
+ * Terminal dismiss: khong con destination pill hop le (owner ended).
+ * Khong morph/handback toi fabricated (0, topPad) / 56dp; clear overlay ngay.
+ */
+internal fun statusBarMorphShouldTerminalDismissNoDestination(
+    ownerEndedAuthoritative: Boolean,
+): Boolean = ownerEndedAuthoritative
+
+/**
+ * Destination owner cho collapse morph/handback — uu tien live selected,
+ * khong stale frozen owner da dismiss. Owner-ended → null (terminal).
+ */
+internal fun statusBarMorphCollapseDestinationOwnerId(
+    ownerEndedAuthoritative: Boolean,
+    liveSelectedOwnerId: String?,
+    frozenOwnerId: String?,
+): String? {
+    if (ownerEndedAuthoritative) return null
+    return liveSelectedOwnerId?.takeIf { it.isNotEmpty() }
+        ?: frozenOwnerId?.takeIf { it.isNotEmpty() }
+}
+
+/**
+ * Collapse visual abort (khong mount host ve fabricated 0,topPad):
+ * - owner-ended (terminal empty)
+ * - collapsing + thieu capture (ke ca con live dest ID) — live ID ≠ measured rect
+ * Co frozen geometry same-owner → [hasFrozenGeometryForLiveOwner]=true cho phep
+ * neo bang frozen, khong fabricate.
+ */
+internal fun statusBarMorphShouldAbortCollapseVisual(
+    ownerEndedAuthoritative: Boolean,
+    hasValidPillCapture: Boolean,
+    collapsing: Boolean,
+    hasLiveDestinationOwner: Boolean,
+    hasFrozenGeometryForLiveOwner: Boolean = false,
+): Boolean {
+    if (ownerEndedAuthoritative) return true
+    if (!collapsing) return false
+    if (hasValidPillCapture) return false
+    if (hasFrozenGeometryForLiveOwner && hasLiveDestinationOwner) return false
+    // Thieu capture + khong frozen same-owner — abort (cam 0,topPad).
+    return true
+}
+
+/**
+ * Capture chi hop le cho collapse khi owner match destination live.
+ * Stale frame owner da dismiss → false (khong neo morph toi geometry cu).
+ */
+internal fun statusBarMorphCaptureMatchesDestination(
+    hasValidCapture: Boolean,
+    captureOwnerId: String?,
+    destinationOwnerId: String?,
+): Boolean {
+    if (!hasValidCapture) return false
+    if (destinationOwnerId.isNullOrEmpty()) return false
+    if (captureOwnerId.isNullOrEmpty()) return false
+    return captureOwnerId == destinationOwnerId
+}
+
+/**
  * First-frame handoff: chi an pill that khi co rect that + shell XY/WH aligned,
  * hoac morph da chay tu origin that (tranh 2-pill). KHONG suppress tren center fallback.
+ * Suppress + slot reclaim dong thoi (khong prelude) — Expansion.confirmPillSuppressed.
  */
 internal fun statusBarMorphShouldConfirmPillSuppressed(
     hasValidPillRect: Boolean,

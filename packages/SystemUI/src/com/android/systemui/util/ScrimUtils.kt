@@ -48,6 +48,14 @@ class ScrimUtils private constructor(context: Context?) {
         fun setPulsing(pulsing: Boolean) {}
         fun onNotificationPosted(sbn: StatusBarNotification) {}
         fun onNotificationRemoved(sbn: StatusBarNotification) {}
+        /**
+         * Removal co reason (NotificationListenerService.REASON_*).
+         * Mac dinh uy thac ban khong reason — listener cu khong can override.
+         * @param reason -1 = unknown (path cu / chua truyen).
+         */
+        fun onNotificationRemoved(sbn: StatusBarNotification, reason: Int) {
+            onNotificationRemoved(sbn)
+        }
         fun onKeyguardLayoutChanged() {}
         fun onKeyguardAlphaChanged(alpha: Float) {}
     }
@@ -271,7 +279,12 @@ class ScrimUtils private constructor(context: Context?) {
     }
 
     fun onNotificationRemoved(sbn: StatusBarNotification) {
-        listeners.notifyOnMain { it.onNotificationRemoved(sbn) }
+        onNotificationRemoved(sbn, /* reason= */ -1)
+    }
+
+    /** Truyen REASON_* tu NotificationListener — listener moi doc reason. */
+    fun onNotificationRemoved(sbn: StatusBarNotification, reason: Int) {
+        listeners.notifyOnMain { it.onNotificationRemoved(sbn, reason) }
     }
 
     private var keyguardRootView: View? = null

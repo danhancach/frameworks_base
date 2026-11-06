@@ -48,6 +48,7 @@ import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableIntState
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
@@ -83,11 +84,15 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.awaitCancellation
 import com.android.compose.modifiers.thenIf
 import com.android.compose.theme.PlatformTheme
 import com.android.compose.theme.colorAttr
 import com.android.keyguard.AlphaOptimizedLinearLayout
 import com.android.systemui.Flags
+import com.android.systemui.axdynamicbar.ui.AxDynamicBarChipViewModel
+import com.android.systemui.axdynamicbar.ui.compose.AxDynamicBarChip
 import com.android.systemui.clock.ClockModernization
 import com.android.systemui.clock.ui.composable.Clock
 import com.android.systemui.clock.ui.viewmodel.AmPmStyle
@@ -112,8 +117,6 @@ import com.android.systemui.scene.shared.flag.SceneContainerFlag
 import com.android.systemui.scene.ui.view.WindowRootView
 import com.android.systemui.shade.ui.composable.VariableDayDate
 import com.android.systemui.statusbar.StatusBarAlwaysUseRegionSampling
-import com.android.systemui.axdynamicbar.ui.AxDynamicBarChipViewModel
-import com.android.systemui.axdynamicbar.ui.compose.AxDynamicBarChip
 import com.android.systemui.statusbar.chips.ui.compose.OngoingActivityChips
 import com.android.systemui.statusbar.core.NewStatusBarIcons
 import com.android.systemui.statusbar.core.StatusBarEventForwardingModernization
@@ -137,6 +140,7 @@ import com.android.systemui.statusbar.pipeline.battery.ui.viewmodel.BatteryViewM
 import com.android.systemui.statusbar.pipeline.shared.ui.binder.HomeStatusBarIconBlockListBinder
 import com.android.systemui.statusbar.pipeline.shared.ui.binder.HomeStatusBarTouchExclusionRegionBinder
 import com.android.systemui.statusbar.pipeline.shared.ui.binder.HomeStatusBarViewBinder
+import com.android.systemui.statusbar.pipeline.shared.ui.model.VisibilityModel
 import com.android.systemui.statusbar.quickactions.shared.model.QuickActionChipId
 import com.android.systemui.statusbar.quickactions.shared.model.QuickActionChipModel
 import com.android.systemui.statusbar.quickactions.ui.compose.QuickActionChipsContainer
@@ -159,7 +163,6 @@ import javax.inject.Inject
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.DisposableHandle
-import kotlinx.coroutines.awaitCancellation
 
 /** Factory to simplify the dependency management for [StatusBarRoot] */
 @PerDisplaySingleton
@@ -723,6 +726,17 @@ private fun addStartSideComposable(
 
                 if (ClockModernization.isEnabled) {
                     clockView.visibility = View.GONE
+                    // Compose clock: doc clockNudgeTranslationX tu chip spring 2 pha —
+                    // KHONG sample slot linearT (finish doc lap ~364ms vs slot ~500ms).
+                    val clockVisibility by
+                        statusBarViewModel.isClockVisible.collectAsStateWithLifecycle(
+                            initialValue = VisibilityModel(View.GONE, shouldAnimateChange = false)
+                        )
+                    var composeClockPlaced by remember { mutableStateOf(false) }
+                    val slotExpansion = axDynamicBarChipViewModel.statusBarExpansion
+                    val composeClockNudgeX = slotExpansion.clockNudgeTranslationX
+                    val clockShown =
+                        clockVisibility.visibility == View.VISIBLE && composeClockPlaced
                     WithAdaptiveTint(
                         isDarkProvider = { bounds ->
                             statusBarViewModel.areaDark.isDarkTheme(bounds)
@@ -734,7 +748,14 @@ private fun addStartSideComposable(
                             modifier =
                                 Modifier.padding(end = 2.dp)
                                     .wrapContentSize()
+                                    .graphicsLayer {
+                                        translationX =
+                                            if (clockShown) composeClockNudgeX else 0f
+                                    }
                                     .onGloballyPositioned { coordinates ->
+                                        composeClockPlaced =
+                                            coordinates.size.width > 0 &&
+                                                coordinates.size.height > 0
                                         val boundsInWindow = coordinates.boundsInWindow()
                                         val bounds =
                                             Rect(
@@ -854,9 +875,13 @@ private fun addStartSideComposable(
     // NIC van do full width container -> overflow DOT sai + khoang trong. Luon chen
     // composeView lam anh em LinearLayout truoc notif container de NIC do dung phan con lai.
     //
-    // Icon reflow (task-028): CAM GONE ca ComposeView (clock/date/OAC chung cay).
-    // AxDynamicBarChip reclaim CHI width slot sau overlay handoff → LinearLayout
-    // giao phan con lai cho start_side_notif_and_chip_container / NIC.
+    // Icon reflow (task-028 / task-010/011): CAM GONE ca ComposeView (clock/date/OAC chung cay).
+    // Co che NIC (task-015/016): Chip `.layout` measure natural trong ngan sach
+    // widthIn(chipsMaxWidth) — KHONG Infinity bypass; KHONG max=occupied animate.
+    // StatusBarChipNativeOccupiedBridge requestLayout host/parent khi desired occupied doi —
+    // CAM set LayoutParams.width = pill (clock/date chung ComposeView). width0 an slot, giu host.
+    // Far-right system icons dung yen (khong per-icon fake translation).
+    // WRAP_CONTENT/NIC runtime con USER_PENDING — khong claim PASS.
     val notificationIconAreaIndex =
         startSideExceptHeadsUp.indexOfChild(
             startSideExceptHeadsUp.findViewById(R.id.start_side_notif_and_chip_container)

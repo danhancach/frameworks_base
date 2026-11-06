@@ -12,6 +12,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import kotlin.math.min
 import com.android.axion.blur.AxBlurSurfaceDefaults
+import com.android.axion.blur.AxBlurSurfacePaintKind
 import com.android.axion.blur.axBlurBackground
 import com.android.systemui.blur.AxSystemFrost
 import androidx.compose.animation.ContentTransform
@@ -63,15 +64,21 @@ import androidx.compose.material3.ripple
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.Alignment
 import kotlinx.coroutines.delay
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -176,6 +183,138 @@ internal const val AlphaGlass = 0.72f
  */
 internal val LocalBlurAlpha = compositionLocalOf { 1f }
 
+/**
+ * STATUS BAR morph: shared glass owner present (morph host).
+ * Tach LocalKeyguardYieldGlassToMorph — khong dam keyguard/AOD.
+ * islandCardSurface: yield=true → TOP selected FG-only; under giu blur.
+ * Task-041: expanded stack yield=false (moi card giu islandBlur local);
+ * chi pill↔expanded morph moi yield shared shell.
+ */
+internal val LocalStatusBarYieldGlassToMorph = staticCompositionLocalOf { false }
+
+/**
+ * Open transfer (task-043/045): top card dang await destination surface.
+ * true → AxBlurSurface destination listener (native HOAC fallback ve that);
+ * false sau Complete. KHONG content-only / alpha0; KHONG fake native khi fallback.
+ */
+internal val LocalStatusBarOpenGlassAwaitDestinationDraw = staticCompositionLocalOf { false }
+
+/** Session gen active cho destination draw report (0 = khong await). */
+internal val LocalStatusBarOpenGlassDestinationSessionGen = staticCompositionLocalOf { 0 }
+
+/**
+ * Callback sau surface local ve that (NativeBackdrop | FallbackSurfaceRendered, α>0).
+ * layout W/H = local size (khong window transformed). KHONG GPU/SF ACK.
+ */
+internal data class StatusBarOpenGlassDestinationDrawReport(
+    val sessionGen: Int,
+    val ownerKey: String,
+    val contextToken: Int,
+    val layoutWidthPx: Float = 0f,
+    val layoutHeightPx: Float = 0f,
+    val nativeBackdropDrawn: Boolean = false,
+    val blurSurfaceAlpha: Float = 0f,
+    val paintKind: StackOpenGlassDestinationPaintKind =
+        if (nativeBackdropDrawn) {
+            StackOpenGlassDestinationPaintKind.NativeBackdrop
+        } else {
+            StackOpenGlassDestinationPaintKind.NoSurface
+        },
+    val fallbackSurfaceRendered: Boolean = false,
+)
+
+internal val LocalStatusBarOpenGlassDestinationDrawReporter =
+    staticCompositionLocalOf<((StatusBarOpenGlassDestinationDrawReport) -> Unit)?> { null }
+
+/**
+ * true = the selected top (isTop && !isLeaving) — chi the nay report painted bounds.
+ * Under-card KHONG overwrite morph target.
+ */
+internal val LocalStatusBarPaintedCardIsTop = staticCompositionLocalOf { false }
+
+/**
+ * event:id owner cua layer dang report painted — reject stale sai owner (task-037).
+ * Rong = legacy (host tu bind contentOwnerKey).
+ */
+internal val LocalStatusBarPaintedCardOwnerKey = staticCompositionLocalOf { "" }
+
+/**
+ * Painted top-card bounds (layout W/H + window LRTB) — freeze morph target.
+ * null = khong do (fallback side-pad).
+ * [ownerKey]/[contextToken] atomic voi LRTB (task-037).
+ */
+internal data class StatusBarPaintedCardReportPx(
+    val layoutWPx: Int,
+    val layoutHPx: Int,
+    val windowLeftPx: Float,
+    val windowTopPx: Float,
+    val windowRightPx: Float,
+    val windowBottomPx: Float,
+    val ownerKey: String = "",
+    val contextToken: Int = 0,
+) {
+    val layoutWidth: Int
+        get() = layoutWPx.coerceAtLeast(0)
+    val layoutHeight: Int
+        get() = layoutHPx.coerceAtLeast(0)
+    val windowWidthPx: Float
+        get() = (windowRightPx - windowLeftPx).coerceAtLeast(0f)
+    val windowHeightPx: Float
+        get() = (windowBottomPx - windowTopPx).coerceAtLeast(0f)
+}
+
+internal val LocalStatusBarPaintedCardBoundsReporter =
+    staticCompositionLocalOf<((StatusBarPaintedCardReportPx) -> Unit)?> { null }
+
+/**
+ * SSOT dragY stack (Expanded at-rest) — StackedExpandedPanels bao cao len morph host.
+ * Shared glass dich cung frame; KHONG translate pointerInput ancestor.
+ */
+internal val LocalStatusBarStackDragYReporter =
+    staticCompositionLocalOf<((dragYPx: Float) -> Unit)?> { null }
+
+/** Bao cao settle/commit anim — morph host freeze painted LRTB. */
+internal val LocalStatusBarStackDragSettlingReporter =
+    staticCompositionLocalOf<((settling: Boolean) -> Unit)?> { null }
+
+/**
+ * Bao cao [StackExpandedDragPhase] — glass ownership theo phase (khong |dragY| eps).
+ *
+ * Ownership SSOT: StackedExpandedPanels publish DONG BO tai gesture lifecycle
+ * (onStackDragStart Held / release Cancel|CommitSettle / settle-end Idle) cung
+ * frame voi dragY — KHONG lay SideEffect lam sole source.
+ * Morph host: yield/plate alpha = composition doc state; graphicsLayer phase =
+ * draw-time. Khong claim sync chi vi ten Live; khong doi phase theo |dragY|.
+ */
+internal val LocalStatusBarStackDragPhaseReporter =
+    staticCompositionLocalOf<((phase: StackExpandedDragPhase) -> Unit)?> { null }
+
+/**
+ * Measure-context token (envelopeW + densityDpi + fontScale) — producer bind
+ * trong onPlaced sau layout current (task-033). 0 = chua co constraints.
+ */
+internal val LocalStatusBarCardNaturalMeasureContextToken =
+    staticCompositionLocalOf { 0 }
+
+/**
+ * Bao cao natural W/H + contextToken theo event.id (layer onPlaced full —
+ * underPeekClip chi draw). Morph host cache theo identity+context; lock TOP
+ * dung natural the nay, KHONG max stack envelope.
+ * (task-031/033: tach card natural vs host envelope vs painted vs touch).
+ */
+internal val LocalStatusBarStackCardNaturalSizeReporter =
+    staticCompositionLocalOf<
+        ((eventId: String, widthPx: Int, heightPx: Int, contextToken: Int) -> Unit)?
+    > { null }
+
+/**
+ * Legacy size-only reporter — map sang bounds (LRTB=0) neu call-site cu.
+ * UU TIEN [LocalStatusBarPaintedCardBoundsReporter].
+ */
+@Deprecated("Dung LocalStatusBarPaintedCardBoundsReporter (full LRTB)")
+internal val LocalStatusBarPaintedCardSizeReporter =
+    staticCompositionLocalOf<((widthPx: Int, heightPx: Int) -> Unit)?> { null }
+
 /** Rim width for the small glass pills; the 1 dp card rim would read as an outline at chip size. */
 internal val ChipHighlightWidth = 0.5.dp
 
@@ -199,6 +338,21 @@ internal fun Modifier.islandBlur(
     includeViewBackdrop: Boolean = true,
     /** Ban kinh Y elliptical; mac dinh = [cornerRadius] (scalar). */
     cornerRadiusY: Dp = cornerRadius,
+    /** Open-glass legacy: fire sau native backdrop (khong alpha_zero). */
+    onNativeBackdropDrawn: ((widthPx: Int, heightPx: Int, surfaceAlpha: Float) -> Unit)? =
+        null,
+    /**
+     * Open-glass production: native HOAC fallback ve that (α>0).
+     * Mac dinh null — surface thuong khong callback moi frame.
+     */
+    onDestinationSurfaceDrawn:
+        ((
+            widthPx: Int,
+            heightPx: Int,
+            surfaceAlpha: Float,
+            kind: AxBlurSurfacePaintKind,
+        ) -> Unit)? =
+            null,
 ): Modifier {
     // Tint mac dinh = AxSystemFrost (cung PrimaryCard / affordance / notif).
     val resolvedTint = tint ?: Color(AxSystemFrost.tintColor(LocalContext.current))
@@ -212,6 +366,8 @@ internal fun Modifier.islandBlur(
         highlight = AxBlurSurfaceDefaults.highlightBrush(),
         highlightWidth = highlightWidth,
         includeViewBackdrop = includeViewBackdrop,
+        onNativeBackdropDrawn = onNativeBackdropDrawn,
+        onDestinationSurfaceDrawn = onDestinationSurfaceDrawn,
     )
 }
 
@@ -248,14 +404,122 @@ internal fun Modifier.islandCardSurface(
     morphHostFrame: Boolean,
     onClick: (() -> Unit)? = null,
 ): Modifier {
+    // Yield shared (morph): TOP FG-only. Expanded stack yield=false → moi card
+    // giu clip+islandBlur theo key(event.id) (archive stable-tree).
+    // OpenWaiting (045): yield=false + local blur α>0 (native|fallback) truoc drop shared.
+    val yieldSbGlass = LocalStatusBarYieldGlassToMorph.current
+    val reportPaintedTop = LocalStatusBarPaintedCardIsTop.current
+    val paintedOwnerKey = LocalStatusBarPaintedCardOwnerKey.current
+    val paintedContextToken = LocalStatusBarCardNaturalMeasureContextToken.current
+    val awaitOpenDestDraw = LocalStatusBarOpenGlassAwaitDestinationDraw.current
+    val openDestSessionGen = LocalStatusBarOpenGlassDestinationSessionGen.current
+    val openDestDrawReporter = LocalStatusBarOpenGlassDestinationDrawReporter.current
+    val hostOwnsGlass = morphHostFrame || (yieldSbGlass && reportPaintedTop)
+    // Surface ACK: native backdrop HOAC fallback ve that — khong content-only / alpha0.
+    // Chi top dang await; listener null o surface thuong → khong callback moi frame.
+    val reportOpenDestSurface =
+        awaitOpenDestDraw &&
+            reportPaintedTop &&
+            !hostOwnsGlass &&
+            openDestSessionGen > 0 &&
+            openDestDrawReporter != null
+    // Listener moi attach (Waiting sessionGen>0) — invalidate de redraw blur ACK
+    // neu surface da ve frame truoc khi reporter ton tai.
+    val openGlassHostView = LocalView.current
+    val wasAwaitOpenDest = remember { mutableStateOf(false) }
+    SideEffect {
+        if (reportOpenDestSurface && !wasAwaitOpenDest.value) {
+            openGlassHostView.invalidate()
+        }
+        wasAwaitOpenDest.value = reportOpenDestSurface
+    }
+    val destinationSurfaceListener:
+        ((
+            widthPx: Int,
+            heightPx: Int,
+            surfaceAlpha: Float,
+            kind: AxBlurSurfacePaintKind,
+        ) -> Unit)? =
+        if (reportOpenDestSurface) {
+            val reporter = openDestDrawReporter
+            val sessionGen = openDestSessionGen
+            val ownerKey = paintedOwnerKey
+            val ctxToken = paintedContextToken
+            { widthPx, heightPx, surfaceAlpha, kind ->
+                val paintKind =
+                    when (kind) {
+                        AxBlurSurfacePaintKind.NativeBackdrop ->
+                            StackOpenGlassDestinationPaintKind.NativeBackdrop
+                        AxBlurSurfacePaintKind.FallbackSurfaceRendered ->
+                            StackOpenGlassDestinationPaintKind.FallbackSurfaceRendered
+                    }
+                reporter?.invoke(
+                    StatusBarOpenGlassDestinationDrawReport(
+                        sessionGen = sessionGen,
+                        ownerKey = ownerKey,
+                        contextToken = ctxToken,
+                        layoutWidthPx = widthPx.toFloat(),
+                        layoutHeightPx = heightPx.toFloat(),
+                        nativeBackdropDrawn =
+                            paintKind == StackOpenGlassDestinationPaintKind.NativeBackdrop,
+                        blurSurfaceAlpha = surfaceAlpha,
+                        paintKind = paintKind,
+                        fallbackSurfaceRendered =
+                            paintKind ==
+                                StackOpenGlassDestinationPaintKind.FallbackSurfaceRendered,
+                    ),
+                )
+            }
+        } else {
+            null
+        }
     val surface =
         when {
-            morphHostFrame && onClick == null -> Modifier
-            morphHostFrame -> Modifier.clip(ShapeCard)
-            else -> Modifier.clip(ShapeCard).islandBlur(RadiusCard, CardBg)
+            hostOwnsGlass && onClick == null -> Modifier
+            hostOwnsGlass -> Modifier.clip(ShapeCard)
+            else ->
+                Modifier.clip(ShapeCard).islandBlur(
+                    cornerRadius = RadiusCard,
+                    fallbackColor = CardBg,
+                    onDestinationSurfaceDrawn = destinationSurfaceListener,
+                )
         }
+    // Chi selected top report — under-card khong overwrite LRTB/W/H.
+    val paintedBoundsReporter = LocalStatusBarPaintedCardBoundsReporter.current
+    @Suppress("DEPRECATION")
+    val paintedSizeLegacy = LocalStatusBarPaintedCardSizeReporter.current
     return this
         .then(surface)
+        .then(
+            if (reportPaintedTop && paintedBoundsReporter != null) {
+                Modifier.onGloballyPositioned { coords ->
+                    val w = coords.size.width
+                    val h = coords.size.height
+                    if (w <= 0 || h <= 0) return@onGloballyPositioned
+                    val b = coords.boundsInWindow()
+                    paintedBoundsReporter(
+                        StatusBarPaintedCardReportPx(
+                            layoutWPx = w,
+                            layoutHPx = h,
+                            windowLeftPx = b.left,
+                            windowTopPx = b.top,
+                            windowRightPx = b.right,
+                            windowBottomPx = b.bottom,
+                            ownerKey = paintedOwnerKey,
+                            contextToken = paintedContextToken,
+                        ),
+                    )
+                }
+            } else if (reportPaintedTop && paintedSizeLegacy != null) {
+                Modifier.onSizeChanged { sz ->
+                    if (sz.width > 0 && sz.height > 0) {
+                        paintedSizeLegacy(sz.width, sz.height)
+                    }
+                }
+            } else {
+                Modifier
+            },
+        )
         .then(
             if (onClick != null) {
                 Modifier.clickable(
