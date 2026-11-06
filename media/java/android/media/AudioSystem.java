@@ -2276,6 +2276,10 @@ public class AudioSystem
     public static native boolean getMasterMono();
     /** @hide enables or disables the master mono mode. */
     public static native int setMasterMono(boolean mono);
+    /**
+     * @hide Mono chi cho output loa trong. Khong doi accessibility master mono.
+     */
+    public static native int setSpeakerPortraitMono(boolean mono);
     /** @hide enables or disables the RTT mode. */
     public static native int setRttEnabled(boolean enabled);
 
