@@ -344,6 +344,7 @@ public class NotificationStackScrollLayoutController implements Dumpable {
     private float mMaxAlphaForUnhide = 1.0f;
     private float mMaxAlphaForRebind = 1.0f;
     private float mMaxAlphaFromView = 1.0f;
+    private float mMaxAlphaForQuickQs = 1.0f;
 
     /**
      * Maximum alpha when to and from or sitting idle on the glanceable hub. Will be 1.0f when the
@@ -1500,6 +1501,14 @@ public class NotificationStackScrollLayoutController implements Dumpable {
         updateAlpha();
     }
 
+    /** Limits notification alpha during quick QS expansion without overriding other alpha caps. */
+    public void setMaxAlphaForQuickQs(float alpha) {
+        if (mMaxAlphaForQuickQs != alpha) {
+            mMaxAlphaForQuickQs = alpha;
+            updateAlpha();
+        }
+    }
+
     /**
      * Applies a blur effect to the view.
      *
@@ -1528,6 +1537,7 @@ public class NotificationStackScrollLayoutController implements Dumpable {
             newAlpha = Math.min(newAlpha, mMaxAlphaForRebind);
             newAlpha = Math.min(newAlpha, mMaxAlphaForGlanceableHub);
             newAlpha = Math.min(newAlpha, mMaxAlphaForKeyguard);
+            newAlpha = Math.min(newAlpha, mMaxAlphaForQuickQs);
             mView.setAlpha(newAlpha);
         }
     }
@@ -1988,6 +1998,7 @@ public class NotificationStackScrollLayoutController implements Dumpable {
         pw.println("mMaxAlphaForGlanceableHub=" + mMaxAlphaForGlanceableHub);
         pw.println("mMaxAlphaForKeyguard=" + mMaxAlphaForKeyguard);
         pw.println("mMaxAlphaForKeyguardSource=" + mMaxAlphaForKeyguardSource);
+        pw.println("mMaxAlphaForQuickQs=" + mMaxAlphaForQuickQs);
     }
 
     /**
