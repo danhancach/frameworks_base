@@ -201,7 +201,8 @@ constructor(
             if (state != null) position(state, duration)
             else if (old?.track == track) old.position
             else 0L
-        val playing = data.isPlaying ?: isPlaying(state)
+        // Session callbacks can arrive before the cached QS MediaData is refreshed.
+        val playing = if (state != null) isPlaying(state) else data.isPlaying ?: false
         val actions =
             state?.customActions?.take(2)?.mapNotNull { action ->
                 val label = action.name?.toString()?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null

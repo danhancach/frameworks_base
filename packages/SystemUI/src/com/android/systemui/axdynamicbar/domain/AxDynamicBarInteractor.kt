@@ -15,6 +15,7 @@ import com.android.systemui.axdynamicbar.model.IslandState
 import com.android.systemui.axdynamicbar.model.IslandUiState
 import com.android.systemui.axdynamicbar.model.RecordingState
 import com.android.systemui.axdynamicbar.shared.IslandActions
+import com.android.systemui.axdynamicbar.shared.StatusBarMediaTimeout
 import com.android.systemui.axdynamicbar.shared.islandEventShouldHideForForeground
 import com.android.systemui.axdynamicbar.shared.islandEventSupportsForegroundHide
 import com.android.systemui.axdynamicbar.shared.sendWithBal
@@ -41,6 +42,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -76,6 +78,7 @@ constructor(
     @Volatile private var lastOutsideDismissElapsedMs = 0L
 
     private val dismissedEventIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val expiredStatusBarMediaIds = MutableStateFlow<Set<String>>(emptySet())
 
     override var onFocusableRequested: ((Boolean) -> Unit)? = null
 
@@ -267,14 +270,36 @@ constructor(
         }
 
         applicationScope.launch {
+            val timeout = StatusBarMediaTimeout()
+            combine(
+                repository.media.mediaEvents.map { events ->
+                    events.associate { it.id to it.isPlaying }
+                }.distinctUntilChanged(),
+                // Recheck elapsed time across lock/doze transitions, including time spent asleep.
+                _isOnKeyguard,
+                _isDozing,
+            ) { playback, _, _ -> playback }.collectLatest { playback ->
+                timeout.update(playback, SystemClock.elapsedRealtime())
+                while (true) {
+                    val now = SystemClock.elapsedRealtime()
+                    expiredStatusBarMediaIds.value = timeout.expiredIds(now)
+                    val remaining = timeout.nextDelayMs(now) ?: break
+                    delay(remaining)
+                }
+            }
+        }
+
+        applicationScope.launch {
             combine(
                 repository.events,
                 settings.disabledEventTypes,
                 _isOnKeyguard,
                 repository.appTracking.foregroundPackage,
-            ) { raw, _, kg, foregroundPkg ->
-                Triple(raw.filter { settings.isEventEnabled(it) }, kg, foregroundPkg)
-            }.collect { (rawEvents, onKeyguard, foregroundPkg) ->
+                expiredStatusBarMediaIds,
+            ) { raw, _, kg, foregroundPkg, expiredMedia ->
+                Triple(raw.filter { settings.isEventEnabled(it) }, kg, foregroundPkg) to expiredMedia
+            }.collect { (input, expiredMedia) ->
+                val (rawEvents, onKeyguard, foregroundPkg) = input
                 if (!settings.isEnabled.value) return@collect
                 // Cap nhat reconciliation owner-gap Clock truoc khi tinh suppress/UI.
                 repository.notification.onForegroundPackageChanged(foregroundPkg)
@@ -296,6 +321,8 @@ constructor(
                     e.id !in dismissedEventIds &&
                         // Keyguard has its own presentation; never expose an unconfirmed run.
                         !(onKeyguard && e.id in pendingConfirmationIds) &&
+                        // Chi an media qua han tren status bar; QS/keyguard van giu session.
+                        !(!onKeyguard && e is IslandEvent.Media && !e.isPlaying && e.id in expiredMedia) &&
                         !(onKeyguard && e is IslandEvent.Notification) &&
                         !(onKeyguard && e is IslandEvent.Charging) &&
                         !(onKeyguard && e is IslandEvent.AppSwitch) &&
