@@ -82,7 +82,7 @@ internal fun AppHistoryExpanded(event: IslandEvent.AppSwitch, interactor: Island
                         app = app,
                         onClick = {
                             interactor.switchToApp(app.taskId)
-                            interactor.collapseIsland()
+                            interactor.collapseIslandForAppLaunch(app.packageName.takeIf { it.isNotEmpty() })
                         },
                         onKill = { interactor.killApp(app.taskId) },
                         modifier = Modifier.weight(1f),

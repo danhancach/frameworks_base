@@ -18,7 +18,6 @@ package com.android.systemui.statusbar.pipeline.shared.ui.viewmodel
 
 import android.content.res.mainResources
 import android.content.testableContext
-import com.android.systemui.axdynamicbar.ui.axDynamicBarChipViewModel
 import com.android.systemui.desktop.domain.interactor.desktopInteractor
 import com.android.systemui.keyguard.domain.interactor.keyguardInteractor
 import com.android.systemui.keyguard.domain.interactor.keyguardTransitionInteractor
@@ -116,7 +115,6 @@ var Kosmos.homeStatusBarViewModelFactory: (Int) -> HomeStatusBarViewModel by
                 userLogoutInteractor = userLogoutInteractor,
                 scrollToTopInteractor = scrollToTopInteractor,
                 headsUpNotificationInteractor = headsUpNotificationInteractor,
-                axDynamicBarChipViewModel = axDynamicBarChipViewModel,
             )
         }
     }

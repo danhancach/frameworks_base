@@ -1,53 +1,22 @@
-@file:OptIn(ExperimentalMaterial3ExpressiveApi::class)
-
 package com.android.systemui.axdynamicbar.ui
 
 import android.content.Context
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewTreeObserver
+import android.view.WindowInsets
 import android.view.WindowManager
-import android.util.Log
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.MutableTransitionState
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.derivedStateOf
-import androidx.compose.runtime.LaunchedEffect
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.TransformOrigin
-import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.unit.dp
-
 import androidx.activity.OnBackPressedDispatcher
 import androidx.activity.OnBackPressedDispatcherOwner
 import androidx.activity.setViewTreeOnBackPressedDispatcherOwner
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -56,20 +25,13 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.android.compose.theme.PlatformTheme
-import com.android.systemui.shared.recents.utilities.Utilities
-import com.android.systemui.axdynamicbar.model.IslandEvent
-import com.android.systemui.axdynamicbar.shared.ExpandedMaxWidth
-import com.android.systemui.axdynamicbar.shared.ChipMorphContainer
-import com.android.systemui.axdynamicbar.shared.LocalBlurAlpha
-import com.android.systemui.axdynamicbar.shared.ProvideIslandHaptics
-import com.android.systemui.axdynamicbar.shared.SpaceLg
-import com.android.systemui.axdynamicbar.ui.compose.ExpandedIslandContent
-import com.android.systemui.axdynamicbar.ui.compose.NotificationAlertCard
+import com.android.systemui.axdynamicbar.shared.CollapseMorphPerfTrace
+import com.android.systemui.axdynamicbar.shared.TouchableInsetsRefreshCoalesce
+import com.android.systemui.axdynamicbar.shared.invalidateForInternalInsets
+import com.android.systemui.axdynamicbar.shared.statusBarOverlayHideDelayMs
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.dagger.qualifiers.Main
-import android.os.Handler
-import android.os.Looper
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -80,11 +42,22 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
-import android.view.WindowInsets
-import androidx.compose.ui.input.pointer.PointerEvent
 
-private const val OVERLAY_HIDE_DELAY_MS = 400L
-private const val TAG = "AxDynamicBarExpanded"
+/**
+ * Overlay lifecycle tach alert vs morph:
+ * - Alert exit: grace 400ms (AnimatedVisibility exit khong bi cat).
+ * - Morph collapse settled + pill handoff: chi +50ms roi remove.
+ * EXIT_ANIM_DURATION 600 chi WRAP sau morph — khong dung cho alert shrink.
+ */
+private const val EXIT_ANIM_DURATION = 600L
+
+private data class OverlayNeedSnapshot(
+    val expanded: Boolean,
+    val pillSuppressed: Boolean,
+    val hasAlert: Boolean,
+    val onKeyguard: Boolean,
+    val enabled: Boolean,
+)
 
 @SysUISingleton
 class AxDynamicBarExpandedPanel
@@ -96,81 +69,277 @@ constructor(
     @Main private val mainHandler: Handler,
     private val viewModel: AxDynamicBarChipViewModel,
 ) {
-    private data class OverlayState(
-        val needed: Boolean = false,
-        val expanded: Boolean = false,
-        val allowExitAnimation: Boolean = false,
-    )
-
     private var initialized = false
-    @Volatile private var desiredState = OverlayState()
     private var overlayView: ComposeView? = null
     private var panelLifecycleOwner: PanelLifecycleOwner? = null
     private var hideOverlayJob: Job? = null
+    /** Trang thai hien thi hien tai cua ComposeView giu am (tranh add/removeView moi lan mo). */
+    private var overlayShown = false
+    private val overlayStatusBarTopPx = mutableIntStateOf(0)
+    private val overlayHasCutout = mutableStateOf(false)
+    private var overlayHideCleanup: (() -> Unit)? = null
 
-    private var explicitFocusRequested = false
     private var replyCaptureActive = false
+    private var explicitFocusRequested = false
+    /** Alert dang hien (khong expanded island) — can MATCH_PARENT de AXIS_DOWN khong bi cat. */
+    private var alertOverlayActive = false
+    /** Compact alert: touchable chi the; false = soft-max + tap ngoai dismiss. */
+    private var alertCompactMode = true
     private var imeVisible = false
     private var imeHeight = 0
+    /**
+     * Day the expand (px, window coords) — touchable chi toi day (+ slack stack)
+     * de phan duoi man van cham home duoc (MATCH_PARENT chi de ve, khong nuot touch).
+     */
+    private var expandedContentBottomPx = 0
+    /** Bounds the alert (window px) — Compact dung rect that; Expanded dung day + soft-max. */
+    private val alertContentBounds = Rect()
+
+    /**
+     * Coalesce touchable insets: invalidate ≤1/frame (khong requestLayout content).
+     * ViewRootImpl.invalidate scheduleTraversals; dispatchOnComputeInternalInsets van chay.
+     */
+    private val insetsCoalesce =
+        TouchableInsetsRefreshCoalesce(
+            onInvalidate = { overlayView?.invalidateForInternalInsets() },
+        )
+
+    /** Async Trace closing that → end/handoff/cancel (cookie=layoutGen). */
+    private val collapsePerfTrace = CollapseMorphPerfTrace()
 
     private val touchableInsetsListener =
         ViewTreeObserver.OnComputeInternalInsetsListener { info ->
-            if (!replyCaptureActive) return@OnComputeInternalInsetsListener
             val v = overlayView ?: return@OnComputeInternalInsetsListener
-            val touchableBottom = when {
-                !imeVisible -> v.height
-                imeHeight > 0 -> v.height - imeHeight
-                else -> v.height / 2 // IME height unknown: never cover the keyboard
+            if (!overlayShown || v.visibility != View.VISIBLE) {
+                info.setTouchableInsets(
+                    ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION
+                )
+                info.touchableRegion.setEmpty()
+                return@OnComputeInternalInsetsListener
             }
-            info.setTouchableInsets(ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION)
-            info.touchableRegion.set(0, 0, v.width, touchableBottom.coerceAtLeast(0))
+            when {
+                replyCaptureActive -> {
+                    val touchableBottom = when {
+                        !imeVisible -> v.height
+                        imeHeight > 0 -> v.height - imeHeight
+                        else -> v.height / 2 // IME height unknown: never cover the keyboard
+                    }
+                    info.setTouchableInsets(
+                        ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION
+                    )
+                    info.touchableRegion.set(0, 0, v.width, touchableBottom.coerceAtLeast(0))
+                }
+                // Dang fade-out mo app -> rong touchableRegion de touch xuyen xuong app ngay.
+                viewModel.statusBarExpansion.isFadingOutCard.value -> {
+                    info.setTouchableInsets(
+                        ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION
+                    )
+                    info.touchableRegion.setEmpty()
+                }
+                // Compact alert dang mo: chi vung bounds the de pass-through app ben duoi.
+                viewModel.isAlertExpanded.value && alertCompactMode -> {
+                    if (v.width <= 0 || v.height <= 0) return@OnComputeInternalInsetsListener
+                    info.setTouchableInsets(
+                        ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION
+                    )
+                    val b = alertContentBounds
+                    if (b.isEmpty) {
+                        val fallback = (v.height * 0.08f).toInt().coerceAtLeast(1)
+                        info.touchableRegion.set(0, 0, v.width, fallback)
+                    } else {
+                        val slack = (v.height * 0.01f).toInt().coerceAtLeast(1)
+                        info.touchableRegion.set(
+                            b.left.coerceAtLeast(0),
+                            b.top.coerceAtLeast(0),
+                            b.right.coerceAtMost(v.width),
+                            (b.bottom + slack).coerceAtMost(v.height),
+                        )
+                    }
+                }
+                // Expanded / dang morph collapse: chi vung the (+ slack keo).
+                viewModel.isExpanded.value || viewModel.statusBarExpansion.pillSuppressed.value -> {
+                    if (v.width <= 0 || v.height <= 0) return@OnComputeInternalInsetsListener
+                    info.setTouchableInsets(
+                        ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION
+                    )
+                    info.touchableRegion.set(
+                        0,
+                        0,
+                        v.width,
+                        contentTouchableBottom(expandedContentBottomPx, v.height),
+                    )
+                }
+                // Alert: Compact = dung bounds the; Expanded = soft-max full width nhu island.
+                alertOverlayActive -> {
+                    if (v.width <= 0 || v.height <= 0) return@OnComputeInternalInsetsListener
+                    info.setTouchableInsets(
+                        ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION
+                    )
+                    if (alertCompactMode) {
+                        val b = alertContentBounds
+                        if (b.isEmpty) {
+                            val fallback = (v.height * 0.08f).toInt().coerceAtLeast(1)
+                            info.touchableRegion.set(0, 0, v.width, fallback)
+                        } else {
+                            val slack = (v.height * 0.01f).toInt().coerceAtLeast(1)
+                            info.touchableRegion.set(
+                                b.left.coerceAtLeast(0),
+                                b.top.coerceAtLeast(0),
+                                b.right.coerceAtMost(v.width),
+                                (b.bottom + slack).coerceAtMost(v.height),
+                            )
+                        }
+                    } else {
+                        info.touchableRegion.set(
+                            0,
+                            0,
+                            v.width,
+                            contentTouchableBottom(alertContentBounds.bottom, v.height),
+                        )
+                    }
+                }
+                else -> return@OnComputeInternalInsetsListener
+            }
         }
+
+    /**
+     * Day touchable: day the (window Y) + slack.
+     * Soft-max ~22% man — ComposeView MATCH_PARENT hay phinh measure; the thuc te
+     * ~statusBar+card. Gesture stack so huu touch sau DOWN nen khong can maxDrag.
+     */
+    private fun contentTouchableBottom(contentBottomPx: Int, windowHeight: Int): Int {
+        val softMax = (windowHeight * 0.22f).toInt().coerceAtLeast(1)
+        val clamped =
+            when {
+                contentBottomPx <= 0 -> (windowHeight * 0.14f).toInt()
+                contentBottomPx > softMax -> softMax
+                else -> contentBottomPx
+            }
+        val slack = (windowHeight * 0.025f).toInt().coerceAtLeast(1)
+        return (clamped + slack).coerceIn(1, softMax + slack)
+    }
+
+    /**
+     * Cap nhat day the tu Compose — ghi bottom ngay; schedule invalidate (khong requestLayout)
+     * de InternalInsets chay lai. Endpoint bottom<=0 → flushNow.
+     */
+    private fun reportExpandedContentBottom(bottomPx: Int) {
+        if (!overlayShown) return
+        if (bottomPx == expandedContentBottomPx) return
+        expandedContentBottomPx = bottomPx
+        ensureMainThread {
+            if (bottomPx <= 0) {
+                insetsCoalesce.flushNow()
+            } else {
+                insetsCoalesce.schedule()
+            }
+        }
+    }
+
+    private fun reportAlertContentBounds(left: Int, top: Int, right: Int, bottom: Int) {
+        if (
+            alertContentBounds.left == left &&
+                alertContentBounds.top == top &&
+                alertContentBounds.right == right &&
+                alertContentBounds.bottom == bottom
+        ) {
+            return
+        }
+        alertContentBounds.set(left, top, right, bottom)
+        // Ngoai pham vi collapse-bottom: giu requestLayout (chua A/B chung minh invalidate du).
+        ensureMainThread { overlayView?.requestLayout() }
+    }
 
     fun init() {
         if (initialized) return
         initialized = true
 
         viewModel.interactor.onCollapseRequested = { viewModel.statusBarExpansion.collapse() }
+        viewModel.interactor.onFadeOutForAppLaunchRequested = { pkg ->
+            viewModel.statusBarExpansion.fadeOutForAppLaunch(pkg)
+        }
         viewModel.interactor.onFocusableRequested = { focusable -> setOverlayFocusable(focusable) }
         viewModel.interactor.onAlertReplyCaptureRequested = { enabled -> setReplyCapture(enabled) }
 
+        viewModel.statusBarExpansion.isFadingOutCard
+            .onEach { fading ->
+                if (fading) {
+                    setOverlayFocusable(false)
+                    ensureMainThread { insetsCoalesce.flushNow() }
+                }
+            }
+            .launchIn(applicationScope)
+
+        // pillSuppressed: giu overlay suot collapse morph 600ms sau khi isExpanded=false.
+        // Alert exit: delay 400ms (khong dung 50ms toan cuc — cat AnimatedVisibility exit).
+        var previousHadAlert = false
         combine(
-            viewModel.isExpanded,
-            viewModel.interactor.uiState.map { it.notificationAlert != null }
-                .distinctUntilChanged(),
-            viewModel.isOnKeyguard,
-            viewModel.interactor.settings.isEnabled,
-        ) { expanded, hasAlert, onKeyguard, enabled ->
-            val allowed = enabled && !onKeyguard
-            OverlayState(
-                needed = allowed && (expanded || hasAlert),
-                expanded = allowed && expanded,
-                allowExitAnimation = allowed,
-            )
-        }
+                viewModel.isExpanded,
+                viewModel.statusBarExpansion.pillSuppressed,
+                viewModel.interactor.uiState.map { it.notificationAlert != null }.distinctUntilChanged(),
+                viewModel.isOnKeyguard,
+                viewModel.interactor.settings.isEnabled,
+            ) { expanded, pillSuppressed, hasAlert, onKeyguard, enabled ->
+                OverlayNeedSnapshot(expanded, pillSuppressed, hasAlert, onKeyguard, enabled)
+            }
             .distinctUntilChanged()
-            .onEach { state ->
-                desiredState = state
-                ensureMainThread {
-                    if (state != desiredState) return@ensureMainThread
+            .onEach { snap ->
+                val needed =
+                    snap.enabled &&
+                        !snap.onKeyguard &&
+                        (snap.expanded || snap.pillSuppressed || snap.hasAlert)
+                if (needed) {
                     hideOverlayJob?.cancel()
                     hideOverlayJob = null
-                    if (state.needed) {
-                        showOverlayInternal()
-                        applyWindowState()
-                    } else {
-                        applyWindowState()
-                        if (!state.allowExitAnimation) {
-                            hideOverlayInternal()
-                        } else {
-                            hideOverlayJob = applicationScope.launch {
-                                delay(OVERLAY_HIDE_DELAY_MS)
-                                ensureMainThread {
-                                    if (!desiredState.needed) hideOverlayInternal()
-                                }
-                            }
+                    showOverlay()
+                } else {
+                    // Alert vua mat + khong morph: grace exit. Morph settle: 50ms handoff.
+                    val alertExitGrace =
+                        previousHadAlert &&
+                            !snap.hasAlert &&
+                            !snap.expanded &&
+                            !snap.pillSuppressed
+                    val delayMs = statusBarOverlayHideDelayMs(alertExitGrace)
+                    hideOverlayJob?.cancel()
+                    hideOverlayJob =
+                        applicationScope.launch {
+                            delay(delayMs)
+                            hideOverlay()
                         }
-                    }
+                }
+                previousHadAlert = snap.hasAlert
+            }
+            .launchIn(applicationScope)
+
+        viewModel.isExpanded
+            .onEach { expanded ->
+                updateOverlay(expanded)
+            }
+            .launchIn(applicationScope)
+
+        // Alert-only: MATCH_PARENT + touchable region (tranh WRAP_CONTENT cat the keo xuong).
+        viewModel.interactor.uiState
+            .map { it.notificationAlert != null }
+            .onEach { hasAlert ->
+                alertOverlayActive = hasAlert
+                if (!hasAlert) {
+                    alertContentBounds.setEmpty()
+                    alertCompactMode = true
+                }
+                ensureMainThread {
+                    syncAlertOverlayHeight(hasAlert)
+                    overlayView?.requestLayout()
+                }
+            }
+            .launchIn(applicationScope)
+
+        viewModel.interactor.alertCompactMode
+            .onEach { compact ->
+                alertCompactMode = compact
+                if (overlayShown && viewModel.isAlertExpanded.value) {
+                    updateOverlay(viewModel.isExpanded.value)
+                } else {
+                    ensureMainThread { overlayView?.requestLayout() }
                 }
             }
             .launchIn(applicationScope)
@@ -181,14 +350,11 @@ constructor(
         else mainHandler.post(action)
     }
 
+    private fun showOverlay() {
+        ensureMainThread { showOverlayInternal() }
+    }
+
     private fun showOverlayInternal() {
-        if (overlayView != null || !desiredState.needed) return
-
-        val lifecycleOwner = PanelLifecycleOwner()
-        lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-        lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_START)
-        lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
-
         val windowMetrics = windowManager.currentWindowMetrics
         val statusBarTop = windowMetrics.windowInsets
             .getInsets(WindowInsets.Type.statusBars())
@@ -196,19 +362,86 @@ constructor(
         val hasCutout = windowMetrics.windowInsets
             .getInsets(WindowInsets.Type.displayCutout())
             .top > 0
+        overlayStatusBarTopPx.intValue = statusBarTop
+        overlayHasCutout.value = hasCutout
+
+        val isCurrentlyExpanded = viewModel.isExpanded.value
+        val pillSuppressed = viewModel.statusBarExpansion.pillSuppressed.value
+        val hasAlert = viewModel.interactor.uiState.value.notificationAlert != null
+        alertOverlayActive = hasAlert
+        val flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR or
+            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+            if (explicitFocusRequested || replyCaptureActive) 0
+            else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+
+        // MATCH_PARENT khi expand/morph/alert: translationY stack khong bi WRAP_CONTENT cat.
+        val overlayHeight =
+            if (isCurrentlyExpanded || pillSuppressed || hasAlert) {
+                WindowManager.LayoutParams.MATCH_PARENT
+            } else {
+                WindowManager.LayoutParams.WRAP_CONTENT
+            }
+
+        // Tai su dung ComposeView + PlatformTheme da giu am (xoa spike 45-67ms luc mo).
+        val existing = overlayView
+        if (existing != null) {
+            if (overlayShown) return
+            val params = existing.layoutParams as? WindowManager.LayoutParams
+            if (params != null) {
+                params.flags = flags
+                params.height = overlayHeight
+                params.fitInsetsTypes = 0
+                params.setTrustedOverlay()
+                windowManager.updateViewLayout(existing, params)
+            }
+            overlayShown = true
+            panelLifecycleOwner?.apply {
+                handleLifecycleEvent(Lifecycle.Event.ON_START)
+                handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            }
+            existing.visibility = View.VISIBLE
+            updateTouchableRegion(existing, isCurrentlyExpanded)
+            return
+        }
+
+        val lifecycleOwner = PanelLifecycleOwner()
+        lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+        lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
 
         val view = ComposeView(context).apply {
+            // translationY stack keo xuong khong bi View clip.
+            clipChildren = false
+            clipToPadding = false
             setContent {
                 PlatformTheme {
-                    ProvideIslandHaptics(viewModel.hapticsEnabled) {
-                        OverlayContent(viewModel, statusBarTop, hasCutout)
-                    }
+                    OverlayContent(
+                        viewModel,
+                        overlayStatusBarTopPx.intValue,
+                        overlayHasCutout.value,
+                        onExpandedContentBottomPx = ::reportExpandedContentBottom,
+                        onAlertContentBoundsPx = ::reportAlertContentBounds,
+                        collapsePerfTrace = collapsePerfTrace,
+                        onRegisterHideCleanup = { overlayHideCleanup = it },
+                    )
                 }
             }
             setOnTouchListener { _, event ->
                 when (event.actionMasked) {
                     MotionEvent.ACTION_OUTSIDE -> {
-                        viewModel.collapseFromOutsideTouch(event.downTime)
+                        // Tap ngoai touchable (home) → an expand / alert mo rong.
+                        // Compact alert: khong dismiss (touch pass-through xuong app).
+                        // WATCH_OUTSIDE_TOUCH van nhan ACTION_OUTSIDE khi touch toi cua so duoi.
+                        when {
+                            viewModel.isAlertExpanded.value ->
+                                if (!alertCompactMode) viewModel.interactor.dismissNotificationAlertFromOutside()
+                            viewModel.isExpanded.value ->
+                                viewModel.collapseFromOutsideTouch(event.downTime)
+                            alertOverlayActive && !alertCompactMode ->
+                                viewModel.interactor.dismissNotificationAlertFromOutside()
+                        }
                         true
                     }
                     MotionEvent.ACTION_DOWN ->
@@ -221,16 +454,14 @@ constructor(
             }
             setOnApplyWindowInsetsListener { v, insets ->
                 val visible = insets.isVisible(WindowInsets.Type.ime())
-                val wasImeVisible = imeVisible
                 val height = insets.getInsets(WindowInsets.Type.ime()).bottom
                 if (visible != imeVisible || height != imeHeight) {
                     imeVisible = visible
                     imeHeight = height
-                    if (replyCaptureActive) v.requestLayout() // recompute touchable region
+                    // Reply/IME: ngoai pham vi collapse-bottom — giu requestLayout cu.
+                    if (replyCaptureActive) v.requestLayout()
                 }
-                if (visible != wasImeVisible) {
-                    viewModel.interactor.onOverlayImeVisibilityChanged(visible)
-                }
+                viewModel.interactor.onOverlayImeVisibilityChanged(visible)
                 v.onApplyWindowInsets(insets)
             }
             viewTreeObserver.addOnComputeInternalInsetsListener(touchableInsetsListener)
@@ -241,316 +472,240 @@ constructor(
         view.setViewTreeOnBackPressedDispatcherOwner(lifecycleOwner)
         panelLifecycleOwner = lifecycleOwner
 
-        // This overlay is only shown when unlocked. SHOW_WHEN_LOCKED can surface a stale
-        // window during keyguard transitions and is not needed for a status-bar sub-panel.
-        val flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR or
-            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
-            if (explicitFocusRequested) 0
-            else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        view.addOnAttachStateChangeListener(
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    v.findOnBackInvokedDispatcher()?.let { dispatcher ->
+                        lifecycleOwner.onBackPressedDispatcher.setOnBackInvokedDispatcher(
+                            dispatcher
+                        )
+                    }
+                    if (overlayShown) {
+                        updateTouchableRegion(v, viewModel.isExpanded.value)
+                    }
+                }
+
+                override fun onViewDetachedFromWindow(v: View) {}
+            }
+        )
+        view.addOnLayoutChangeListener { v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            // Chi cap nhat touchable region khi cua so dang hien va bounds thuc su doi.
+            if (overlayShown && (left != oldLeft || top != oldTop || right != oldRight || bottom != oldBottom)) {
+                updateTouchableRegion(v, viewModel.isExpanded.value)
+            }
+        }
 
         val params =
             WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
-                if (replyCaptureActive) WindowManager.LayoutParams.MATCH_PARENT
-                else WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayHeight,
                 WindowManager.LayoutParams.TYPE_STATUS_BAR_SUB_PANEL,
                 flags,
                 PixelFormat.TRANSLUCENT,
             )
         params.gravity = Gravity.TOP or Gravity.FILL_HORIZONTAL
         params.title = "AxDynamicBarExpanded"
+        params.fitInsetsTypes = 0
+        // MATCH_PARENT + alpha=1 neu khong trusted → InputDispatcher drop touch home
+        // ("Untrusted touch due to occlusion by SystemUI") du touchableRegion hep.
+        params.setTrustedOverlay()
 
-        try {
-            windowManager.addView(view, params)
-        } catch (e: RuntimeException) {
-            view.viewTreeObserver.removeOnComputeInternalInsetsListener(touchableInsetsListener)
-            view.setOnTouchListener(null)
-            view.setOnApplyWindowInsetsListener(null)
-            lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-            lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-            lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-            view.disposeComposition()
-            panelLifecycleOwner = null
-            Log.w(TAG, "Unable to add overlay", e)
-            return
-        }
+        overlayShown = true
+        windowManager.addView(view, params)
         overlayView = view
     }
 
-    private fun hideOverlayInternal() {
-        // Clear this reference first: disposal may synchronously dispatch reply/focus callbacks.
-        val view = overlayView
-        overlayView = null
-        if (view != null) {
-            view.viewTreeObserver.removeOnComputeInternalInsetsListener(touchableInsetsListener)
-            view.setOnTouchListener(null)
-            view.setOnApplyWindowInsetsListener(null)
-            panelLifecycleOwner?.apply {
-                handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-                handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-                handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-            }
-            try {
-                windowManager.removeViewImmediate(view)
-            } catch (_: IllegalArgumentException) {
-                // A display teardown may have removed the window already.
-            } finally {
-                view.disposeComposition()
-            }
-        }
-        panelLifecycleOwner = null
-        replyCaptureActive = false
-        explicitFocusRequested = false
-        imeVisible = false
-        imeHeight = 0
-        // An abandoned reply must not leave the interactor waiting for input from a dead view.
-        viewModel.interactor.onAlertReplyActiveChanged(false)
+    /**
+     * Chi dung InternalInsets (touchableInsetsListener) — khong setTouchableRegion full man
+     * (set full man truoc day da chan home). Attach/layout/structural: giu requestLayout.
+     * Chi collapse-bottom dung invalidate coalesce (reportExpandedContentBottom).
+     */
+    private fun updateTouchableRegion(view: View, expanded: Boolean) {
+        view.requestLayout()
     }
 
-    private fun applyWindowState() {
+    private fun hideOverlay() {
+        ensureMainThread { hideOverlayInternal() }
+    }
+
+    private fun hideOverlayInternal() {
+        shrinkRunnable?.let { mainHandler.removeCallbacks(it) }
+        shrinkRunnable = null
+        insetsCoalesce.cancelAndBumpGeneration()
+        collapsePerfTrace.forceCancel("hideOverlay")
+        replyCaptureActive = false
+        explicitFocusRequested = false
+        alertOverlayActive = false
+        alertCompactMode = true
+        imeVisible = false
+        imeHeight = 0
+        expandedContentBottomPx = 0
+        alertContentBounds.setEmpty()
+        val view = overlayView ?: return
+        if (!overlayShown) return
+        overlayShown = false
+        // Xoa sach state morph/glass/alert dong bo truoc khi dung lifecycle va an View.GONE
+        // (khong giu BlurEngine / Cat::High khi idle — bao toan ARR 60Hz).
+        overlayHideCleanup?.invoke()
+        view.visibility = View.GONE
+        (view.layoutParams as? WindowManager.LayoutParams)?.let { params ->
+            params.flags =
+                params.flags or
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            windowManager.updateViewLayout(view, params)
+        }
+        panelLifecycleOwner?.apply {
+            handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        }
+    }
+
+    private var shrinkRunnable: Runnable? = null
+
+    private fun updateOverlay(expanded: Boolean) = ensureMainThread {
+        shrinkRunnable?.let { mainHandler.removeCallbacks(it) }
+        shrinkRunnable = null
+        if (!overlayShown) return@ensureMainThread
+        val view = overlayView ?: return@ensureMainThread
+        val params = view.layoutParams as? WindowManager.LayoutParams ?: return@ensureMainThread
+        val morphing = viewModel.statusBarExpansion.pillSuppressed.value
+        val focusable = explicitFocusRequested || replyCaptureActive
+        if (expanded || morphing) {
+            params.flags =
+                if (focusable) {
+                    params.flags and
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv() and
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                } else {
+                    (params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) and
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                }
+            // MATCH_PARENT: graphicsLayer.translationY khong mo rong WRAP_CONTENT.
+            params.height = WindowManager.LayoutParams.MATCH_PARENT
+            params.fitInsetsTypes = 0
+            params.setTrustedOverlay()
+            windowManager.updateViewLayout(view, params)
+            updateTouchableRegion(view, true)
+        } else {
+            if (alertOverlayActive) {
+                params.flags =
+                    if (focusable) {
+                        params.flags and
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv() and
+                            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                    } else {
+                        (params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) and
+                            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                    }
+                params.height = WindowManager.LayoutParams.MATCH_PARENT
+                params.fitInsetsTypes = 0
+                windowManager.updateViewLayout(view, params)
+                updateTouchableRegion(view, false)
+                view.requestLayout()
+            } else {
+                params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                windowManager.updateViewLayout(view, params)
+                updateTouchableRegion(view, false)
+                val runnable = Runnable {
+                    if (!overlayShown) return@Runnable
+                    val v = overlayView ?: return@Runnable
+                    if (alertOverlayActive ||
+                        replyCaptureActive ||
+                        viewModel.statusBarExpansion.pillSuppressed.value
+                    ) {
+                        return@Runnable
+                    }
+                    val p = v.layoutParams as? WindowManager.LayoutParams ?: return@Runnable
+                    p.height = WindowManager.LayoutParams.WRAP_CONTENT
+                    windowManager.updateViewLayout(v, p)
+                }
+                shrinkRunnable = runnable
+                mainHandler.postDelayed(runnable, EXIT_ANIM_DURATION)
+            }
+        }
+    }
+
+    /**
+     * Alert hien: MATCH_PARENT (khong cat the keo).
+     * Alert an: KHONG WRAP ngay — de AnimatedVisibility exit + grace 400ms;
+     * hideOverlay an cua so. EXIT_ANIM_DURATION 600 chi morph WRAP.
+     */
+    private fun syncAlertOverlayHeight(hasAlert: Boolean) {
+        if (!overlayShown) return
         val view = overlayView ?: return
         val params = view.layoutParams as? WindowManager.LayoutParams ?: return
-        val focusable = desiredState.needed && explicitFocusRequested
-        val flags = if (focusable) {
-            params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-        } else {
-            params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        }
-        val height = if (replyCaptureActive && desiredState.needed) {
-            WindowManager.LayoutParams.MATCH_PARENT
-        } else {
-            WindowManager.LayoutParams.WRAP_CONTENT
-        }
-        if (params.flags == flags && params.height == height) return
-        params.flags = flags
-        params.height = height
-        try {
+        val focusable = explicitFocusRequested || replyCaptureActive
+        if (viewModel.isExpanded.value ||
+            replyCaptureActive ||
+            viewModel.statusBarExpansion.pillSuppressed.value
+        ) {
+            params.flags =
+                if (focusable) {
+                    params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+                } else {
+                    params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                }
+            if (params.height != WindowManager.LayoutParams.MATCH_PARENT) {
+                params.height = WindowManager.LayoutParams.MATCH_PARENT
+                params.fitInsetsTypes = 0
+            }
             windowManager.updateViewLayout(view, params)
-        } catch (e: IllegalArgumentException) {
-            // A pending display/window teardown can race with an IME or expansion change.
-            Log.w(TAG, "Unable to update overlay", e)
-            hideOverlayInternal()
+            return
         }
+        if (hasAlert) {
+            params.flags =
+                if (focusable) {
+                    params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+                } else {
+                    params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                }
+            params.fitInsetsTypes = 0
+            if (params.height != WindowManager.LayoutParams.MATCH_PARENT) {
+                params.height = WindowManager.LayoutParams.MATCH_PARENT
+            }
+            windowManager.updateViewLayout(view, params)
+            view.requestLayout()
+        }
+        // hasAlert=false: giu height hien tai den hideOverlay (khong WRAP cat exit).
     }
 
     private fun setReplyCapture(enabled: Boolean) = ensureMainThread {
         if (replyCaptureActive == enabled) return@ensureMainThread
-        replyCaptureActive = enabled && desiredState.needed
-        applyWindowState()
-        overlayView?.requestLayout() // refresh the touchable region around the IME
+        replyCaptureActive = enabled
+        if (!overlayShown) return@ensureMainThread
+        val view = overlayView ?: return@ensureMainThread
+        val params = view.layoutParams as? WindowManager.LayoutParams ?: return@ensureMainThread
+        // pillSuppressed: dang morph collapse 600ms — khong WRAP (cat geom).
+        val keepMatch =
+            enabled ||
+                viewModel.isExpanded.value ||
+                alertOverlayActive ||
+                viewModel.statusBarExpansion.pillSuppressed.value
+        params.height =
+            if (keepMatch) {
+                WindowManager.LayoutParams.MATCH_PARENT
+            } else {
+                WindowManager.LayoutParams.WRAP_CONTENT
+            }
+        if (keepMatch) {
+            params.fitInsetsTypes = 0
+        }
+        windowManager.updateViewLayout(view, params)
+        view.requestLayout()
     }
 
     private fun setOverlayFocusable(focusable: Boolean) = ensureMainThread {
-        if (explicitFocusRequested == focusable) return@ensureMainThread
-        explicitFocusRequested = focusable && desiredState.needed
-        applyWindowState()
-    }
-}
-
-@Composable
-private fun OverlayContent(viewModel: AxDynamicBarChipViewModel, statusBarHeightPx: Int, hasCutout: Boolean) {
-    val density = LocalDensity.current
-    val isLargeScreen = Utilities.isLargeScreen(LocalContext.current)
-
-    val largeScreenExtra = if (isLargeScreen) 4.dp else 0.dp
-    val topPad = if (hasCutout) largeScreenExtra
-        else with(density) { statusBarHeightPx.toDp() } + largeScreenExtra
-    val chipState by viewModel.chipState.collectAsStateWithLifecycle()
-    val isExpanded by viewModel.isExpanded.collectAsStateWithLifecycle()
-    val uiState by viewModel.interactor.uiState.collectAsStateWithLifecycle()
-    val isOnKeyguard by viewModel.isOnKeyguard.collectAsStateWithLifecycle()
-    val notifAlert = uiState.notificationAlert
-    val compactNotifs by viewModel.interactor.settings.compactNotifications.collectAsStateWithLifecycle()
-    val morphEnabled by viewModel.chipMorphEnabled.collectAsStateWithLifecycle()
-    val chipBounds by viewModel.chipBoundsOnScreen.collectAsStateWithLifecycle()
-
-    val lastAlert = remember { mutableStateOf(notifAlert) }
-    LaunchedEffect(notifAlert) {
-        if (notifAlert != null) lastAlert.value = notifAlert
-    }
-
-    val expandedVisible = remember { MutableTransitionState(false) }
-    val showNotif = !isExpanded && notifAlert != null
-    val notifVisible = remember { MutableTransitionState(false) }
-
-    LaunchedEffect(isExpanded) {
-        expandedVisible.targetState = isExpanded
-    }
-
-    LaunchedEffect(showNotif) {
-        notifVisible.targetState = showNotif
-    }
-
-    LaunchedEffect(chipState) {
-        val filtered = chipState?.allEvents?.filter { it !is IslandEvent.AospChip }
-        if (filtered.isNullOrEmpty() && isExpanded) {
-            viewModel.statusBarExpansion.collapse()
+        explicitFocusRequested = focusable
+        if (!overlayShown) return@ensureMainThread
+        val view = overlayView ?: return@ensureMainThread
+        val params = view.layoutParams as? WindowManager.LayoutParams ?: return@ensureMainThread
+        if (focusable || replyCaptureActive) {
+            params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        } else {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         }
-    }
-
-    val origin = TransformOrigin(0.5f, 0f)
-    val motionScheme = MaterialTheme.motionScheme
-
-    val expandedBlurAlpha by animateFloatAsState(
-        targetValue = if (isExpanded) 1f else 0f,
-        animationSpec = motionScheme.fastEffectsSpec(),
-        label = "expanded_blur_alpha",
-    )
-    val alertBlurAlpha by animateFloatAsState(
-        targetValue = if (showNotif) 1f else 0f,
-        animationSpec = motionScheme.fastEffectsSpec(),
-        label = "alert_blur_alpha",
-    )
-
-    val expandedPanel: @Composable (Modifier) -> Unit = { contentModifier ->
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .pointerInput(Unit) {
-                    val slop = viewConfiguration.touchSlop
-                    awaitEachGesture {
-                        var ev: PointerEvent
-                        do {
-                            ev = awaitPointerEvent(PointerEventPass.Final)
-                        } while (!ev.changes.any { it.changedToDownIgnoreConsumed() })
-
-                        val downChange =
-                            ev.changes.firstOrNull { it.changedToDownIgnoreConsumed() }
-                                ?: ev.changes.firstOrNull()
-                                ?: return@awaitEachGesture
-
-                        val pointerId = downChange.id
-                        val downPos = downChange.position
-                        val downConsumed = downChange.isConsumed
-                        var hasExceededSlop = false
-
-                        while (true) {
-                            val event = awaitPointerEvent(PointerEventPass.Final)
-                            val change =
-                                event.changes.firstOrNull { it.id == pointerId }
-                                    ?: event.changes.firstOrNull()
-                                    ?: break
-
-                            val dx = change.position.x - downPos.x
-                            val dy = change.position.y - downPos.y
-                            if (dx * dx + dy * dy > slop * slop) {
-                                hasExceededSlop = true
-                            }
-
-                            if (!change.pressed) {
-                                if (!downConsumed && !change.isConsumed && !hasExceededSlop) {
-                                    change.consume()
-                                    viewModel.statusBarExpansion.collapse()
-                                }
-                                break
-                            }
-                        }
-                    }
-                }
-                .padding(top = topPad),
-            contentAlignment = Alignment.TopCenter,
-        ) {
-            chipState?.let { state ->
-                val filtered = state.allEvents.filter { it !is IslandEvent.AospChip }
-                if (filtered.isEmpty()) return@let
-                Box(
-                    modifier =
-                        contentModifier.clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                            // A tap on a card's own surface (not on one of its controls)
-                            // minimises the island, matching a tap on the chip. Previously
-                            // this was an inert clickable that silently swallowed the tap.
-                            onClick = { viewModel.statusBarExpansion.collapse() },
-                        )
-                ) {
-                    ExpandedIslandContent(
-                        events = filtered,
-                        interactor = viewModel.interactor,
-                        onCollapse = { viewModel.statusBarExpansion.collapse() },
-                        pinnedEventId = state.event.id,
-                        hapticsViewModelFactory = viewModel.interactor.sliderHapticsViewModelFactory,
-                    )
-                }
-            }
-        }
-    }
-
-    if (morphEnabled) {
-        ChipMorphContainer(visible = isExpanded, chipBounds = chipBounds) { contentModifier ->
-            expandedPanel(contentModifier)
-        }
-    } else {
-        CompositionLocalProvider(LocalBlurAlpha provides expandedBlurAlpha) {
-            AnimatedVisibility(
-                visibleState = expandedVisible,
-                enter = fadeIn(motionScheme.defaultEffectsSpec()) + scaleIn(
-                    animationSpec = motionScheme.defaultSpatialSpec(),
-                    initialScale = 0.4f,
-                    transformOrigin = origin,
-                ),
-                exit = fadeOut(motionScheme.fastEffectsSpec()) + scaleOut(
-                    animationSpec = motionScheme.fastSpatialSpec(),
-                    targetScale = 0.4f,
-                    transformOrigin = origin,
-                ),
-            ) {
-                expandedPanel(Modifier)
-            }
-        }
-    }
-
-    val alertCard: @Composable (Modifier) -> Unit = { cardModifier ->
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = topPad),
-            contentAlignment = Alignment.TopCenter,
-        ) {
-            val alert = lastAlert.value
-            if (alert != null) {
-                NotificationAlertCard(
-                    notification = alert,
-                    interactor = viewModel.interactor,
-                    onDismiss = { viewModel.interactor.dismissNotificationAlert() },
-                    initiallyCompact = compactNotifs,
-                    modifier =
-                        Modifier.widthIn(max = ExpandedMaxWidth)
-                            .fillMaxWidth()
-                            .padding(horizontal = SpaceLg)
-                            .then(cardModifier),
-                )
-            }
-        }
-    }
-
-    if (morphEnabled) {
-        ChipMorphContainer(
-            visible = showNotif,
-            chipBounds = chipBounds,
-            onHidden = { if (notifAlert == null) lastAlert.value = null },
-            content = alertCard,
-        )
-    } else {
-        CompositionLocalProvider(LocalBlurAlpha provides alertBlurAlpha) {
-            AnimatedVisibility(
-                visibleState = notifVisible,
-                enter = fadeIn(motionScheme.defaultEffectsSpec()) + scaleIn(
-                    animationSpec = motionScheme.defaultSpatialSpec(),
-                    initialScale = 0.4f,
-                    transformOrigin = origin,
-                ),
-                exit = fadeOut(motionScheme.fastEffectsSpec()) + scaleOut(
-                    animationSpec = motionScheme.fastSpatialSpec(),
-                    targetScale = 0.4f,
-                    transformOrigin = origin,
-                ),
-            ) {
-                alertCard(Modifier)
-            }
-        }
+        windowManager.updateViewLayout(view, params)
     }
 }
 

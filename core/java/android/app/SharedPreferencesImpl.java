@@ -21,6 +21,7 @@ import android.compat.Compatibility;
 import android.compat.annotation.ChangeId;
 import android.compat.annotation.EnabledSince;
 import android.compat.annotation.UnsupportedAppUsage;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.FileUtils;
@@ -67,6 +68,17 @@ final class SharedPreferencesImpl implements SharedPreferences {
     private static final String TAG = "SharedPreferencesImpl";
     private static final boolean DEBUG = false;
     private static final Object CONTENT = new Object();
+
+    // Bao tab dong ho dang chon cua Clock sang SystemUI cho Dynamic Bar.
+    private static final String DESKCLOCK_TAB_KEY = "selected_tab";
+    private static final String DESKCLOCK_GOOGLE_PKG = "com.google.android.deskclock";
+    private static final String DESKCLOCK_AOSP_PKG = "com.android.deskclock";
+    private static final String SYSTEMUI_PKG = "com.android.systemui";
+    private static final String ACTION_DESKCLOCK_TAB_CHANGED =
+            "com.android.systemui.axdynamicbar.ACTION_DESKCLOCK_TAB_CHANGED";
+    private static final String EXTRA_DESKCLOCK_PACKAGE = "package";
+    private static final String EXTRA_DESKCLOCK_SELECTED_TAB = "selected_tab";
+    private static volatile int sLastDispatchedDeskClockTab = Integer.MIN_VALUE;
 
     /** If a fsync takes more than {@value #MAX_FSYNC_DURATION_MILLIS} ms, warn */
     private static final long MAX_FSYNC_DURATION_MILLIS = 256;
@@ -326,11 +338,16 @@ final class SharedPreferencesImpl implements SharedPreferences {
 
     @Override
     public int getInt(String key, int defValue) {
+        final int result;
         synchronized (mLock) {
             awaitLoadedLocked();
             Integer v = (Integer)mMap.get(key);
-            return v != null ? v : defValue;
+            result = v != null ? v : defValue;
         }
+        if (DESKCLOCK_TAB_KEY.equals(key)) {
+            maybeNotifyDeskClockSelectedTab(result, false);
+        }
+        return result;
     }
     @Override
     public long getLong(String key, long defValue) {
@@ -528,6 +545,7 @@ final class SharedPreferencesImpl implements SharedPreferences {
             List<String> keysModified = null;
             Set<OnSharedPreferenceChangeListener> listeners = null;
             Map<String, Object> mapToWriteToDisk;
+            Integer updatedDeskClockTab = null;
 
             synchronized (SharedPreferencesImpl.this.mLock) {
                 // We optimistically don't make a deep copy until
@@ -573,6 +591,9 @@ final class SharedPreferencesImpl implements SharedPreferences {
                             }
                             mapToWriteToDisk.remove(k);
                         } else {
+                            if (DESKCLOCK_TAB_KEY.equals(k) && v instanceof Integer) {
+                                updatedDeskClockTab = (Integer) v;
+                            }
                             if (mapToWriteToDisk.containsKey(k)) {
                                 Object existingValue = mapToWriteToDisk.get(k);
                                 if (existingValue != null && existingValue.equals(v)) {
@@ -596,6 +617,9 @@ final class SharedPreferencesImpl implements SharedPreferences {
 
                     memoryStateGeneration = mCurrentMemoryStateGeneration;
                 }
+            }
+            if (updatedDeskClockTab != null) {
+                maybeNotifyDeskClockSelectedTab(updatedDeskClockTab, true);
             }
             return new MemoryCommitResult(memoryStateGeneration, keysCleared, keysModified,
                     listeners, mapToWriteToDisk);
@@ -885,6 +909,30 @@ final class SharedPreferencesImpl implements SharedPreferences {
         mcr.setDiskWriteResult(false, false);
     }
 
+
+    private static void maybeNotifyDeskClockSelectedTab(int tabOrdinal, boolean force) {
+        final String pkg = ActivityThread.currentPackageName();
+        if (!DESKCLOCK_GOOGLE_PKG.equals(pkg) && !DESKCLOCK_AOSP_PKG.equals(pkg)) {
+            return;
+        }
+        final Application app = ActivityThread.currentApplication();
+        if (app == null) {
+            return;
+        }
+        if (!force && tabOrdinal == sLastDispatchedDeskClockTab) {
+            return;
+        }
+        sLastDispatchedDeskClockTab = tabOrdinal;
+        try {
+            final Intent intent = new Intent(ACTION_DESKCLOCK_TAB_CHANGED)
+                    .setPackage(SYSTEMUI_PKG)
+                    .putExtra(EXTRA_DESKCLOCK_PACKAGE, pkg)
+                    .putExtra(EXTRA_DESKCLOCK_SELECTED_TAB, tabOrdinal);
+            app.sendBroadcast(intent);
+        } catch (Throwable ignored) {
+            // Khong lam loi luong doc/ghi SharedPreferences cua Clock.
+        }
+    }
 
     private static final class SharedPreferencesThreadFactory implements ThreadFactory {
         @Override

@@ -17,8 +17,6 @@
 package com.android.systemui.axdynamicbar.ui.compose
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,7 +39,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -116,19 +113,24 @@ private fun ClipboardStashItem(
     item: IslandEvent.ClipboardItem,
     interactor: IslandActions,
 ) {
-    Row(
+    val onCopy = {
+        if (item.isImage && item.imageUri != null) interactor.copyUriToClipboard(item.imageUri)
+        else interactor.copyToClipboard(item.preview)
+    }
+    MorphClickableBox(
+        onClick = onCopy,
         modifier = Modifier
             .fillMaxWidth()
             .clip(ShapeSm)
-            .background(DarkCard.copy(alpha = AlphaGlass))
-            .clickable {
-                if (item.isImage && item.imageUri != null) interactor.copyUriToClipboard(item.imageUri)
-                else interactor.copyToClipboard(item.preview)
-            }
-            .padding(SpaceLg),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(SpaceLg),
+            .background(DarkCard.copy(alpha = AlphaGlass)),
     ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(SpaceLg),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(SpaceLg),
+        ) {
         if (item.isImage) {
             Box(
                 modifier = Modifier
@@ -183,63 +185,61 @@ private fun ClipboardStashItem(
             Icons.Filled.ContentCopy,
             null,
             tint = IslandTone.ACCENT.tint,
-            modifier = Modifier
-                .size(SizeIconSm)
-                .clickable {
-                    if (item.isImage && item.imageUri != null) interactor.copyUriToClipboard(item.imageUri)
-                    else interactor.copyToClipboard(item.preview)
-                },
+            modifier = Modifier.size(SizeIconSm),
         )
+        }
     }
 }
 
 @Composable
 private fun ClipboardSingleItem(event: IslandEvent.Clipboard, interactor: IslandActions) {
+    val onCopy = {
+        interactor.copyToClipboard(event.preview)
+        interactor.collapseIsland()
+    }
     if (event.preview.isNotEmpty()) {
-        Row(
+        MorphClickableBox(
+            onClick = onCopy,
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(ShapeSm)
-                .background(DarkCard.copy(alpha = AlphaGlass))
-                .clickable {
-                    interactor.copyToClipboard(event.preview)
-                    interactor.collapseIsland()
-                }
-                .padding(SpaceLg),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(SpaceLg),
+                .background(DarkCard.copy(alpha = AlphaGlass)),
         ) {
-            if (event.isUrl) {
-                Box(
-                    modifier = Modifier
-                        .size(SizeCompactIcon)
-                        .clip(ShapeCompact)
-                        .background(IslandTone.ACCENT.tint.copy(alpha = AlphaIconBg)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(Icons.Filled.Link, null, tint = IslandTone.ACCENT.tint, modifier = Modifier.size(18.dp))
-                }
-            }
-            Text(
-                event.preview,
-                color = OnCardText,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            Icon(
-                Icons.Filled.ContentCopy,
-                null,
-                tint = IslandTone.ACCENT.tint,
+            Row(
                 modifier = Modifier
-                    .size(SizeIconSm)
-                    .wrapContentWidth()
-                    .clickable {
-                        interactor.copyToClipboard(event.preview)
-                        interactor.collapseIsland()
-                    },
-            )
+                    .fillMaxWidth()
+                    .padding(SpaceLg),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SpaceLg),
+            ) {
+                if (event.isUrl) {
+                    Box(
+                        modifier = Modifier
+                            .size(SizeCompactIcon)
+                            .clip(ShapeCompact)
+                            .background(IslandTone.ACCENT.tint.copy(alpha = AlphaIconBg)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(Icons.Filled.Link, null, tint = IslandTone.ACCENT.tint, modifier = Modifier.size(18.dp))
+                    }
+                }
+                Text(
+                    event.preview,
+                    color = OnCardText,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    Icons.Filled.ContentCopy,
+                    null,
+                    tint = IslandTone.ACCENT.tint,
+                    modifier = Modifier
+                        .size(SizeIconSm)
+                        .wrapContentWidth(),
+                )
+            }
         }
     }
 
@@ -253,7 +253,7 @@ private fun ClipboardSingleItem(event: IslandEvent.Clipboard, interactor: Island
             compact = true,
             onClick = {
                 interactor.openUrl(event.preview)
-                interactor.collapseIsland()
+                interactor.collapseIslandForAppLaunch(null)
             },
         )
     }
@@ -281,13 +281,10 @@ internal fun RowScope.CompactClipboardRow(
         modifier = Modifier.weight(1f),
     )
     Spacer(Modifier.width(SpaceMd))
-    val interaction = remember { MutableInteractionSource() }
     Surface(
         onClick = { interactor.dismissEvent(event) },
         shape = ShapeChip,
         color = IslandTone.ACCENT.tint.copy(alpha = AlphaIconBg),
-        modifier = Modifier.pressScale(interaction),
-        interactionSource = interaction,
     ) {
         Text(
             stringResource(R.string.ax_dynamic_bar_dismiss),

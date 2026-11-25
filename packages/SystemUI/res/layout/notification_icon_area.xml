@@ -14,9 +14,11 @@
   ~ See the License for the specific language governing permissions and
   ~ limitations under the License
   -->
+<!-- match_parent: NIC dung full notification_icon_area (da weight=1) de
+     isOverflowing do dung width con lai, khong tu hep theo so icon. -->
 <com.android.systemui.statusbar.phone.NotificationIconContainer
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/notificationIcons"
-    android:layout_width="wrap_content"
+    android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:clipChildren="false"/>

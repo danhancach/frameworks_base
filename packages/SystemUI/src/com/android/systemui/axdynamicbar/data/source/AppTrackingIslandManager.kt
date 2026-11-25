@@ -9,7 +9,15 @@ import android.content.pm.PackageManager
 import android.os.RemoteException
 import android.os.UserHandle
 import android.util.Log
+import android.view.Display
 import com.android.systemui.axdynamicbar.model.IslandEvent
+import com.android.systemui.axdynamicbar.shared.AppTrackingFgApplyKind
+import com.android.systemui.axdynamicbar.shared.AppTrackingFgOwnerState
+import com.android.systemui.axdynamicbar.shared.AppTrackingFgTaskInput
+import com.android.systemui.axdynamicbar.shared.statusBarAppFgApplyTask
+import com.android.systemui.axdynamicbar.shared.statusBarAppFgDisplayEligible
+import com.android.systemui.axdynamicbar.shared.statusBarAppPillLogFgOwner
+import com.android.systemui.axdynamicbar.shared.statusBarOwnerForegroundIsHomeOrSystemUi
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.shared.system.TaskStackChangeListener
@@ -30,8 +38,15 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
     private val _appSwitchEvent = MutableStateFlow<IslandEvent.AppSwitch?>(null)
     val appSwitchEvent: StateFlow<IslandEvent.AppSwitch?> = _appSwitchEvent.asStateFlow()
 
+    /** Package user app dang foreground; null = launcher / SystemUI / khong co app. */
+    private val _foregroundPackage = MutableStateFlow<String?>(null)
+    val foregroundPackage: StateFlow<String?> = _foregroundPackage.asStateFlow()
+
     private val recentApps = mutableListOf<IslandEvent.RecentApp>()
-    @Volatile private var listening = false
+    /** Theo doi task stack (media hide +/hoac app_switch). */
+    @Volatile private var stackListening = false
+    /** Co emit IslandEvent.AppSwitch khi doi app. */
+    @Volatile private var emitAppSwitch = false
     private var launcherPackage: String? = null
     private val activityManager by lazy {
         context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -39,8 +54,11 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
     private var switchesSincePrune = 0
 
     @Volatile private var currentForegroundPkg: String? = null
+    /** Pkg cuoi da ghi switch/history — tach dedupe khoi FG ownership. */
+    @Volatile private var lastRecordedSwitchPkg: String? = null
 
     private fun emitEvent() {
+        if (!emitAppSwitch) return
         val event =
             if (recentApps.isNotEmpty())
                 IslandEvent.AppSwitch(
@@ -52,123 +70,335 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
         _appSwitchEvent.value = event
     }
 
-    private val listener =
-        object : TaskStackChangeListener {
-            override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
-                if (!listening) return
-                val topActivity = taskInfo.topActivity ?: return
-                val pkg = topActivity.packageName
-                if (
-                    pkg == launcherPackage ||
-                        pkg == "com.android.systemui" ||
-                        pkg == "com.android.launcher3"
-                ) {
-                    currentForegroundPkg = null
-                    return
-                }
-                if (!hasLauncherIntent(pkg)) return
-                if (pkg == currentForegroundPkg) {
-                    if (Log.isLoggable(TAG, Log.DEBUG)) {
-                        Log.d(TAG, "skip duplicate front pkg=$pkg task=${taskInfo.taskId}")
-                    }
-                    return
-                }
+    private fun setForegroundPackage(
+        pkg: String?,
+        cause: String = "setFg",
+        taskId: Int = -1,
+        displayId: Int = Display.DEFAULT_DISPLAY,
+    ) {
+        currentForegroundPkg = pkg
+        if (_foregroundPackage.value != pkg) {
+            _foregroundPackage.value = pkg
+            // Diag: callback→FG that — cung AxDbAppPill uptime (stage delay Home).
+            statusBarAppPillLogFgOwner(
+                cause = cause,
+                kind = if (pkg == null) "CLEAR" else "SET",
+                taskId = taskId,
+                displayId = displayId,
+                packageName = pkg,
+            )
+        }
+    }
 
-                val leavingPkg = currentForegroundPkg
-                currentForegroundPkg = pkg
+    private fun ownerState(): AppTrackingFgOwnerState =
+        AppTrackingFgOwnerState(
+            foregroundPkg = currentForegroundPkg,
+            lastRecordedSwitchPkg = lastRecordedSwitchPkg,
+        )
 
-                val appName =
-                    try {
-                        context.packageManager
-                            .getApplicationLabel(context.packageManager.getApplicationInfo(pkg, 0))
-                            .toString()
-                    } catch (_: Exception) {
-                        pkg
-                    }
+    /**
+     * Home / wallpaper home-type / SystemUI → FG null (giu pill tren Home).
+     * Khong broad-null moi SystemUI surface ngoai package SystemUI/launcher.
+     */
+    private fun isHomeTypeOrSystemUi(taskInfo: ActivityManager.RunningTaskInfo): Boolean =
+        statusBarOwnerForegroundIsHomeOrSystemUi(
+            topActivityType = taskInfo.topActivityType,
+            packageName = taskInfo.topActivity?.packageName,
+            launcherPackage = launcherPackage,
+        )
 
-                val appIcon =
-                    try {
-                        context.packageManager.getApplicationIcon(pkg)
-                    } catch (_: Exception) {
-                        null
-                    }
+    /**
+     * Top task default display — khong getRunningTasks(1) (co the secondary top).
+     */
+    private fun defaultDisplayTopTask(): ActivityManager.RunningTaskInfo? =
+        try {
+            ActivityTaskManager.getInstance()
+                .getTasks(
+                    /* maxNum = */ 1,
+                    /* filterOnlyVisibleRecents = */ false,
+                    /* keepIntentExtra = */ false,
+                    /* displayId = */ Display.DEFAULT_DISPLAY,
+                )
+                .firstOrNull()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query default-display tasks", e)
+            null
+        }
 
-                val app =
-                    IslandEvent.RecentApp(
-                        packageName = pkg,
-                        appName = appName,
-                        appIcon = appIcon,
+    /**
+     * Ap dung top task → foregroundPackage (+ optional switch history).
+     * @param recordAppSwitch true khi onTaskMovedToFront; false reconcile / seed ownership.
+     */
+    private fun applyForegroundFromTask(
+        taskInfo: ActivityManager.RunningTaskInfo,
+        recordAppSwitch: Boolean,
+    ) {
+        val pkgHint = taskInfo.topActivity?.packageName
+        val result =
+            statusBarAppFgApplyTask(
+                state = ownerState(),
+                task =
+                    AppTrackingFgTaskInput(
+                        displayId = taskInfo.displayId,
+                        topActivityType = taskInfo.topActivityType,
+                        packageName = pkgHint,
                         taskId = taskInfo.taskId,
-                        lastActiveTime = System.currentTimeMillis(),
-                    )
-
-                synchronized(recentApps) {
-                    if (!listening) return
-                    recentApps.removeAll { it.packageName == pkg }
-                    recentApps.add(0, app)
-                    while (recentApps.size > MAX_RECENT) recentApps.removeLast()
-
-                    if (++switchesSincePrune >= MAX_RECENT) {
-                        switchesSincePrune = 0
-                        try {
-                            val runningTaskIds =
-                                activityManager.getRunningTasks(MAX_RECENT + 12)
-                                    .mapTo(HashSet()) { it.taskId }
-                            recentApps.removeAll { it.taskId !in runningTaskIds }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Unable to prune recent tasks", e)
-                        }
-                    }
-
-                    val newPreviousApp =
-                        if (leavingPkg != null && leavingPkg != pkg) {
-                            recentApps.find { it.packageName == leavingPkg }
-                        } else {
-                            _appSwitchEvent.value?.previousApp
-                        }
-
-                    val event =
-                        if (recentApps.isNotEmpty())
-                            IslandEvent.AppSwitch(
-                                recentApps = recentApps.toList(),
-                                previousApp = newPreviousApp,
-                            )
-                        else null
-                    logEvent("front pkg=$pkg leaving=$leavingPkg", event)
-                    _appSwitchEvent.value = event
+                        recordAppSwitch = recordAppSwitch,
+                    ),
+                launcherPackage = launcherPackage,
+                emitAppSwitch = emitAppSwitch,
+                hasLauncherIntent = pkgHint?.let { hasLauncherIntent(it) } ?: false,
+            )
+        val applyCause =
+            if (recordAppSwitch) "onTaskMovedToFront" else "reconcile"
+        when (result.kind) {
+            AppTrackingFgApplyKind.SKIP_DISPLAY -> {
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "skip ineligible displayId=${taskInfo.displayId}")
                 }
+                return
             }
-
-            override fun onTaskRemoved(taskId: Int) {
-                if (!listening) return
-                synchronized(recentApps) {
-                    if (!listening) return
-                    val removed = recentApps.removeAll { it.taskId == taskId }
-                    if (removed) emitEvent()
+            AppTrackingFgApplyKind.SKIP_NO_PACKAGE -> return
+            AppTrackingFgApplyKind.CLEAR_HOME_OR_SYSTEM_UI -> {
+                setForegroundPackage(
+                    pkg = null,
+                    cause = "$applyCause/CLEAR_HOME",
+                    taskId = taskInfo.taskId,
+                    displayId = taskInfo.displayId,
+                )
+                lastRecordedSwitchPkg = result.nextState.lastRecordedSwitchPkg
+                return
+            }
+            AppTrackingFgApplyKind.UPDATE_OWNER -> {
+                setForegroundPackage(
+                    pkg = result.nextState.foregroundPkg,
+                    cause = "$applyCause/UPDATE_OWNER",
+                    taskId = taskInfo.taskId,
+                    displayId = taskInfo.displayId,
+                )
+                lastRecordedSwitchPkg = result.nextState.lastRecordedSwitchPkg
+            }
+            AppTrackingFgApplyKind.OWNER_UNCHANGED -> {
+                lastRecordedSwitchPkg = result.nextState.lastRecordedSwitchPkg
+                if (!result.shouldRecordSwitch) {
+                    if (Log.isLoggable(TAG, Log.DEBUG)) {
+                        Log.d(
+                            TAG,
+                            "skip duplicate front pkg=$pkgHint task=${taskInfo.taskId}",
+                        )
+                    }
+                    return
                 }
             }
         }
+        if (!result.shouldRecordSwitch) return
+
+        val pkg = result.nextState.foregroundPkg ?: return
+        val leavingPkg = result.leavingPkgForSwitch
+
+        val appName =
+            try {
+                context.packageManager
+                    .getApplicationLabel(context.packageManager.getApplicationInfo(pkg, 0))
+                    .toString()
+            } catch (_: Exception) {
+                pkg
+            }
+
+        val appIcon =
+            try {
+                context.packageManager.getApplicationIcon(pkg)
+            } catch (_: Exception) {
+                null
+            }
+
+        val app =
+            IslandEvent.RecentApp(
+                packageName = pkg,
+                appName = appName,
+                appIcon = appIcon,
+                taskId = taskInfo.taskId,
+                lastActiveTime = System.currentTimeMillis(),
+            )
+
+        synchronized(recentApps) {
+            if (!stackListening || !emitAppSwitch) return
+            recentApps.removeAll { it.packageName == pkg }
+            recentApps.add(0, app)
+            while (recentApps.size > MAX_RECENT) recentApps.removeLast()
+
+            if (++switchesSincePrune >= MAX_RECENT) {
+                switchesSincePrune = 0
+                try {
+                    val runningTaskIds =
+                        activityManager.getRunningTasks(MAX_RECENT + 12)
+                            .mapTo(HashSet()) { it.taskId }
+                    recentApps.removeAll { it.taskId !in runningTaskIds }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unable to prune recent tasks", e)
+                }
+            }
+
+            val newPreviousApp =
+                if (leavingPkg != null && leavingPkg != pkg) {
+                    recentApps.find { it.packageName == leavingPkg }
+                } else {
+                    _appSwitchEvent.value?.previousApp
+                }
+
+            val event =
+                if (recentApps.isNotEmpty())
+                    IslandEvent.AppSwitch(
+                        recentApps = recentApps.toList(),
+                        previousApp = newPreviousApp,
+                    )
+                else null
+            logEvent("front pkg=$pkg leaving=$leavingPkg", event)
+            _appSwitchEvent.value = event
+        }
+    }
+
+    /**
+     * Event-driven reconcile (khong poll): top default-display 1 lan / callback.
+     * Bu home-type null topActivity (wallpaper task) + stack doi truoc MovedToFront muon.
+     */
+    private fun reconcileForegroundFromRunningTask() {
+        val task = defaultDisplayTopTask() ?: return
+        applyForegroundFromTask(task, recordAppSwitch = false)
+    }
+
+    private val listener =
+        object : TaskStackChangeListener {
+            override fun onTaskMovedToFront(taskInfo: ActivityManager.RunningTaskInfo) {
+                if (!stackListening) return
+                applyForegroundFromTask(taskInfo, recordAppSwitch = true)
+            }
+
+            /**
+             * Home restart/TO_FRONT thuong log som (truoc remote transition finish ~1s).
+             * Chi clear FG khi Home tren default display — khong clear secondary Home.
+             */
+            override fun onActivityRestartAttempt(
+                task: ActivityManager.RunningTaskInfo,
+                homeTaskVisible: Boolean,
+                clearedTask: Boolean,
+                wasVisible: Boolean,
+            ) {
+                if (!stackListening) return
+                if (!statusBarAppFgDisplayEligible(task.displayId)) return
+                // Chi khi task dang restart la Home/SystemUI — khong clear theo homeTaskVisible le.
+                if (!isHomeTypeOrSystemUi(task)) return
+                setForegroundPackage(
+                    pkg = null,
+                    cause = "onActivityRestartAttempt/HOME",
+                    taskId = task.taskId,
+                    displayId = task.displayId,
+                )
+            }
+
+            override fun onTaskStackChanged() {
+                if (!stackListening) return
+                reconcileForegroundFromRunningTask()
+            }
+
+            override fun onTaskRemoved(taskId: Int) {
+                if (!stackListening) return
+                synchronized(recentApps) {
+                    if (!stackListening) return
+                    val removed = recentApps.removeAll { it.taskId == taskId }
+                    if (removed) emitEvent()
+                }
+                // Task owner bi remove — reconcile top con lai (co the ve Home).
+                reconcileForegroundFromRunningTask()
+            }
+        }
+
+    /** Theo doi foreground (an media pill khi app mo) — khong can bat event app_switch. */
+    fun startForegroundTracking() {
+        ensureStackListening()
+    }
+
+    fun stopForegroundTracking() {
+        // Giữ listener neu app_switch van bat.
+        if (!emitAppSwitch) {
+            tearDownStackListening()
+        }
+    }
 
     fun startListening() {
-        if (listening) return
-        listening = true
-        currentForegroundPkg = null
-        switchesSincePrune = 0
-        launcherPackage = resolveLauncherPackage()
-        TaskStackChangeListeners.getInstance().registerTaskStackListener(listener)
+        emitAppSwitch = true
+        ensureStackListening()
     }
 
     fun stopListening() {
-        if (!listening) return
-        listening = false
-        currentForegroundPkg = null
-        switchesSincePrune = 0
-        synchronized(launcherIntentCache) { launcherIntentCache.clear() }
-        TaskStackChangeListeners.getInstance().unregisterTaskStackListener(listener)
+        emitAppSwitch = false
         synchronized(recentApps) {
             recentApps.clear()
             _appSwitchEvent.value = null
         }
+        // Van theo doi foreground neu media can.
+        // stopForegroundTracking goi rieng khi tat media.
+        if (!stackListening) return
+        // Neu chi app_switch tat ma foreground tracking van can — repository quyet.
+    }
+
+    /** Tat het (media + app_switch). */
+    fun stopAll() {
+        emitAppSwitch = false
+        tearDownStackListening()
+        synchronized(recentApps) {
+            recentApps.clear()
+            _appSwitchEvent.value = null
+        }
+        setForegroundPackage(null)
+        lastRecordedSwitchPkg = null
+    }
+
+    private fun ensureStackListening() {
+        if (stackListening) return
+        stackListening = true
+        switchesSincePrune = 0
+        launcherPackage = resolveLauncherPackage()
+        TaskStackChangeListeners.getInstance().registerTaskStackListener(listener)
+        seedForegroundFromRunningTask()
+    }
+
+    /** Dong bo foreground hien tai (tranh pill media le khi da o trong app). */
+    private fun seedForegroundFromRunningTask() {
+        try {
+            val task = defaultDisplayTopTask() ?: return
+            if (!statusBarAppFgDisplayEligible(task.displayId)) return
+            if (isHomeTypeOrSystemUi(task) ||
+                task.topActivity?.packageName?.let { !hasLauncherIntent(it) } == true
+            ) {
+                setForegroundPackage(
+                    pkg = null,
+                    cause = "seed/CLEAR_HOME",
+                    taskId = task.taskId,
+                    displayId = task.displayId,
+                )
+            } else {
+                val pkg = task.topActivity?.packageName ?: return
+                setForegroundPackage(
+                    pkg = pkg,
+                    cause = "seed/SET",
+                    taskId = task.taskId,
+                    displayId = task.displayId,
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to seed foreground package", e)
+        }
+    }
+
+    private fun tearDownStackListening() {
+        if (!stackListening) return
+        stackListening = false
+        switchesSincePrune = 0
+        synchronized(launcherIntentCache) { launcherIntentCache.clear() }
+        TaskStackChangeListeners.getInstance().unregisterTaskStackListener(listener)
+        setForegroundPackage(null)
+        lastRecordedSwitchPkg = null
     }
 
     fun clear() {
@@ -187,7 +417,7 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
     }
 
     fun switchToApp(taskId: Int) {
-        if (!listening || taskId < 0) return
+        if (!emitAppSwitch || taskId < 0) return
         val tracked = synchronized(recentApps) {
             recentApps.firstOrNull { it.taskId == taskId }
                 ?: _appSwitchEvent.value?.previousApp?.takeIf { it.taskId == taskId }
@@ -230,11 +460,14 @@ class AppTrackingIslandManager @Inject constructor(@Application private val cont
             }
 
             recentApps.removeAll { it.taskId == taskId }
-            if (pkg == currentForegroundPkg) currentForegroundPkg = null
+            if (pkg == currentForegroundPkg) setForegroundPackage(null)
+            if (pkg == lastRecordedSwitchPkg) lastRecordedSwitchPkg = null
 
             val newPreviousApp =
                 if (_appSwitchEvent.value?.previousApp?.taskId == taskId) null
                 else _appSwitchEvent.value?.previousApp
+
+            if (!emitAppSwitch) return
 
             val event =
                 if (recentApps.isNotEmpty())

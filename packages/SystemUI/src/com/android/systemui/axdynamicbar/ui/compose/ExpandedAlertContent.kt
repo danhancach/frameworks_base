@@ -2,7 +2,6 @@ package com.android.systemui.axdynamicbar.ui.compose
 
 import android.text.format.DateFormat
 import androidx.compose.foundation.background
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,7 +19,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -35,9 +33,21 @@ import java.util.Date
 
 @Composable
 internal fun AlarmExpanded(event: IslandEvent.Alarm, interactor: IslandActions) {
+    val context = LocalContext.current
     val tint = IslandTone.ATTENTION.tint
     ExpandedCardLayout(
         accentColor = tint,
+        onContentClick =
+            if (event.contentIntent != null || event.packageName.isNotEmpty()) {
+                {
+                    openEventContentAndCollapse(
+                        context,
+                        event.contentIntent,
+                        interactor,
+                        event.packageName,
+                    )
+                }
+            } else null,
         icon = {
             if (event.isRinging) PulsingDot(color = tint, size = 14.dp)
             else Icon(Icons.Filled.Alarm, null, tint = tint, modifier = Modifier.size(16.dp))
@@ -109,13 +119,10 @@ internal fun RowScope.CompactAlarmRow(
     }
     if (event.isRinging) {
         Spacer(Modifier.width(SpaceMd))
-        val interaction = remember { MutableInteractionSource() }
         Surface(
             onClick = { interactor.dismissEvent(event) },
             shape = ShapeChip,
             color = tint.copy(alpha = AlphaIconBg),
-            modifier = Modifier.pressScale(interaction),
-            interactionSource = interaction,
         ) {
             Text(
                 stringResource(R.string.ax_dynamic_bar_dismiss),

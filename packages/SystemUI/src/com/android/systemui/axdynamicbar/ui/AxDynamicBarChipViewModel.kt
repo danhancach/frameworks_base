@@ -1,31 +1,31 @@
 package com.android.systemui.axdynamicbar.ui
 
-import android.view.HapticFeedbackConstants
-import android.view.View
-import androidx.compose.ui.geometry.Rect
+import android.os.SystemClock
 import com.android.systemui.animation.Expandable
 import com.android.systemui.axdynamicbar.domain.AxDynamicBarInteractor
 import com.android.systemui.axdynamicbar.model.IslandEvent
-import com.android.systemui.statusbar.chips.ui.model.OngoingActivityChipModel
 import com.android.systemui.biometrics.AuthController
 import com.android.systemui.biometrics.domain.interactor.UdfpsOverlayInteractor
+import com.android.systemui.classifier.domain.interactor.FalsingInteractor
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
 import com.android.systemui.statusbar.KeyguardIndicationController
+import com.android.systemui.statusbar.chips.ui.model.OngoingActivityChipModel
 import com.android.systemui.statusbar.pipeline.battery.domain.interactor.BatteryInteractor
 import com.android.systemui.statusbar.policy.BatteryController
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -33,9 +33,25 @@ import kotlinx.coroutines.launch
 data class AxDynamicBarChipState(
     val event: IslandEvent,
     val eventCount: Int,
+    /** Persistent user pin — khong doi khi FG suppress tam. */
     val pinnedIndex: Int,
+    /**
+     * Index UI visible (topEvent) — co the khac [pinnedIndex] khi pin dang suppress.
+     */
+    val visibleSelectedIndex: Int = pinnedIndex,
     val allEvents: List<IslandEvent>,
     val notificationAlert: IslandEvent.Notification? = null,
+    /**
+     * Hidden for owner foreground or pending run confirmation; composition survives.
+     * Khac event remove / dummy↔real handoff.
+     */
+    val ownerAppVisualHidden: Boolean = false,
+    /** Number of IDs suppressed by actual foreground ownership. */
+    val foregroundSuppressedCount: Int = 0,
+    /** Package FG that (raw) — Chip tokenize khi log AxDbAppPill. */
+    val foregroundPackage: String? = null,
+    /** Total visually suppressed IDs; owner and pending sets can overlap. */
+    val visuallySuppressedCount: Int = foregroundSuppressedCount,
 )
 
 data class KeyguardBatteryInfo(
@@ -60,7 +76,13 @@ constructor(
     private val keyguardIndicationController: KeyguardIndicationController,
     val keyguardExpansion: AxDynamicBarKeyguardExpansion,
     val statusBarExpansion: AxDynamicBarStatusBarExpansion,
+    private val falsingInteractor: FalsingInteractor,
 ) {
+    /** Goi ngay ACTION_DOWN (pointerInteropFilter) — tranh falsing FP unlock. */
+    fun avoidFalsingGesture() {
+        falsingInteractor.avoidGesture()
+    }
+
     val isLowUdfps: StateFlow<Boolean> =
         udfpsOverlayInteractor.udfpsOverlayParams
             .map { params ->
@@ -76,15 +98,31 @@ constructor(
     val chipState: StateFlow<AxDynamicBarChipState?> =
         interactor.uiState
             .map { uiState ->
-                if (!uiState.shouldShow) return@map null
                 val alert = uiState.notificationAlert
-                val topEvent = uiState.topEvent ?: alert ?: return@map null
+                val ownerAppHidden =
+                    uiState.visuallySuppressedIds.isNotEmpty() &&
+                        uiState.visibleEvents.isEmpty() &&
+                        alert == null &&
+                        uiState.events.any { it.id in uiState.visuallySuppressedIds }
+                // Keep the same composition while hidden or awaiting Clock confirmation.
+                if (!uiState.shouldShow && !ownerAppHidden) return@map null
+                if (!uiState.hasUnderlyingChipEvents && alert == null) return@map null
+                val topEvent =
+                    uiState.topEvent
+                        ?: alert
+                        ?: uiState.events.firstOrNull { it.id in uiState.visuallySuppressedIds }
+                        ?: return@map null
                 AxDynamicBarChipState(
                     event = topEvent,
                     eventCount = uiState.events.count { it !is IslandEvent.Notification },
                     pinnedIndex = uiState.pinnedEventIndex,
+                    visibleSelectedIndex = uiState.visibleSelectedIndex,
                     allEvents = uiState.events,
                     notificationAlert = alert,
+                    ownerAppVisualHidden = ownerAppHidden,
+                    foregroundSuppressedCount = uiState.foregroundSuppressedIds.size,
+                    foregroundPackage = uiState.foregroundPackage,
+                    visuallySuppressedCount = uiState.visuallySuppressedIds.size,
                 )
             }
             .distinctUntilChanged()
@@ -96,14 +134,6 @@ constructor(
     val isKeyguardMusicPillEnabled: StateFlow<Boolean> = interactor.settings.isKeyguardMusicPillEnabled
     val mediaUseWaveform: StateFlow<Boolean> = interactor.mediaUseWaveform
     val chipStyle: StateFlow<Int> = interactor.settings.chipStyle
-    val chipMorphEnabled: StateFlow<Boolean> = interactor.settings.chipMorphEnabled
-    val hapticsEnabled: StateFlow<Boolean> = interactor.settings.hapticsEnabled
-
-    fun performTapHaptic(view: View) {
-        if (hapticsEnabled.value) {
-            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-        }
-    }
 
     val keyguardBatteryInfo: StateFlow<KeyguardBatteryInfo> =
         combine(
@@ -126,6 +156,7 @@ constructor(
         )
 
     init {
+        interactor.onKeyguardCollapseRequested = { keyguardExpansion.collapse() }
         applicationScope.launch {
             interactor.uiState
                 .map { state ->
@@ -136,7 +167,7 @@ constructor(
                 .distinctUntilChanged()
                 .collect { incomingCallId ->
                     if (incomingCallId != null) {
-                        interactor.dismissNotificationAlert()
+                        interactor.dismissAllNotificationAlertsImmediate(notifyExpansion = false)
                         if (interactor.isOnKeyguard.value) {
                             keyguardExpansion.expand()
                         } else {
@@ -148,6 +179,107 @@ constructor(
                     }
                 }
         }
+        // Dem nguoc het gio → mo pill dung timer do (giong cuoc goi den; multi-timer dung onlyEventId).
+        observeTimerExpiryAutoExpand()
+    }
+
+    /**
+     * Schedule expand 1 lan / (event.id + moc end). Khong restart job neu cung stamp dang chay.
+     * Bo qua khi co cuoc goi den (collector call dang giu expand/collapse).
+     */
+    private fun observeTimerExpiryAutoExpand() {
+        applicationScope.launch {
+            val expiryJobs = ConcurrentHashMap<String, Job>()
+            val scheduledStamp = ConcurrentHashMap<String, String>()
+            val firedStamps = ConcurrentHashMap.newKeySet<String>()
+            interactor.uiState
+                .map { state ->
+                    state.events
+                        .filterIsInstance<IslandEvent.Timer>()
+                        .mapNotNull { timer ->
+                            if (timer.isPaused) return@mapNotNull null
+                            val endEr = timer.endElapsedRealtimeMs
+                            val endWall = timer.endTimeMs
+                            if (endEr <= 0L && endWall <= 0L) null
+                            else TimerExpiryWatch(timer.id, endEr, endWall)
+                        }
+                        .associateBy { it.id }
+                }
+                .distinctUntilChanged()
+                .collect { watches ->
+                    for (id in expiryJobs.keys - watches.keys) {
+                        expiryJobs.remove(id)?.cancel()
+                        scheduledStamp.remove(id)
+                        firedStamps.removeIf { it.startsWith("$id#") }
+                    }
+                    for ((id, watch) in watches) {
+                        val stamp = watch.stamp()
+                        if (stamp in firedStamps) continue
+                        if (scheduledStamp[id] == stamp && expiryJobs[id]?.isActive == true) {
+                            continue
+                        }
+                        val remainingMs = watch.remainingMs()
+                        expiryJobs.remove(id)?.cancel()
+                        scheduledStamp[id] = stamp
+                        expiryJobs[id] =
+                            launch {
+                                if (remainingMs > 0L) delay(remainingMs)
+                                if (!shouldFireTimerExpiryExpand(id, stamp)) return@launch
+                                if (!firedStamps.add(stamp)) return@launch
+                                expandForTimerExpiry(id)
+                            }
+                    }
+                }
+        }
+    }
+
+    private fun shouldFireTimerExpiryExpand(eventId: String, stamp: String): Boolean {
+        if (hasIncomingCall()) return false
+        val current =
+            interactor.uiState.value.events
+                .filterIsInstance<IslandEvent.Timer>()
+                .firstOrNull { it.id == eventId } ?: return false
+        if (current.isPaused) return false
+        return TimerExpiryWatch(
+                current.id,
+                current.endElapsedRealtimeMs,
+                current.endTimeMs,
+            )
+            .stamp() == stamp
+    }
+
+    private fun hasIncomingCall(): Boolean =
+        interactor.uiState.value.events.any {
+            it is IslandEvent.Call && it.callType == "Phone:incoming"
+        }
+
+    private fun expandForTimerExpiry(eventId: String) {
+        interactor.dismissAllNotificationAlertsImmediate(notifyExpansion = false)
+        interactor.pinEventById(eventId)
+        if (interactor.isOnKeyguard.value) {
+            keyguardExpansion.expand(eventId)
+        } else {
+            statusBarExpansion.expand(eventId)
+        }
+    }
+
+    /** Moc het gio timer — schedule expand 1 lan / (id + end). */
+    private data class TimerExpiryWatch(
+        val id: String,
+        val endElapsedRealtimeMs: Long,
+        val endTimeMs: Long,
+    ) {
+        fun stamp(): String = "$id#$endElapsedRealtimeMs#$endTimeMs"
+
+        fun remainingMs(
+            nowElapsedMs: Long = SystemClock.elapsedRealtime(),
+            nowWallMs: Long = System.currentTimeMillis(),
+        ): Long =
+            when {
+                endElapsedRealtimeMs > 0L -> endElapsedRealtimeMs - nowElapsedMs
+                endTimeMs > 0L -> endTimeMs - nowWallMs
+                else -> Long.MAX_VALUE
+            }
     }
 
     // Re-compute charging string whenever battery info changes
@@ -165,12 +297,6 @@ constructor(
 
     val isOnKeyguard: StateFlow<Boolean> = interactor.isOnKeyguard
 
-    val isShowingOnStatusBar: Flow<Boolean> =
-        combine(isEnabled, chipState, isOnKeyguard) { enabled, state, onKeyguard ->
-                enabled && state != null && !onKeyguard
-            }
-            .distinctUntilChanged()
-
     val isKeyguardFadingAway: StateFlow<Boolean> = interactor.isKeyguardFadingAway
 
     val isBouncerShowing: StateFlow<Boolean> = interactor.isBouncerShowing
@@ -187,12 +313,14 @@ constructor(
         keyguardIndicationController.setSuppressIndication(suppressed)
     }
 
-    private val _chipBoundsOnScreen = MutableStateFlow<Rect?>(null)
-    val chipBoundsOnScreen: StateFlow<Rect?> = _chipBoundsOnScreen.asStateFlow()
+    private val _chipCenterXFraction = MutableStateFlow(0.5f)
+    val chipCenterXFraction: StateFlow<Float> = _chipCenterXFraction.asStateFlow()
 
-    fun updateChipBounds(bounds: Rect) {
-        if (bounds.width > 0f && bounds.height > 0f) _chipBoundsOnScreen.value = bounds
+    fun updateChipCenterX(fraction: Float) {
+        if (fraction.isFinite()) _chipCenterXFraction.value = fraction.coerceIn(0f, 1f)
     }
+
+    val isAlertExpanded: StateFlow<Boolean> = statusBarExpansion.isAlertExpanded
 
     val isExpanded: StateFlow<Boolean> = statusBarExpansion.isExpanded
 
@@ -218,13 +346,16 @@ constructor(
 
     fun cyclePrev() = interactor.cyclePrev()
 
+    /** Pin event theo id (stack reorder commit Samsung Now Bar). */
+    fun pinEventById(eventId: String) = interactor.pinEventById(eventId)
+
     fun dismissEvent(event: IslandEvent) = interactor.dismissEvent(event)
 
-    fun togglePlayPause() = interactor.togglePlayPause()
+    fun togglePlayPause(mediaKey: String) = interactor.togglePlayPause(mediaKey)
 
-    fun skipNext() = interactor.skipNext()
+    fun skipNext(mediaKey: String) = interactor.skipNext(mediaKey)
 
-    fun skipPrev() = interactor.skipPrev()
+    fun skipPrev(mediaKey: String) = interactor.skipPrev(mediaKey)
 
     fun toggleTorch() = interactor.toggleTorch()
 

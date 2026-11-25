@@ -23,6 +23,8 @@ import android.content.IntentFilter;
 import android.graphics.PixelFormat;
 import android.os.BatteryManager;
 import android.os.Handler;
+import android.view.Display;
+import android.view.DisplayCutout;
 import android.view.WindowManager;
 
 import com.android.systemui.CoreStartable;
@@ -133,6 +135,14 @@ public class CutoutProgressController implements CoreStartable {
     }
 
     private void enableFeature() {
+        // May khong co punch-hole (vd pdx237): khong gan overlay ring.
+        Display display = mContext.getDisplay();
+        DisplayCutout cutout = display != null ? display.getCutout() : null;
+        if (cutout == null || cutout.isEmpty()) {
+            disableFeature();
+            return;
+        }
+
         attachOverlay();
         registerPipelineListener();
         registerBatteryReceiver();

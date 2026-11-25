@@ -59,8 +59,21 @@ internal fun NowPlayingExpanded(event: IslandEvent.NowPlaying, interactor: Islan
         }
     }
 
+    val launchIntent = event.contentIntent ?: event.sbn?.notification?.contentIntent
+    val launchPkg = event.sbn?.packageName.orEmpty()
     ExpandedCardLayout(
         accentColor = tint,
+        onContentClick =
+            if (launchIntent != null || launchPkg.isNotEmpty()) {
+                {
+                    openEventContentAndCollapse(
+                        context,
+                        launchIntent,
+                        interactor,
+                        launchPkg,
+                    )
+                }
+            } else null,
         iconSize = if (event.albumArt != null) SizeCompactIcon else SizeIconBadge,
         iconBackground = event.albumArt == null,
         icon = {

@@ -7,8 +7,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,7 +21,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bluetooth
@@ -38,7 +35,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -374,22 +370,27 @@ private fun RingerCard(
             label = "ringer_tint",
         )
 
-    val interaction = remember { MutableInteractionSource() }
+    val morphHostFrame = LocalKeyguardMorphHostFrame.current
     Surface(
-        onClick = onClick,
-        modifier = modifier.pressScale(interaction).semantics { selected = isSelected },
+        onClick = if (morphHostFrame) ({}) else onClick,
+        enabled = !morphHostFrame,
+        modifier = modifier.semantics { selected = isSelected },
         shape = ShapeLg,
         color = bg,
-        interactionSource = interaction,
     ) {
-        // The tile is already inset; the generous padding these used to carry just made it tall.
-        Column(
-            modifier = Modifier.padding(vertical = SpaceMd),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(SpaceXs),
-        ) {
-            Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp))
-            Text(label, color = tint, style = MaterialTheme.typography.labelSmall)
+        Box {
+            // The tile is already inset; the generous padding these used to carry just made it tall.
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(vertical = SpaceMd),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(SpaceXs),
+            ) {
+                Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp))
+                Text(label, color = tint, style = MaterialTheme.typography.labelSmall)
+            }
+            if (morphHostFrame) {
+                MorphNativeHitOverlay(onClick = onClick, modifier = Modifier.matchParentSize())
+            }
         }
     }
 }

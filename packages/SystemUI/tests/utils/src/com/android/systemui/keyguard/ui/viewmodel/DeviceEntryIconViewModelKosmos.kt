@@ -17,6 +17,7 @@
 package com.android.systemui.keyguard.ui.viewmodel
 
 import com.android.systemui.accessibility.domain.interactor.accessibilityInteractor
+import com.android.systemui.axdynamicbar.ui.AxDynamicBarKeyguardExpansion
 import com.android.systemui.deviceentry.domain.interactor.deviceEntryInteractor
 import com.android.systemui.deviceentry.domain.interactor.deviceEntrySourceInteractor
 import com.android.systemui.deviceentry.domain.interactor.deviceEntryUdfpsInteractor
@@ -30,6 +31,9 @@ import com.android.systemui.kosmos.testScope
 import com.android.systemui.scene.domain.interactor.sceneInteractor
 import com.android.systemui.shade.domain.interactor.shadeInteractor
 import com.android.systemui.statusbar.phone.statusBarKeyguardViewManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.whenever
 
 val Kosmos.fakeDeviceEntryIconViewModelTransition by Fixture { FakeDeviceEntryIconTransition() }
 
@@ -38,6 +42,8 @@ val Kosmos.deviceEntryIconViewModelTransitionsMock by Fixture {
 }
 
 val Kosmos.deviceEntryIconViewModel by Fixture {
+    val dynamicBarKeyguardExpansion = mock<AxDynamicBarKeyguardExpansion>()
+    whenever(dynamicBarKeyguardExpansion.isPillDragging).thenReturn(MutableStateFlow(false))
     DeviceEntryIconViewModel(
         transitions = deviceEntryIconViewModelTransitionsMock,
         burnInInteractor = burnInInteractor,
@@ -51,5 +57,6 @@ val Kosmos.deviceEntryIconViewModel by Fixture {
         accessibilityInteractor = accessibilityInteractor,
         scope = testScope.backgroundScope,
         sceneInteractor = { sceneInteractor },
+        axDynamicBarKeyguardExpansion = dynamicBarKeyguardExpansion,
     )
 }

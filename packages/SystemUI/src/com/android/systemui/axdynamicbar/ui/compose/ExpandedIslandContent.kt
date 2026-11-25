@@ -2,26 +2,17 @@
 
 package com.android.systemui.axdynamicbar.ui.compose
 
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -32,7 +23,9 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.MaterialTheme
+import com.android.systemui.axdynamicbar.shared.islandClickIndication
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -55,34 +48,80 @@ import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.shared.*
 import com.android.systemui.res.R
 
-private val EXPANDED_BOTTOM_PAD = 50.dp
-
 @Composable
 fun ExpandedIslandContent(
     events: List<IslandEvent>,
     interactor: IslandActions,
     onCollapse: () -> Unit,
     expandedFilter: String? = null,
+    /**
+     * Chronometer: id dang mo luc expand (multi-timer). Stack van dung ALL non-notif events
+     * de doi media↔timer; commit cap nhat qua [onExpandOnlyEventIdChange].
+     */
+    expandOnlyEventId: String? = null,
     pinnedEventId: String? = null,
+    /** Cap nhat expand-only khi stack commit (null cho media / non-chronometer). */
+    onExpandOnlyEventIdChange: ((String?) -> Unit)? = null,
+    /**
+     * Confirmed stack pin — event.id the moi (ke ca media↔media).
+     * Ownership: goi SAU interactor.pinEventById; sync frozen morph/dummy.
+     */
+    onConfirmedStackEventId: ((String) -> Unit)? = null,
     hapticsViewModelFactory: SliderHapticsViewModel.Factory,
+    stackGesturesEnabled: Boolean = true,
 ) {
     if (events.isEmpty()) return
 
+    // Status-bar expand (khong filter): stack Samsung — toan bo chip non-notif.
+    if (expandedFilter == null) {
+        val stackEvents =
+            remember(events, pinnedEventId) { buildStackOrder(events, pinnedEventId) }
+        LaunchedEffect(stackEvents) {
+            if (stackEvents.isEmpty()) {
+                delay(200)
+                onCollapse()
+            }
+        }
+        if (stackEvents.isEmpty()) return
+
+        // Pin + dong bo expandOnly + frozen (timer↔media / multi media).
+        val stackInteractor =
+            remember(interactor, events, onExpandOnlyEventIdChange, onConfirmedStackEventId) {
+                object : IslandActions by interactor {
+                    override fun pinEventById(eventId: String) {
+                        // Pin sync uiState.topEvent TRUOC callback (atomic ownership).
+                        interactor.pinEventById(eventId)
+                        val next = events.find { it.id == eventId }
+                        // Uu tien event.id that — media↔media null→null van sync frozen.
+                        if (onConfirmedStackEventId != null) {
+                            onConfirmedStackEventId.invoke(eventId)
+                        } else {
+                            onExpandOnlyEventIdChange?.invoke(
+                                next?.let { expandOnlyEventIdFor(it) },
+                            )
+                        }
+                    }
+                }
+            }
+        // expandOnlyEventId chi anh huong pin luc mo; stack order = pinned + cycle.
+        StackedExpandedPanels(
+            events = events,
+            pinnedEventId = pinnedEventId ?: expandOnlyEventId,
+            interactor = stackInteractor,
+            hapticsViewModelFactory = hapticsViewModelFactory,
+            stackGesturesEnabled = stackGesturesEnabled,
+        )
+        return
+    }
+
     val filteredEvents =
         remember(events, expandedFilter, pinnedEventId) {
-            if (expandedFilter != null) {
-                events.filter {
-                    EVENT_TYPE_IDS[it::class.java] == expandedFilter
-                }
+            val typed = events.filter { EVENT_TYPE_IDS[it::class.java] == expandedFilter }
+            val pinned = typed.find { it.id == pinnedEventId }
+            if (pinned != null) {
+                listOf(pinned) + typed.filter { it.id != pinned.id }
             } else {
-
-                val base = events.filter { it !is IslandEvent.Notification }
-                val pinned = base.find { it.id == pinnedEventId }
-                if (pinned != null) {
-                    listOf(pinned) + base.filter { it.id != pinned.id }
-                } else {
-                    base
-                }
+                typed
             }
         }
 
@@ -105,6 +144,7 @@ fun ExpandedIslandContent(
     if (filteredEvents.isEmpty()) return
 
     val isNotificationFilter = expandedFilter == "notification"
+    val context = LocalContext.current
     val notifGroups =
         remember(filteredEvents, isNotificationFilter) {
             if (!isNotificationFilter) return@remember emptyList()
@@ -132,9 +172,24 @@ fun ExpandedIslandContent(
                     item(key = event.id) {
                         MagneticSwipeToDismiss(
                             onDismiss = { interactor.dismissEvent(event) },
+                            // SB: khong rotationZ khi vuot ngang.
+                            tiltEnabled = false,
                             modifier = Modifier.animateItem(),
                         ) {
-                            PrimaryCard { NotificationExpanded(event, interactor) }
+                            CompositionLocalProvider(LocalStackOwnsContentClick provides true) {
+                                PrimaryCard(
+                                    onClick = {
+                                        openEventContentAndCollapse(
+                                            context,
+                                            event.sbn.notification?.contentIntent,
+                                            interactor,
+                                            event.sbn.packageName.orEmpty(),
+                                        )
+                                    },
+                                ) {
+                                    NotificationExpanded(event, interactor)
+                                }
+                            }
                         }
                     }
                 } else {
@@ -143,6 +198,8 @@ fun ExpandedIslandContent(
                     item(key = "group_$pkg") {
                         MagneticSwipeToDismiss(
                             onDismiss = { group.forEach { interactor.dismissEvent(it) } },
+                            // SB: khong rotationZ khi vuot ngang.
+                            tiltEnabled = false,
                             modifier = Modifier.animateItem(),
                         ) {
                             PrimaryCard {
@@ -160,44 +217,44 @@ fun ExpandedIslandContent(
         } else {
             items(filteredEvents, key = { it.id }) { event ->
                 MagneticSwipeToDismiss(
-                    onDismiss = { interactor.dismissEvent(event) },
+                    onDismiss = {
+                        if (event is IslandEvent.Media) {
+                            interactor.dismissEventFromExpandedSwipe(event)
+                        } else {
+                            interactor.dismissEvent(event)
+                        }
+                    },
+                    // Media chi cho vuot ngang de an ngay khi dang tam dung.
+                    allowHorizontalDismiss = event !is IslandEvent.Media || !event.isPlaying,
+                    horizontalDetachThreshold = StackExpandedCardSwipeStartDp,
+                    horizontalReleaseStrictThreshold = StackExpandedCardSwipeStartDp,
+                    // SB: khong rotationZ khi vuot ngang.
+                    tiltEnabled = false,
                     modifier = Modifier.animateItem(),
                 ) {
-                    if (event is IslandEvent.Media) {
-                        MediaCard(event, interactor)
-                    } else {
-                        val context = LocalContext.current
-                        val tapModifier =
-                            if (event.contentIntent != null) {
-                                Modifier.clickable {
-                                    if (event.contentIntent.trySendWithBal(context)) {
-                                        interactor.collapseIsland()
-                                    }
+                    when (event) {
+                        is IslandEvent.Media -> MediaCard(event, interactor)
+                        // Chronometer & Promoted ongoing: khung QS — khong PrimaryCard SpaceXxl.
+                        is IslandEvent.Timer ->
+                            ChronometerQsCard { TimerExpanded(event, interactor) }
+                        is IslandEvent.Stopwatch ->
+                            ChronometerQsCard { StopwatchExpanded(event, interactor) }
+                        is IslandEvent.PromotedOngoing -> PromotedOngoingExpanded(event, interactor)
+                        else -> {
+                            val primaryClick =
+                                if (canOpenIslandEventApp(event)) {
+                                    { openIslandEventAndCollapse(context, event, interactor) }
+                                } else {
+                                    null
                                 }
-                            } else {
-                                Modifier
-                            }
-                        PrimaryCard(modifier = tapModifier) {
-                            // Hoisted: the specs are read inside the non-composable transitionSpec.
-                            val motionScheme = MaterialTheme.motionScheme
-                            AnimatedContent(
-                                targetState = event,
-                                transitionSpec = {
-                                    ((fadeIn(motionScheme.defaultEffectsSpec()) +
-                                        scaleIn(
-                                            initialScale = 0.95f,
-                                            animationSpec = motionScheme.defaultSpatialSpec(),
-                                        )) togetherWith
-                                        (fadeOut(motionScheme.fastEffectsSpec()) +
-                                            scaleOut(
-                                                targetScale = 0.95f,
-                                                animationSpec = motionScheme.fastSpatialSpec(),
-                                            ))).using(sizeTransform = null)
-                                },
-                                contentKey = { it::class.simpleName + it.id },
-                                label = "expanded_card",
-                            ) { animatedEvent ->
-                                ExpandedEventContent(animatedEvent, interactor, hapticsViewModelFactory)
+                            CompositionLocalProvider(LocalStackOwnsContentClick provides true) {
+                                PrimaryCard(onClick = primaryClick) {
+                                    ExpandedEventContent(
+                                        event,
+                                        interactor,
+                                        hapticsViewModelFactory,
+                                    )
+                                }
                             }
                         }
                     }
@@ -261,55 +318,70 @@ internal fun CallExpanded(event: IslandEvent.Call, interactor: IslandActions) {
     val declineTint = IslandTone.ALERT.tint
     val answerTint = IslandTone.POSITIVE.tint
 
+    val onCallClick: (() -> Unit)? =
+        if (LocalStackOwnsContentClick.current) {
+            null
+        } else {
+            {
+                openEventContentAndCollapse(
+                    context,
+                    event.sbn.notification?.contentIntent,
+                    interactor,
+                    event.sbn.packageName.orEmpty(),
+                )
+            }
+        }
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable {
-                if (event.contentIntent.trySendWithBal(context)) interactor.collapseIsland()
-            },
+        modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(SpaceMd),
     ) {
         // Plain row: the card behind it is already the surface, a tinted panel inside it was a
-        // second surface stacked on the glass.
-        Row(
+        // second surface stacked on the glass. Boc Box de MorphNativeHitOverlay khong che nut duoi.
+        MorphClickableBox(
+            onClick = onCallClick,
+            indication = islandClickIndication(),
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(SpaceMd),
         ) {
-            // Caller photo or app icon
-            val photo = event.callerPhoto ?: event.appIcon
-            if (photo != null) {
-                Image(
-                    bitmap = photo.toScaledBitmap(SizeCompactIcon),
-                    contentDescription = null,
-                    modifier = Modifier
-                        .size(SizeCompactIcon)
-                        .clip(CircleShape),
-                )
-            }
-
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(SpaceXxs),
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SpaceMd),
             ) {
-                Text(
-                    if (isIncoming) stringResource(R.string.ax_dynamic_bar_incoming_call)
-                    else stringResource(R.string.ax_dynamic_bar_call),
-                    color = SubtleGray,
-                    style = MaterialTheme.typography.labelSmall,
-                )
-                Text(
-                    event.callerName ?: event.number ?: "",
-                    color = OnCardText,
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+                // Caller photo or app icon
+                val photo = event.callerPhoto ?: event.appIcon
+                if (photo != null) {
+                    Image(
+                        bitmap = photo.toScaledBitmap(SizeCompactIcon),
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(SizeCompactIcon)
+                            .clip(CircleShape),
+                    )
+                }
 
-            // Call timer for active calls
-            if (event.connected && event.callStartTimeMs > 0L) {
-                CallElapsedTimer(event.callStartTimeMs, accent)
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(SpaceXxs),
+                ) {
+                    Text(
+                        if (isIncoming) stringResource(R.string.ax_dynamic_bar_incoming_call)
+                        else stringResource(R.string.ax_dynamic_bar_call),
+                        color = SubtleGray,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                    Text(
+                        event.callerName ?: event.number ?: "",
+                        color = OnCardText,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                // Call timer for active calls
+                if (event.connected && event.callStartTimeMs > 0L) {
+                    CallElapsedTimer(event.callStartTimeMs, accent)
+                }
             }
         }
 
@@ -381,13 +453,18 @@ private fun CallElapsedTimer(startTimeMs: Long, color: Color) {
  * painted here.
  */
 @Composable
-internal fun PrimaryCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+internal fun PrimaryCard(
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
+    // Morph host keyguard da co mot glass — khong boc islandBlur card long.
+    val morphHostFrame = LocalKeyguardMorphHostFrame.current
     Box(
         modifier =
             Modifier.fillMaxWidth()
-                .clip(ShapeCard)
-                .islandBlur(RadiusCard, CardBg)
-                .then(modifier)
+                .islandCardSurface(morphHostFrame = morphHostFrame, onClick = onClick)
+                .then(modifier),
     ) {
         Box(modifier = Modifier.padding(SpaceXxl)) { content() }
     }

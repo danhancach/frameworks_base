@@ -49,6 +49,7 @@ import com.android.systemui.keyguard.domain.interactor.KeyguardTransitionInterac
 import com.android.systemui.keyguard.shared.model.KeyguardState
 import com.android.systemui.media.controls.domain.pipeline.MediaDataManager
 import com.android.systemui.media.controls.ui.view.MediaHost
+import com.android.systemui.media.controls.util.LockscreenMediaHelper
 import com.android.systemui.media.dream.MediaDreamComplication
 import com.android.systemui.media.remedia.shared.flag.MediaControlsInComposeFlag
 import com.android.systemui.plugins.statusbar.StatusBarStateController
@@ -127,10 +128,12 @@ constructor(
     private val shadeModeInteractor: ShadeModeInteractor,
     private val logger: MediaViewLogger,
     private val dumpManager: DumpManager,
+    private val lockscreenMediaHelper: LockscreenMediaHelper? = null,
 ) : Dumpable {
 
     /** Track the media player setting status on lock screen. */
-    private var allowMediaPlayerOnLockScreen: Boolean = true
+    private var allowMediaPlayerOnLockScreen: Boolean =
+        lockscreenMediaHelper?.isMediaAllowedOnLockscreen() ?: true
     private val lockScreenMediaPlayerUri =
         secureSettings.getUriFor(Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN)
 
@@ -658,24 +661,34 @@ constructor(
             }
         }
 
-        val settingsObserver: ContentObserver =
-            object : ContentObserver(handler) {
-                override fun onChange(selfChange: Boolean, uri: Uri?) {
-                    if (uri == lockScreenMediaPlayerUri) {
-                        allowMediaPlayerOnLockScreen =
-                            secureSettings.getBoolForUser(
-                                Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN,
-                                true,
-                                UserHandle.USER_CURRENT,
-                            )
-                    }
+        if (lockscreenMediaHelper != null) {
+            coroutineScope.launch {
+                lockscreenMediaHelper.isMediaAllowedOnLockscreen.collectLatest {
+                    allowMediaPlayerOnLockScreen = it
+                    updateDesiredLocation(forceNoAnimation = true)
+                    updateUserVisibility()
                 }
             }
-        secureSettings.registerContentObserverForUserAsync(
-            Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN,
-            settingsObserver,
-            UserHandle.USER_ALL,
-        )
+        } else {
+            val settingsObserver: ContentObserver =
+                object : ContentObserver(handler) {
+                    override fun onChange(selfChange: Boolean, uri: Uri?) {
+                        if (uri == lockScreenMediaPlayerUri) {
+                            allowMediaPlayerOnLockScreen =
+                                secureSettings.getBoolForUser(
+                                    Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN,
+                                    true,
+                                    UserHandle.USER_CURRENT,
+                                )
+                        }
+                    }
+                }
+            secureSettings.registerContentObserverForUserAsync(
+                Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN,
+                settingsObserver,
+                UserHandle.USER_ALL,
+            )
+        }
 
         // Listen to the communal UI state. Make sure that communal UI is showing and hub itself
         // is
@@ -716,11 +729,12 @@ constructor(
                 splitShadeStateController.shouldUseSplitNotificationShade(context.resources)
         }
         allowMediaPlayerOnLockScreen =
-            secureSettings.getBoolForUser(
-                Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN,
-                true,
-                UserHandle.USER_CURRENT
-            )
+            lockscreenMediaHelper?.isMediaAllowedOnLockscreen()
+                ?: secureSettings.getBoolForUser(
+                    Settings.Secure.MEDIA_CONTROLS_LOCK_SCREEN,
+                    true,
+                    UserHandle.USER_CURRENT
+                )
     }
 
     /**

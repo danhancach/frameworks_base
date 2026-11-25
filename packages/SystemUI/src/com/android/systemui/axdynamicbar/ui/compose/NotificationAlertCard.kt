@@ -11,6 +11,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -36,8 +37,8 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -83,12 +84,9 @@ import com.android.systemui.axdynamicbar.model.IslandEvent
 import com.android.systemui.axdynamicbar.shared.AlphaGlass
 import com.android.systemui.axdynamicbar.shared.AlphaIconBg
 import com.android.systemui.axdynamicbar.shared.AlphaSubtle
-import com.android.systemui.axdynamicbar.shared.islandBlur
-import com.android.systemui.axdynamicbar.shared.CardBg
 import com.android.systemui.axdynamicbar.shared.DarkCard
 import com.android.systemui.axdynamicbar.shared.IslandTone
 import com.android.systemui.axdynamicbar.shared.OnCardText
-import com.android.systemui.axdynamicbar.shared.RadiusCard
 import com.android.systemui.axdynamicbar.shared.ShapeCard
 import com.android.systemui.axdynamicbar.shared.ShapeChip
 import com.android.systemui.axdynamicbar.shared.ShapeIconMedium
@@ -101,9 +99,10 @@ import com.android.systemui.axdynamicbar.shared.SpaceMd
 import com.android.systemui.axdynamicbar.shared.SpaceSm
 import com.android.systemui.axdynamicbar.shared.SpaceXs
 import com.android.systemui.axdynamicbar.shared.SpaceXxl
+import com.android.systemui.axdynamicbar.shared.StackExpandedCardSwipeStartDp
 import com.android.systemui.axdynamicbar.shared.SubtleGray
+import com.android.systemui.axdynamicbar.shared.islandCardSurface
 import com.android.systemui.axdynamicbar.shared.onTint
-import com.android.systemui.axdynamicbar.shared.pressScale
 import com.android.systemui.axdynamicbar.shared.sendWithBal
 import com.android.systemui.axdynamicbar.shared.tint
 import com.android.systemui.axdynamicbar.shared.toneFor
@@ -188,7 +187,24 @@ fun NotificationAlertCard(
     notification: IslandEvent.Notification,
     interactor: IslandActions,
     onDismiss: () -> Unit,
+    onSwipeDismiss: () -> Unit = onDismiss,
     initiallyCompact: Boolean = false,
+    /** Stack: the under / sau promote — luon Expanded, khong Compact. */
+    forceExpanded: Boolean = false,
+    /** Under peek: false — khong tuong tac / khong bao timeout. */
+    interactive: Boolean = true,
+    reportExpandedChanged: Boolean = true,
+    enableSwipeGestures: Boolean = true,
+    horizontalDismissThreshold: Dp = StackExpandedCardSwipeStartDp,
+    cancelOnConsumedRelease: Boolean = true,
+    tiltEnabled: Boolean = false,
+    stackDragKey: Any? = null,
+    contentOffsetX: () -> Float = { 0f },
+    contentOffsetY: () -> Float = { 0f },
+    onStackDragStart: (() -> Unit)? = null,
+    onStackDragXY: ((dragX: Float, dragY: Float) -> Unit)? = null,
+    onStackDragEnd: ((dragY: Float, velocityY: Float) -> Unit)? = null,
+    maxStackDragPx: Float = 0f,
     modifier: Modifier = Modifier,
 ) {
     key(notification.sbn.key) {
@@ -212,11 +228,13 @@ fun NotificationAlertCard(
     var gesturePressed by remember { mutableStateOf(false) }
     var replyFocused by remember(notification.sbn.key) { mutableStateOf(false) }
     val currentInteractor by rememberUpdatedState(interactor)
+    val allowInteract = interactive
 
     // Card is held while a finger is down OR the reply field has focus.
-    val holding = gesturePressed || replyFocused
+    val holding = allowInteract && (gesturePressed || replyFocused)
     val lastHolding = remember { booleanArrayOf(false) }
     LaunchedEffect(holding) {
+        if (!allowInteract) return@LaunchedEffect
         if (holding == lastHolding[0]) return@LaunchedEffect
         lastHolding[0] = holding
         if (holding) currentInteractor.onNotificationAlertInteractionStart()
@@ -224,36 +242,72 @@ fun NotificationAlertCard(
     }
     val scope = rememberCoroutineScope()
 
-    val initialScene = if (initiallyCompact && !isCall) AlertCardScenes.Compact
-        else AlertCardScenes.Expanded
+    val wantCompact = initiallyCompact && !isCall && !forceExpanded
+    val initialScene =
+        if (wantCompact) AlertCardScenes.Compact else AlertCardScenes.Expanded
     val stlState = rememberMutableSceneTransitionLayoutState(
         initialScene = initialScene,
         transitions = alertCardTransitions,
     )
 
-    DisposableEffect(Unit) {
-        onDispose { interactor.onNotificationAlertInteractionEnd() }
+    // Promote under → top: ep Expanded neu van Compact.
+    LaunchedEffect(forceExpanded) {
+        if (forceExpanded && stlState.currentScene == AlertCardScenes.Compact) {
+            stlState.setTargetScene(AlertCardScenes.Expanded, scope)
+        }
+    }
+
+    // Bao Compact vs mo rong len interactor (timeout + touchable policy) — chi top.
+    val isCompactScene = stlState.currentScene == AlertCardScenes.Compact
+    LaunchedEffect(isCompactScene, reportExpandedChanged) {
+        if (!reportExpandedChanged) return@LaunchedEffect
+        currentInteractor.onNotificationAlertCompactChanged(isCompactScene)
+    }
+
+    DisposableEffect(allowInteract) {
+        onDispose {
+            if (allowInteract) interactor.onNotificationAlertInteractionEnd()
+        }
     }
 
     MagneticSwipeToDismiss(
         onDismiss = {
             if (showReply) interactor.onFocusableRequested?.invoke(false)
-            onDismiss()
+            onSwipeDismiss()
         },
         modifier = modifier,
         allowUpDismiss = true,
+        // Compact: uu tien vuot len an; Expanded giu swipe ngang chuan Samsung >126dp.
+        allowHorizontalDismiss = !isCompactScene,
+        horizontalDetachThreshold = horizontalDismissThreshold,
+        horizontalReleaseStrictThreshold = horizontalDismissThreshold,
+        cancelOnConsumedRelease = cancelOnConsumedRelease,
+        gesturesEnabled = enableSwipeGestures && allowInteract,
+        stackDragKey = stackDragKey,
+        onStackDragStart = onStackDragStart,
+        onStackDragXY = onStackDragXY,
+        onStackDragEnd = onStackDragEnd,
+        maxStackDragPx = maxStackDragPx,
+        elasticStackDrag = false,
+        tiltEnabled = tiltEnabled,
+        contentOffsetX = contentOffsetX,
+        contentOffsetY = contentOffsetY,
     ) {
         Column(
             modifier = Modifier.fillMaxWidth()
-                .pointerInput(Unit) {
-                    detectInteractionGesture(
-                        onStart = { gesturePressed = true },
-                        onEnd = { gesturePressed = false },
-                    )
-                }
-                .clip(ShapeCard)
-                // Frosted surface; falls back to the opaque card colour where blur is unavailable.
-                .islandBlur(RadiusCard, CardBg),
+                .then(
+                    if (allowInteract) {
+                        Modifier.pointerInput(Unit) {
+                            detectInteractionGesture(
+                                onStart = { gesturePressed = true },
+                                onEnd = { gesturePressed = false },
+                            )
+                        }
+                    } else {
+                        Modifier
+                    }
+                )
+                .islandCardSurface(morphHostFrame = false),
         ) {
           Box {
             SceneTransitionLayout(state = stlState) {
@@ -278,14 +332,17 @@ fun NotificationAlertCard(
                         showReply = showReply,
                         interactor = interactor,
                         onDismiss = onDismiss,
+                        onImmediateDismiss = onSwipeDismiss,
                         onExpandToggle = {
                             stlState.setTargetScene(AlertCardScenes.Expanded, scope)
                         },
                         onCollapseToCompact = {
-                            stlState.setTargetScene(AlertCardScenes.Compact, scope)
+                            if (!forceExpanded) {
+                                stlState.setTargetScene(AlertCardScenes.Compact, scope)
+                            }
                         },
                         onShowReply = { showReply = true },
-                        onSentReply = { showReply = false; onDismiss() },
+                        onSentReply = { showReply = false; onSwipeDismiss() },
                         onReplyFocusChange = { replyFocused = it },
                     )
                 }
@@ -301,16 +358,23 @@ fun NotificationAlertCard(
                         showReply = showReply,
                         interactor = interactor,
                         onDismiss = onDismiss,
+                        onImmediateDismiss = onSwipeDismiss,
                         onExpandToggle = {
-                            val target = if (initiallyCompact) AlertCardScenes.Compact
-                                else AlertCardScenes.Collapsed
+                            val target =
+                                when {
+                                    forceExpanded -> AlertCardScenes.Collapsed
+                                    initiallyCompact -> AlertCardScenes.Compact
+                                    else -> AlertCardScenes.Collapsed
+                                }
                             stlState.setTargetScene(target, scope)
                         },
                         onCollapseToCompact = {
-                            stlState.setTargetScene(AlertCardScenes.Compact, scope)
+                            if (!forceExpanded) {
+                                stlState.setTargetScene(AlertCardScenes.Compact, scope)
+                            }
                         },
                         onShowReply = { showReply = true },
-                        onSentReply = { showReply = false; onDismiss() },
+                        onSentReply = { showReply = false; onSwipeDismiss() },
                         onReplyFocusChange = { replyFocused = it },
                     )
                 }
@@ -327,10 +391,15 @@ private fun ContentScope.CompactScene(
     accent: Color,
     onExpand: () -> Unit,
 ) {
-    Surface(
-        onClick = onExpand,
-        color = Color.Transparent,
-        modifier = Modifier.fillMaxWidth(),
+    Box(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(ShapeCard)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(),
+                    onClick = onExpand,
+                ),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth()
@@ -403,6 +472,7 @@ private fun ContentScope.CardScene(
     showReply: Boolean,
     interactor: IslandActions,
     onDismiss: () -> Unit,
+    onImmediateDismiss: () -> Unit = onDismiss,
     onExpandToggle: () -> Unit,
     onCollapseToCompact: () -> Unit,
     onShowReply: () -> Unit,
@@ -412,122 +482,129 @@ private fun ContentScope.CardScene(
     val context = LocalContext.current
     val title = notification.title
     val body = notification.text
+    val onCardClick = {
+        val intent = notification.sbn.notification?.contentIntent
+        var sent = false
+        if (intent != null) {
+            try {
+                intent.sendWithBal(context)
+                sent = true
+            } catch (_: PendingIntent.CanceledException) {}
+        }
+        if (showReply) interactor.onFocusableRequested?.invoke(false)
+        if (!isCall) {
+            if (sent) {
+                interactor.launchAlertAndFadeOut(notification.sbn.packageName)
+            } else {
+                onDismiss()
+            }
+        }
+    }
 
-    Column(modifier = Modifier.element(AlertCardElements.CardContent).fillMaxWidth()) {
-        Surface(
-            onClick = {
-                try { notification.sbn.notification?.contentIntent?.sendWithBal(context) }
-                catch (_: PendingIntent.CanceledException) {}
-                if (showReply) interactor.onFocusableRequested?.invoke(false)
-                if (!isCall) onDismiss()
-            },
-            color = Color.Transparent,
-            modifier = Modifier.fillMaxWidth(),
+    // Ripple phu toan the bo goc ShapeCard 28dp, khong bi cat o hang nut chuc nang AlertActions.
+    Column(
+        modifier =
+            Modifier.element(AlertCardElements.CardContent)
+                .fillMaxWidth()
+                .clip(ShapeCard)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(),
+                    onClick = onCardClick,
+                ),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(SpaceXxl),
+            verticalArrangement = Arrangement.spacedBy(SpaceLg),
         ) {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(SpaceXxl),
-                verticalArrangement = Arrangement.spacedBy(SpaceLg),
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(SpaceSm),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(SpaceSm),
-                ) {
-                    notification.appIcon?.let { icon ->
-                        Image(
-                            bitmap = icon.toScaledBitmap(SizeIconSm),
-                            contentDescription = null,
-                            modifier = Modifier
-                                .element(AlertCardElements.AppIcon)
-                                .size(SizeIconSm)
-                                .clip(ShapeSm),
-                        )
-                    }
-                    Text(
-                        if (notification.isGroupConversation && notification.conversationTitle != null)
-                            "${notification.appName} · ${notification.conversationTitle}"
-                        else
-                            notification.appName.ifEmpty { notification.senderName ?: "" },
-                        color = accent,
-                        style = MaterialTheme.typography.labelMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
+                notification.appIcon?.let { icon ->
+                    Image(
+                        bitmap = icon.toScaledBitmap(SizeIconSm),
+                        contentDescription = null,
+                        modifier = Modifier
+                            .element(AlertCardElements.AppIcon)
+                            .size(SizeIconSm)
+                            .clip(ShapeSm),
                     )
-                    if (isCall) {
-                        CallActions(notification, interactor, onDismiss)
-                    }
-                    if (!showReply && !isCall) {
-                        val expandMod = Modifier.element(AlertCardElements.CardExpand)
-                        if (initiallyCompact) {
-                            ExpandChip(Icons.Filled.ExpandLess, accent, onCollapseToCompact, expandMod)
-                        } else if (hasExpandableContent) {
-                            ExpandChip(
-                                if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                                accent,
-                                onExpandToggle,
-                                expandMod,
-                            )
-                        }
+                }
+                Text(
+                    if (notification.isGroupConversation && notification.conversationTitle != null)
+                        "${notification.appName} · ${notification.conversationTitle}"
+                    else
+                        notification.appName.ifEmpty { notification.senderName ?: "" },
+                    color = accent,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (isCall) {
+                    CallActions(notification, interactor, onImmediateDismiss)
+                }
+                if (!showReply && !isCall) {
+                    val expandMod = Modifier.element(AlertCardElements.CardExpand)
+                    if (initiallyCompact) {
+                        ExpandChip(Icons.Filled.ExpandLess, accent, onCollapseToCompact, expandMod)
+                    } else if (hasExpandableContent) {
+                        ExpandChip(
+                            if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                            accent,
+                            onExpandToggle,
+                            expandMod,
+                        )
                     }
                 }
+            }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.Top,
-                    horizontalArrangement = Arrangement.spacedBy(SpaceLg),
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(SpaceLg),
+            ) {
+                NotifAvatar(
+                    notification,
+                    accent,
+                    SizeCompactIcon,
+                    Modifier.element(AlertCardElements.Avatar),
+                )
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(SpaceXs),
                 ) {
-                    NotifAvatar(
-                        notification,
-                        accent,
-                        SizeCompactIcon,
-                        Modifier.element(AlertCardElements.Avatar),
+                    val sender = notification.senderName ?: notification.appName
+                    Text(
+                        sender,
+                        color = OnCardText,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.element(AlertCardElements.SenderName),
                     )
 
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(SpaceXs),
-                    ) {
-                        val sender = notification.senderName ?: notification.appName
-                        Text(
-                            sender,
-                            color = OnCardText,
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.element(AlertCardElements.SenderName),
-                        )
-
-                        if (expanded) {
-                            if (hasTitleAndBody) {
-                                Text(
-                                    title!!,
-                                    color = OnCardText,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Text(
-                                    body!!,
-                                    color = SubtleGray,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 8,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            } else {
-                                val preview = body ?: title ?: ""
-                                if (preview.isNotEmpty()) {
-                                    Text(
-                                        preview,
-                                        color = SubtleGray,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        maxLines = 10,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                            }
+                    if (expanded) {
+                        if (hasTitleAndBody) {
+                            Text(
+                                title!!,
+                                color = OnCardText,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                body!!,
+                                color = SubtleGray,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 8,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                         } else {
                             val preview = body ?: title ?: ""
                             if (preview.isNotEmpty()) {
@@ -535,21 +612,32 @@ private fun ContentScope.CardScene(
                                     preview,
                                     color = SubtleGray,
                                     style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 2,
+                                    maxLines = 10,
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
                         }
+                    } else {
+                        val preview = body ?: title ?: ""
+                        if (preview.isNotEmpty()) {
+                            Text(
+                                preview,
+                                color = SubtleGray,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
+                }
 
-                    notification.notificationImage?.let { img ->
-                        Image(
-                            bitmap = img.toScaledBitmap(ThumbnailSize),
-                            contentDescription = null,
-                            modifier = Modifier.size(ThumbnailSize).clip(ShapeSm),
-                            contentScale = ContentScale.Crop,
-                        )
-                    }
+                notification.notificationImage?.let { img ->
+                    Image(
+                        bitmap = img.toScaledBitmap(ThumbnailSize),
+                        contentDescription = null,
+                        modifier = Modifier.size(ThumbnailSize).clip(ShapeSm),
+                        contentScale = ContentScale.Crop,
+                    )
                 }
             }
         }
@@ -567,6 +655,7 @@ private fun ContentScope.CardScene(
                     accent = accent,
                     maxButtons = if (expanded) MAX_EXPANDED_ACTIONS else MAX_COLLAPSED_ACTIONS,
                     onDismiss = onDismiss,
+                    onActionDismiss = onImmediateDismiss,
                     onReplyClick = onShowReply,
                 )
             }
@@ -626,6 +715,7 @@ private fun AlertActions(
     accent: Color,
     maxButtons: Int,
     onDismiss: () -> Unit,
+    onActionDismiss: () -> Unit = onDismiss,
     onReplyClick: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -656,26 +746,28 @@ private fun AlertActions(
                 onClick = {
                     try { action.action.actionIntent?.sendWithBal(context) }
                     catch (_: PendingIntent.CanceledException) {}
-                    onDismiss()
+                    onActionDismiss()
                 },
             )
         }
-        val dismissInteraction = remember { MutableInteractionSource() }
-        Surface(
-            onClick = onDismiss,
-            shape = CircleShape,
-            color = accent.copy(alpha = AlphaIconBg),
-            modifier = Modifier.pressScale(dismissInteraction).size(SizeActionHeight),
-            interactionSource = dismissInteraction,
+        Box(
+            modifier =
+                Modifier.size(SizeActionHeight)
+                    .clip(CircleShape)
+                    .background(accent.copy(alpha = AlphaIconBg))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = ripple(color = accent),
+                        onClick = onDismiss,
+                    ),
+            contentAlignment = Alignment.Center,
         ) {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(SizeActionHeight)) {
-                Icon(
-                    Icons.Filled.Close,
-                    contentDescription = stringResource(R.string.ax_dynamic_bar_dismiss),
-                    tint = accent,
-                    modifier = Modifier.size(SizeIconSm),
-                )
-            }
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = stringResource(R.string.ax_dynamic_bar_dismiss),
+                tint = accent,
+                modifier = Modifier.size(SizeIconSm),
+            )
         }
     }
 }
@@ -689,13 +781,17 @@ private fun AlertActionPill(
     icon: ImageVector? = null,
     onClick: () -> Unit,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
-        onClick = onClick,
-        shape = ShapeChip,
-        color = backgroundColor,
-        modifier = modifier.pressScale(interaction),
-        interactionSource = interaction,
+    Box(
+        modifier =
+            modifier
+                .clip(ShapeChip)
+                .background(backgroundColor)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(color = contentColor),
+                    onClick = onClick,
+                ),
+        contentAlignment = Alignment.Center,
     ) {
         Row(
             modifier = Modifier.height(SizeActionHeight).padding(horizontal = SpaceLg),
@@ -793,17 +889,19 @@ private fun ActionCircle(
     tint: Color,
     onClick: () -> Unit,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
-        onClick = onClick,
-        shape = CircleShape,
-        color = bg,
-        modifier = Modifier.pressScale(interaction).size(36.dp),
-        interactionSource = interaction,
+    Box(
+        modifier =
+            Modifier.size(36.dp)
+                .clip(CircleShape)
+                .background(bg)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(color = tint),
+                    onClick = onClick,
+                ),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(36.dp)) {
-            Icon(icon, null, tint = tint, modifier = Modifier.size(18.dp))
-        }
+        Icon(icon, null, tint = tint, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -814,17 +912,20 @@ private fun ExpandChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
-        onClick = onClick,
-        shape = CircleShape,
-        color = accent.copy(alpha = AlphaIconBg),
-        modifier = modifier.pressScale(interaction).size(36.dp),
-        interactionSource = interaction,
+    Box(
+        modifier =
+            modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .background(accent.copy(alpha = AlphaIconBg))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(color = accent),
+                    onClick = onClick,
+                ),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(36.dp)) {
-            Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
-        }
+        Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
     }
 }
 
@@ -835,22 +936,24 @@ private fun DrawableActionCircle(
     tint: Color,
     onClick: () -> Unit,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
-        onClick = onClick,
-        shape = CircleShape,
-        color = bg,
-        modifier = Modifier.pressScale(interaction).size(36.dp),
-        interactionSource = interaction,
+    Box(
+        modifier =
+            Modifier.size(36.dp)
+                .clip(CircleShape)
+                .background(bg)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(color = tint),
+                    onClick = onClick,
+                ),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(36.dp)) {
-            Image(
-                bitmap = drawable.toScaledBitmap(18.dp),
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-                colorFilter = ColorFilter.tint(tint),
-            )
-        }
+        Image(
+            bitmap = drawable.toScaledBitmap(18.dp),
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            colorFilter = ColorFilter.tint(tint),
+        )
     }
 }
 
@@ -915,29 +1018,32 @@ private fun ReplyField(
             },
         )
         if (replyText.isNotEmpty()) {
-            val sendInteraction = remember { MutableInteractionSource() }
-            Surface(
-                onClick = {
-                    val intent = Intent().apply {
-                        val results = Bundle().apply {
-                            putCharSequence(reply.remoteInput.resultKey, replyText)
-                        }
-                        RemoteInput.addResultsToIntent(arrayOf(reply.remoteInput), this, results)
-                    }
-                    try { reply.action.actionIntent?.sendWithBal(context, intent) }
-                    catch (e: Exception) { Log.w("NotificationReply", "Failed to send reply", e) }
-                    replyText = ""
-                    interactor.onFocusableRequested?.invoke(false)
-                    onSent()
-                },
-                shape = CircleShape,
-                color = accent,
-                modifier = Modifier.pressScale(sendInteraction).size(32.dp).padding(SpaceXs),
-                interactionSource = sendInteraction,
+            Box(
+                modifier =
+                    Modifier.size(32.dp)
+                        .padding(SpaceXs)
+                        .clip(CircleShape)
+                        .background(accent)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = ripple(color = IslandTone.ACCENT.onTint),
+                            onClick = {
+                                val intent = Intent().apply {
+                                    val results = Bundle().apply {
+                                        putCharSequence(reply.remoteInput.resultKey, replyText)
+                                    }
+                                    RemoteInput.addResultsToIntent(arrayOf(reply.remoteInput), this, results)
+                                }
+                                try { reply.action.actionIntent?.sendWithBal(context, intent) }
+                                catch (e: Exception) { Log.w("NotificationReply", "Failed to send reply", e) }
+                                replyText = ""
+                                interactor.onFocusableRequested?.invoke(false)
+                                onSent()
+                            },
+                        ),
+                contentAlignment = Alignment.Center,
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.AutoMirrored.Filled.Send, null, tint = IslandTone.ACCENT.onTint, modifier = Modifier.size(14.dp))
-                }
+                Icon(Icons.AutoMirrored.Filled.Send, null, tint = IslandTone.ACCENT.onTint, modifier = Modifier.size(14.dp))
             }
             Spacer(Modifier.width(SpaceXs))
         }

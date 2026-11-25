@@ -86,7 +86,7 @@ constructor(
         if (isTypeEnabled("ringer")) system.startRinger()
         if (isTypeEnabled("clipboard")) system.startClipboard()
         notification.startListening()
-        if (isTypeEnabled("app_switch")) appTracking.startListening()
+        syncAppTrackingListeners()
         if (isTypeEnabled("torch")) torch.startListening()
         if (isTypeEnabled("biometric_unlock")) biometric.startListening()
         if (isTypeEnabled("media") || isTypeEnabled("sports")) smartspace.startListening()
@@ -101,7 +101,7 @@ constructor(
         system.stopListening()
         notification.stopListening()
         torch.stopListening()
-        appTracking.stopListening()
+        appTracking.stopAll()
         biometric.stopListening()
         smartspace.stopListening()
     }
@@ -127,8 +127,7 @@ constructor(
         if (isTypeEnabled("clipboard")) system.startClipboard()
         else system.stopClipboard()
 
-        if (isTypeEnabled("app_switch")) appTracking.startListening()
-        else appTracking.stopListening()
+        syncAppTrackingListeners()
         if (isTypeEnabled("torch")) torch.startListening()
         else torch.stopListening()
         if (isTypeEnabled("biometric_unlock")) biometric.startListening()
@@ -136,6 +135,28 @@ constructor(
 
         if (isTypeEnabled("media") || isTypeEnabled("sports")) smartspace.startListening()
         else smartspace.stopListening()
+    }
+
+    /** Event co app chu -> theo doi foreground (an pill khi dang trong app); app_switch -> emit pill doi app. */
+    private fun syncAppTrackingListeners() {
+        val needForeground =
+            isTypeEnabled("media") ||
+                isTypeEnabled("timer") ||
+                isTypeEnabled("stopwatch") ||
+                isTypeEnabled("audio_recording") ||
+                isTypeEnabled("call") ||
+                isTypeEnabled("promoted_ongoing") ||
+                isTypeEnabled("sports") ||
+                isTypeEnabled("now_playing") ||
+                isTypeEnabled("alarm")
+        val needAppSwitch = isTypeEnabled("app_switch")
+        if (!needForeground && !needAppSwitch) {
+            appTracking.stopAll()
+            return
+        }
+        if (needAppSwitch) appTracking.startListening() else appTracking.stopListening()
+        if (needForeground) appTracking.startForegroundTracking()
+        else appTracking.stopForegroundTracking()
     }
 
     private fun syncDisabledTypes() {
@@ -147,19 +168,15 @@ constructor(
         val sportsGroup = combine(
             smartspace.sportsEvents,
             notification.sportsEvents,
-        ) { ssSports, notifSports ->
+        ) { qlSports, notifSports ->
             if (!isTypeEnabled("sports")) emptyList()
-            else ssSports + notifSports.filter { ns ->
-                ssSports.none { ss ->
-                    ss.team1Name.equals(ns.team1Name, ignoreCase = true) &&
-                        ss.team2Name.equals(ns.team2Name, ignoreCase = true)
+            else qlSports + notifSports.filter { ns ->
+                qlSports.none { qs ->
+                    qs.team1Name.equals(ns.team1Name, ignoreCase = true) &&
+                        qs.team2Name.equals(ns.team2Name, ignoreCase = true)
                 }
             }
         }
-        val nowPlayingSource = combine(
-            smartspace.nowPlayingEvent,
-            notification.nowPlayingEvent,
-        ) { ambient, notif -> ambient ?: notif }
         val promotedGroup = combine(
             notification.promotedOngoingEvents,
             sportsGroup,
@@ -184,36 +201,41 @@ constructor(
         }
         val midGroup =
             combine(
-                media.mediaEvent,
+                media.mediaEvents,
                 connectivity.bluetoothEvent,
                 connectivity.hotspotEvent,
                 system.chargingEvent,
                 notification.alarmEvent,
             ) { m, bt, hotspot, charging, alarm ->
-                listOfNotNull(
-                    m?.takeIf { isTypeEnabled("media") },
-                    bt?.takeIf { isTypeEnabled("bluetooth") },
-                    hotspot?.takeIf { isTypeEnabled("hotspot") },
-                    charging?.takeIf { isTypeEnabled("charging") },
-                    alarm?.takeIf { isTypeEnabled("alarm") },
-                )
+                buildList {
+                    if (isTypeEnabled("media")) addAll(m)
+                    if (isTypeEnabled("bluetooth")) bt?.let(::add)
+                    if (isTypeEnabled("hotspot")) hotspot?.let(::add)
+                    if (isTypeEnabled("charging")) charging?.let(::add)
+                    if (isTypeEnabled("alarm")) alarm?.let(::add)
+                }
             }
         val lowGroupA =
             combine(
-                notification.timerEvent,
+                notification.timerEvents,
                 notification.stopwatchEvent,
                 system.ringerEvent,
                 connectivity.vpnEvent,
                 system.clipboardEvent,
-            ) { timer, stopwatch, ringer, vpn, clipboard ->
-                listOfNotNull(
-                    timer?.takeIf { isTypeEnabled("timer") },
-                    stopwatch?.takeIf { isTypeEnabled("stopwatch") },
-                    ringer?.takeIf { isTypeEnabled("ringer") },
-                    vpn?.takeIf { isTypeEnabled("vpn") },
-                    clipboard?.takeIf { isTypeEnabled("clipboard") },
-                )
+            ) { timers, stopwatch, ringer, vpn, clipboard ->
+                val timerList = if (isTypeEnabled("timer")) timers else emptyList()
+                timerList +
+                    listOfNotNull(
+                        stopwatch?.takeIf { isTypeEnabled("stopwatch") },
+                        ringer?.takeIf { isTypeEnabled("ringer") },
+                        vpn?.takeIf { isTypeEnabled("vpn") },
+                        clipboard?.takeIf { isTypeEnabled("clipboard") },
+                    )
             }
+        val nowPlayingSource = combine(
+            smartspace.nowPlayingEvent,
+            notification.nowPlayingEvent,
+        ) { ambient, notif -> ambient ?: notif }
         val lowGroup =
             combine(
                 lowGroupA,
@@ -238,18 +260,13 @@ constructor(
             indicationGroup,
             aospChip.snapshot,
         ) { high, transient, promoted, indication, aosp ->
-            val transientFiltered =
-                if (aosp.hasChronometerChip) {
-                    transient.filterNot { it is IslandEvent.Timer || it is IslandEvent.Stopwatch }
-                } else {
-                    transient
-                }
+            // Chronometer = Timer/Stopwatch tu NotificationIslandManager (khong nuot / AospChip).
             val promotedFiltered =
                 promoted.filterNot {
                     it is IslandEvent.PromotedOngoing &&
                         (it.sbn.key in aosp.notificationKeys || it.sbn.isMediaNotification())
                 }
-            high + transientFiltered + promotedFiltered + indication + aosp.events
+            high + transient + promotedFiltered + indication + aosp.events
         }
 
         return allEvents.map { events ->

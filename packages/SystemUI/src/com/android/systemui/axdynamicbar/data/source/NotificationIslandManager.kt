@@ -1,9 +1,11 @@
 package com.android.systemui.axdynamicbar.data.source
 
 import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Person
 import android.content.Context
+import android.content.Intent
 import com.android.systemui.res.R
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
@@ -18,10 +20,35 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Chronometer
 import android.widget.FrameLayout
+import com.android.systemui.axdynamicbar.data.KeyRevisionTracker
+import com.android.systemui.axdynamicbar.data.NotificationSmallIconLoader
+import com.android.systemui.axdynamicbar.domain.NotificationStateReducer
 import com.android.systemui.axdynamicbar.model.IslandEvent
+import com.android.systemui.axdynamicbar.model.NotificationIconRefresh
 import com.android.systemui.axdynamicbar.model.RecordingState
+import com.android.systemui.axdynamicbar.shared.DESK_CLOCK_REASON_UNKNOWN
+import com.android.systemui.axdynamicbar.shared.DeskClockNotifKind
+import com.android.systemui.axdynamicbar.shared.DeskClockNotifRemovalDecision
+import com.android.systemui.axdynamicbar.shared.DeskClockOwnerGapEffect
+import com.android.systemui.axdynamicbar.shared.DeskClockOwnerGapRetention
+import com.android.systemui.axdynamicbar.shared.DeskClockPostedDisposition
+import com.android.systemui.axdynamicbar.shared.DeskClockStopwatchRunRelation
+import com.android.systemui.axdynamicbar.shared.DeskClockStopwatchVisualDismissFgEffect
+import com.android.systemui.axdynamicbar.shared.DeskClockStopwatchVisualDismissGate
+import com.android.systemui.axdynamicbar.shared.classifyDeskClockPosted
+import com.android.systemui.axdynamicbar.shared.deskClockEventToken
+import com.android.systemui.axdynamicbar.shared.deskClockNotifRemovalDecision
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchApplyPostToVisualDismissGate
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchRunIdentity
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchVisualDismissGateOf
+import com.android.systemui.axdynamicbar.shared.deskClockStopwatchVisualDismissOnForegroundChanged
+import com.android.systemui.axdynamicbar.shared.islandEventOwnerPackages
+import com.android.systemui.axdynamicbar.shared.statusBarAppPillLogClockNotif
 import com.android.systemui.dagger.SysUISingleton
 import com.android.systemui.dagger.qualifiers.Application
+import com.android.systemui.statusbar.notification.collection.NotificationEntry
+import com.android.systemui.statusbar.notification.collection.notifcollection.CommonNotifCollection
+import com.android.systemui.statusbar.notification.collection.notifcollection.NotifCollectionListener
 import com.android.systemui.util.ScrimUtils
 import java.util.Objects
 import java.util.concurrent.ConcurrentHashMap
@@ -50,6 +77,8 @@ class NotificationIslandManager
 constructor(
     @Application private val context: Context,
     @Application private val applicationScope: CoroutineScope,
+    private val notifCollectionLazy: dagger.Lazy<CommonNotifCollection>,
+    private val smallIconLoader: NotificationSmallIconLoader,
 ) {
     companion object {
         private const val TAG = "NotificationIslandManager"
@@ -84,6 +113,27 @@ constructor(
             Regex("""(.+?)\s+(\d+)\s*[-–—:]\s*(\d+)\s+(.+)""")
         private val VS_PATTERN =
             Regex("""(.+?)\s+(?:vs\.?|v\.?|at)\s+(.+)""", RegexOption.IGNORE_CASE)
+        /** mm:ss hoac h:mm:ss trong text / sortKey timer notification. */
+        private val TIMER_REMAINING_PATTERN =
+            Regex("""(?<![\d:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?![\d:])""")
+        /** Google Clock MetricStyle sortKey: ⏳H:MM:SS / ⏳M:SS remaining. */
+        private val SORTKEY_REMAINING_PATTERN =
+            Regex("""[⏳⏱🕐]?(\d{1,2}):(\d{2})(?::(\d{2}))?""")
+        /** Lap stopwatch: H:MM:SS(.d)? / M:SS(.dd)? trong TEXT_LINES. */
+        private val STOPWATCH_LAP_PATTERN =
+            Regex("""(?<![\d:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?:[.,](\d{1,3}))?(?![\d:])""")
+        private const val EXTRA_TIMER_ID = "com.android.deskclock.extra.TIMER_ID"
+        private const val EXTRA_TIMER_IDS = "com.android.deskclock.extra.TIMER_IDS"
+        /** clock-app://…/timer/4/view */
+        private val TIMER_URI_ID_PATTERN = Regex("""/timer/(\d+)(?:/|$)""")
+        /** groupKey …|g:4 hoac group g:4 — khong bat so uid/prefix. */
+        private val TIMER_GROUP_ID_PATTERN = Regex("""(?:\|g:|^g:)(\d+)$""")
+        /** Prefs: TIMER_ID da thay + remaining gan nhat (survive SystemUI restart). */
+        private const val PREFS_DESKCLOCK = "axdb_deskclock_timers"
+        private const val PREFS_KNOWN_IDS = "known_ids"
+        private const val PREFS_REMAINING_PREFIX = "rem_"
+        /** Sai so khop remaining khi pause/resume / tick. */
+        private const val TIMER_REMAINING_MATCH_MS = 3_000L
 
         private const val NOW_PLAYING_PACKAGE = "com.google.android.as"
         private const val NOW_PLAYING_CHANNEL = "ambientmusic"
@@ -105,8 +155,8 @@ constructor(
         }
     }
 
-    private val _timerEvent = MutableStateFlow<IslandEvent.Timer?>(null)
-    val timerEvent: StateFlow<IslandEvent.Timer?> = _timerEvent.asStateFlow()
+    private val _timerEvents = MutableStateFlow<List<IslandEvent.Timer>>(emptyList())
+    val timerEvents: StateFlow<List<IslandEvent.Timer>> = _timerEvents.asStateFlow()
 
     private val _stopwatchEvent = MutableStateFlow<IslandEvent.Stopwatch?>(null)
     val stopwatchEvent: StateFlow<IslandEvent.Stopwatch?> = _stopwatchEvent.asStateFlow()
@@ -149,9 +199,22 @@ constructor(
     private var recorderGraceJob: Job? = null
     private var recording: IslandEvent.AudioRecording? = null
     private var recordingDismissed = false
-    private var lastTimer: IslandEvent.Timer? = null
-    private var timerDismissedKey: String? = null
-    private var stopwatchDismissedKey: String? = null
+    /**
+     * Visual swipe-hide stopwatch (khong stop Clock that). Stateful gate —
+     * rejected posts cap nhat latestObserved (pause/resume continuation).
+     */
+    private var stopwatchVisualDismissGate: DeskClockStopwatchVisualDismissGate? = null
+    private var stopwatchDismissedPackage: String? = null
+    private val stopwatchDismissedKey: String?
+        get() = stopwatchVisualDismissGate?.notificationKey
+    private val stopwatchAwaitOwnerRevisit: Boolean
+        get() = stopwatchVisualDismissGate?.awaitOwnerRevisit == true
+    private var stopwatchOwnerRevisitArmed: Boolean
+        get() = stopwatchVisualDismissGate?.ownerRevisitArmed == true
+        set(value) {
+            val g = stopwatchVisualDismissGate ?: return
+            stopwatchVisualDismissGate = g.copy(ownerRevisitArmed = value)
+        }
     private val dismissedPromotedKeys = mutableSetOf<String>()
     private val dismissedSportsKeys = mutableSetOf<String>()
     private var dismissedNowPlayingTitle: String? = null
@@ -161,110 +224,138 @@ constructor(
         extraBufferCapacity = 16,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
+    /** Icon/config refresh — khong di qua showNotificationAlert, payload nho khong reorder. */
+    val notificationIconRefreshFlow = MutableSharedFlow<NotificationIconRefresh>(
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
     val notificationRemovedFlow = MutableSharedFlow<String>(
         extraBufferCapacity = 16,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
-    var activeMediaPackageProvider: (() -> String?)? = null
+    var activeMediaPackageProvider: (() -> Set<String>)? = null
 
     /**
-     * Last content signature per posted key. Concurrent because stopListening() clears it from
-     * another thread.
+     * FG package hien tai (AppTracking) — dung policy owner-gap Clock.
+     * Interactor gan khi init; null = coi nhu khong owner FG.
      */
+    var foregroundPackageProvider: (() -> String?)? = null
+
+    /** Map concurrent vi stopListeningLocked() co the clear tu thread khac. */
     private val seenSignatures: MutableMap<String, Long> = ConcurrentHashMap()
+    private val seenIconRevisions: MutableMap<String, Long> = ConcurrentHashMap()
+    /** Phien ban lan dang thong bao (chong event den muon hoi sinh sau remove/repost). */
+    private val activeNotificationTokens = KeyRevisionTracker()
+    private val notificationStateLock = Any()
+    private var iconInvalidationJob: Job? = null
 
     /**
-     * Keys that may still be shown. Cleared on removal and on dismiss so a late coalesce cannot
-     * put the notification back (and pin its sbn/bitmaps). A later post adds the key again.
+     * Retention SSOT — absolute deadline + generation (test inject clock qua
+     * DeskClockOwnerGapRetention rieng; production dung instance nay).
      */
-    private val activeNotificationKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
-    private val notificationLock = Any()
+    private val deskClockOwnerGapRetention = DeskClockOwnerGapRetention()
+
+    /** Stopwatch dang giu qua owner-gap (notif vang tam). */
+    private var stopwatchOwnerGapKey: String? = null
+    private var stopwatchGapJob: Job? = null
+    /** Timer keys dang giu qua owner-gap. */
+    private val timerOwnerGapKeys = ConcurrentHashMap.newKeySet<String>()
+    private val timerGapJobs = ConcurrentHashMap<String, Job>()
 
     var onTimerEvent: ((IslandEvent.Timer) -> Unit)? = null
     var onAlarmEvent: ((IslandEvent.Alarm) -> Unit)? = null
     var onNotificationPosted: ((IslandEvent.Notification) -> Unit)? = null
 
     @Volatile private var listening = false
-    @Volatile private var timerJob: Job? = null
-
-    private var timerNotificationKey: String? = null
-    private var timerOriginalDurationMs: Long = 0L
+    /** Job het han theo tung notification key. */
+    private val timerJobs = mutableMapOf<String, Job>()
+    /** originalDurationMs theo key — giu khi update cung timer. */
+    private val timerOriginalDurations = mutableMapOf<String, Long>()
+    /** TIMER_ID da thay theo notification key (giu khi doi 1→nhieu timer). */
+    private val deskClockTimerIdsByNotif = mutableMapOf<String, LinkedHashSet<Int>>()
+    /**
+     * Remaining ms gan nhat theo TIMER_ID — khop metric khi thu tu metrics doi
+     * (critical / dang chay len dau) sau Pause→Resume.
+     */
+    private val deskClockLastRemainingById = ConcurrentHashMap<Int, Long>()
+    /**
+     * PendingIntent PAUSE/START do Clock tao theo TIMER_ID — giu khi notif doi sang multi
+     * (chi con RESET nhom). SystemUI khong tu tao PI cho receiver exported=false.
+     */
+    private val deskClockPausePiById = ConcurrentHashMap<Int, android.app.PendingIntent>()
+    private val deskClockStartPiById = ConcurrentHashMap<Int, android.app.PendingIntent>()
     private var stopwatchNotificationKey: String? = null
+    private val deskClockPrefs by lazy {
+        context.getSharedPreferences(PREFS_DESKCLOCK, Context.MODE_PRIVATE)
+    }
+
+    /** Bo nho dem SBN theo notification key de the mo rong co the inflate layout goc. */
+    private val activeSbns = ConcurrentHashMap<String, StatusBarNotification>()
+    private val _activeNotifications = MutableStateFlow<Map<String, StatusBarNotification>>(emptyMap())
+    val activeNotifications: StateFlow<Map<String, StatusBarNotification>> = _activeNotifications.asStateFlow()
+
+    fun getSbn(key: String): StatusBarNotification? {
+        return try {
+            notifCollectionLazy.get().getEntry(key)?.sbn ?: activeSbns[key]
+        } catch (_: Exception) {
+            activeSbns[key]
+        }
+    }
 
     private val scrimListener =
         object : ScrimUtils.ScrimEventListener {
             override fun onNotificationRemoved(sbn: StatusBarNotification) {
-                if (!listening) return
-                seenSignatures.remove(sbn.key)
+                handleNotificationRemoved(sbn, DESK_CLOCK_REASON_UNKNOWN)
+            }
 
-                if (sbn.key == timerNotificationKey) {
-                    timerNotificationKey = null
-                    timerJob?.cancel()
-                    timerJob = null
-                    resetTimerState()
-                }
-                if (sbn.key == stopwatchNotificationKey) {
-                    stopwatchNotificationKey = null
-                    stopwatchDismissedKey = null
-                    _stopwatchEvent.value = null
-                }
-                dismissedPromotedKeys.remove(sbn.key)
-                dismissedSportsKeys.remove(sbn.key)
+            override fun onNotificationRemoved(sbn: StatusBarNotification, reason: Int) {
+                handleNotificationRemoved(sbn, reason)
+            }
 
-                if (sbn.key == recorderNotifKey) {
-                    recorderNotifKey = null
-                    val currentState = recording?.state
-                    if (currentState == RecordingState.SAVED) {
-                        clearAudioRecording()
-                    } else if (currentState != null) {
-                        recorderGraceJob?.cancel()
-                        recorderGraceJob =
-                            applicationScope.launch {
-                                delay(RECORDER_REMOVAL_GRACE_MS)
-                                if (recorderNotifKey == null &&
-                                    recording?.state != RecordingState.SAVED
-                                ) {
-                                    clearAudioRecording()
-                                }
-                            }
-                    }
-                }
-
-                if (sbn.key == alarmNotificationKey) {
-                    alarmNotificationKey = null
-                    _alarmEvent.value = null
-                }
-
-                _callEvents.value =
-                    _callEvents.value.filter { it.sbn.key != sbn.key }
-
-                _promotedOngoingEvents.value =
-                    _promotedOngoingEvents.value.filter { it.sbn.key != sbn.key }
-
-                _sportsEvents.value =
-                    _sportsEvents.value.filter { it.key != sbn.key }
-
-                if (_nowPlayingEvent.value?.key == sbn.key) {
-                    dismissedNowPlayingTitle = null
-                    _nowPlayingEvent.value = null
-                }
-
-                synchronized(notificationLock) {
-                    activeNotificationKeys.remove(sbn.key)
-                    _notificationEvents.value =
-                        _notificationEvents.value.filter { it.sbn.key != sbn.key }
-                }
-
-                notificationRemovedFlow.tryEmit(sbn.key)
+            override fun onUserChanged() {
+                // User switch — drop moi owner-gap retained (khong ghost cross-user).
+                dropAllDeskClockOwnerGaps(cause = "user_changed")
             }
 
             override fun onNotificationPosted(sbn: StatusBarNotification, isSilent: Boolean) {
                 if (!listening) return
-                val pkg = sbn.packageName ?: return
-                val extras = sbn.notification?.extras ?: return
+                activeSbns[sbn.key] = sbn
+                _activeNotifications.update { it + (sbn.key to sbn) }
+                val pkg = sbn.packageName
+                // pkg null: chi reconcile neu dang track gap cung key (khong biet CLOCK).
+                if (pkg == null) {
+                    if (hasTrackedDeskClockSameKeyGap(sbn.key)) {
+                        reconcileDeskClockNonMatchingPost(sbn.key)
+                    }
+                    return
+                }
 
                 if (pkg in CLOCK_PACKAGES) {
+                    val clockFlags = sbn.notification?.flags ?: 0
+                    val isGroupSummary =
+                        clockFlags and Notification.FLAG_GROUP_SUMMARY != 0
+                    val extras = sbn.notification?.extras
+                    val hasGap = hasTrackedDeskClockSameKeyGap(sbn.key)
+                    val prevKind = trackedDeskClockKindForKey(sbn.key)
+
+                    // Summary / extras null: classify truoc early-return (P3).
+                    if (isGroupSummary || extras == null) {
+                        val early =
+                            classifyDeskClockPosted(
+                                hasTrackedSameKeyGap = hasGap,
+                                previousTrackedKind = prevKind,
+                                isGroupSummary = isGroupSummary,
+                                extrasAvailable = extras != null,
+                                classifiedKind = DeskClockNotifKind.NONE,
+                                typeEnabled = true,
+                            )
+                        if (early == DeskClockPostedDisposition.RECONCILE_DROP_RETAINED) {
+                            reconcileDeskClockNonMatchingPost(sbn.key)
+                        }
+                        return
+                    }
+
                     val channelId = sbn.notification?.channelId?.lowercase() ?: ""
                     val actionLabels =
                         sbn.notification?.actions?.map { it.title?.toString()?.lowercase() ?: "" }
@@ -273,41 +364,83 @@ constructor(
                         sbn.notification?.actions?.map { actionIntentString(it) ?: "" }
                             ?: emptyList()
                     val hasStopwatchIntent = actionIntents.any {
-                        it == DeskClockActions.START_STOPWATCH ||
-                            it == DeskClockActions.PAUSE_STOPWATCH ||
-                            it == DeskClockActions.RESET_STOPWATCH ||
-                            it == DeskClockActions.LAP_STOPWATCH ||
-                            it == DeskClockActions.SHOW_STOPWATCH
+                        DeskClockActions.isStopwatchAction(it)
                     }
                     val hasTimerIntent = actionIntents.any {
-                        it == DeskClockActions.START_TIMER ||
-                            it == DeskClockActions.PAUSE_TIMER ||
-                            it == DeskClockActions.RESET_TIMER ||
-                            it == DeskClockActions.ADD_MINUTE_TIMER ||
-                            it == DeskClockActions.SHOW_TIMER
+                        DeskClockActions.isTimerAction(it)
                     }
-                    val hasLap = actionLabels.any { it.contains("lap") }
+                    // EN + VI: Lap / Vong — PendingIntent action thuong null tren Clock moi
+                    val hasLap =
+                        actionLabels.any {
+                            it.contains("lap") || it.contains("vòng") || it.contains("vong")
+                        }
                     val isCountDown = extras.getBoolean("android.chronometerCountDown", false)
 
-                    val isStopwatch = hasStopwatchIntent || channelId.contains("stopwatch") || hasLap
-                    val isTimer = !isStopwatch && (
-                        hasTimerIntent ||
-                            channelId.contains("timer") ||
-                            channelId.contains("firing") ||
-                            isCountDown ||
-                            actionLabels.any { it.contains("+1") || it.contains("add") }
-                    )
+                    val isStopwatch =
+                        hasStopwatchIntent || channelId.contains("stopwatch") || hasLap
+                    val isTimer =
+                        !isStopwatch &&
+                            (hasTimerIntent ||
+                                channelId.contains("timer") ||
+                                channelId.contains("firing") ||
+                                isCountDown ||
+                                actionLabels.any { it.contains("+1") || it.contains("add") })
 
-                    if (isStopwatch && "stopwatch" !in disabledTypes) {
-                        handleStopwatch(sbn, extras, actionLabels, actionIntents)
-                        return
+                    val classifiedKind =
+                        when {
+                            isStopwatch -> DeskClockNotifKind.STOPWATCH
+                            isTimer -> DeskClockNotifKind.TIMER
+                            else -> DeskClockNotifKind.NONE
+                        }
+                    val typeEnabled =
+                        when (classifiedKind) {
+                            DeskClockNotifKind.STOPWATCH -> "stopwatch" !in disabledTypes
+                            DeskClockNotifKind.TIMER -> "timer" !in disabledTypes
+                            DeskClockNotifKind.NONE -> true
+                        }
+                    val disposition =
+                        classifyDeskClockPosted(
+                            hasTrackedSameKeyGap = hasGap,
+                            previousTrackedKind = prevKind,
+                            isGroupSummary = false,
+                            extrasAvailable = true,
+                            classifiedKind = classifiedKind,
+                            typeEnabled = typeEnabled,
+                        )
+                    when (disposition) {
+                        DeskClockPostedDisposition.HANDLE_VALIDATED -> {
+                            when (classifiedKind) {
+                                DeskClockNotifKind.STOPWATCH ->
+                                    handleStopwatch(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.TIMER ->
+                                    handleTimer(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.NONE -> Unit
+                            }
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
+                        DeskClockPostedDisposition.CROSS_TYPE_DROP_THEN_HANDLE -> {
+                            // Drop kind cu + clear retention truoc rebind kind moi.
+                            dropTrackedDeskClockKindBeforeCrossType(sbn.key, prevKind)
+                            when (classifiedKind) {
+                                DeskClockNotifKind.STOPWATCH ->
+                                    handleStopwatch(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.TIMER ->
+                                    handleTimer(sbn, extras, actionLabels, actionIntents)
+                                DeskClockNotifKind.NONE -> Unit
+                            }
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
+                        DeskClockPostedDisposition.RECONCILE_DROP_RETAINED -> {
+                            reconcileDeskClockNonMatchingPost(sbn.key)
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
+                        DeskClockPostedDisposition.IGNORE -> {
+                            if (classifiedKind != DeskClockNotifKind.NONE) return
+                        }
                     }
-                    if (isTimer && "timer" !in disabledTypes) {
-                        handleTimer(sbn, extras, actionLabels, actionIntents)
-                        return
-                    }
-                    if (isStopwatch || isTimer) return
                 }
+
+                val extras = sbn.notification?.extras ?: return
 
                 val isAlarmCategory = sbn.notification?.category == Notification.CATEGORY_ALARM
                 if ((isAlarmCategory || pkg in ALARM_PACKAGES) && sbn.isOngoing) {
@@ -321,7 +454,8 @@ constructor(
                             extras.containsKey(Notification.EXTRA_DECLINE_INTENT) ||
                             extras.containsKey(Notification.EXTRA_HANG_UP_INTENT)
                     if (isCallStyle) {
-                        if ("call" !in disabledTypes) handleCallNotification(sbn, extras)
+                        // Giu nguon CallStyle dung chung; Dynamic Bar va DynamicIsland tu loc theo cong tac rieng.
+                        handleCallNotification(sbn, extras)
                         return
                     }
                 }
@@ -400,6 +534,7 @@ constructor(
                                 startTimeMs = startTime,
                                 actions = notifActions,
                                 pausedDurationMs = 0L,
+                                packageName = pkg,
                                 contentIntent = sbn.notification?.contentIntent,
                             )
                         )
@@ -425,7 +560,8 @@ constructor(
                             appName = title.ifEmpty { existing.appName },
                             state = RecordingState.SAVED,
                             actions = notifActions,
-                            contentIntent = sbn.notification?.contentIntent,
+                            packageName = pkg.ifEmpty { existing.packageName },
+                            contentIntent = sbn.notification?.contentIntent ?: existing.contentIntent,
                         )
                     )
                     return
@@ -481,8 +617,8 @@ constructor(
                 if ("notification" in disabledTypes) return
                 if (isSilent) {
                     seenSignatures.remove(sbn.key)
-                    synchronized(notificationLock) {
-                        if (activeNotificationKeys.remove(sbn.key)) {
+                    synchronized(notificationStateLock) {
+                        if (activeNotificationTokens.removeKey(sbn.key)) {
                             _notificationEvents.update { list ->
                                 list.filter { it.sbn.key != sbn.key }
                             }
@@ -493,7 +629,7 @@ constructor(
                 val category = sbn.notification?.category
                 if (category == Notification.CATEGORY_TRANSPORT) return
                 if (category == Notification.CATEGORY_SERVICE && !hasProgress) return
-                if (sbn.packageName == activeMediaPackageProvider?.invoke()) return
+                if (sbn.packageName in activeMediaPackageProvider?.invoke().orEmpty()) return
 
                 val notifFlags = sbn.notification?.flags ?: 0
                 if (notifFlags and Notification.FLAG_GROUP_SUMMARY != 0) return
@@ -521,22 +657,26 @@ constructor(
                 val signature: Long =
                     if (lastMessage != null) lastMessage.timestamp
                     else contentSignature(sbn, extras)
-                val previous = seenSignatures.put(sbn.key, signature)
+                val previousContent = seenSignatures[sbn.key]
+                // Authoritative ingest tu SBN post (khong phu thuoc ordering collection).
+                val (icon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
+                seenIconRevisions[sbn.key] = iconRevision
+                val contentUnchanged = previousContent == signature
 
-                if (previous == signature) return
+                // Chi doi icon/config: refresh state, KHONG notificationFlow (tranh re-alert).
+                if (contentUnchanged) {
+                    updateNotificationIconOnly(sbn.key, icon, iconRevision)
+                    return
+                }
 
-                if (previous != null &&
+                seenSignatures[sbn.key] = signature
+
+                if (previousContent != null &&
                     (notif?.flags ?: 0) and Notification.FLAG_ONLY_ALERT_ONCE != 0
                 ) return
 
                 if (lastMessage != null && isFromSelf(lastMessage, extras)) return
 
-                val icon =
-                    try {
-                        context.packageManager.getApplicationIcon(pkg)
-                    } catch (_: Exception) {
-                        null
-                    }
                 val appName =
                     try {
                         context.packageManager
@@ -629,6 +769,9 @@ constructor(
                 }
 
                 val notificationImage = extractNotificationImage(extras, sbn)
+                val postToken = synchronized(notificationStateLock) {
+                    activeNotificationTokens.bumpKey(sbn.key)
+                }
 
                 val event =
                     IslandEvent.Notification(
@@ -648,13 +791,575 @@ constructor(
                         senderIcon = senderIcon,
                         senderName = senderName,
                         groupKey = groupKey,
+                        iconRevision = iconRevision,
+                        postToken = postToken,
                         notificationImage = notificationImage,
                     )
-                activeNotificationKeys.add(sbn.key)
                 notificationFlow.tryEmit(event)
                 onNotificationPosted?.invoke(event)
             }
         }
+
+    private fun isEntrySilent(entry: NotificationEntry): Boolean {
+        val ranking = entry.ranking
+        return ranking.importance < NotificationManager.IMPORTANCE_DEFAULT ||
+            (ranking.suppressedVisualEffects and NotificationManager.Policy.SUPPRESSED_EFFECT_PEEK) != 0
+    }
+
+    private val notifCollectionListener =
+        object : NotifCollectionListener {
+            override fun onEntryAdded(entry: NotificationEntry) {
+                entry.sbn?.let { scrimListener.onNotificationPosted(it, isEntrySilent(entry)) }
+            }
+
+            override fun onEntryUpdated(entry: NotificationEntry) {
+                entry.sbn?.let { scrimListener.onNotificationPosted(it, isEntrySilent(entry)) }
+            }
+
+            override fun onEntryRemoved(entry: NotificationEntry, reason: Int) {
+                // Collection da co reason — khong drop qua Scrim path khong reason.
+                entry.sbn?.let { handleNotificationRemoved(it, reason) }
+            }
+        }
+
+    /**
+     * FG doi (Interactor) — doi max-gap <-> leave-grace cho event dang KEEP.
+     * Absolute deadline khong gia han khi flip-flop; chi re-arm phan con lai.
+     * Home + event retained → APP_SHOW ngay (khong doi Clock post).
+     * Visual-dismiss stopwatch: owner-gap chi khi retained nonnull; restore sau
+     * chuoi vao Clock → roi (Home) — khong resurrect moi tick.
+     */
+    fun onForegroundPackageChanged(foregroundPackage: String?) {
+        val sw = _stopwatchEvent.value
+        val swKey = stopwatchOwnerGapKey
+        if (swKey != null && sw != null) {
+            val inOwner =
+                !foregroundPackage.isNullOrEmpty() &&
+                    foregroundPackage in islandEventOwnerPackages(sw)
+            applyDeskClockOwnerGapEffect(
+                deskClockOwnerGapRetention.onOwnerForegroundChanged(swKey, inOwner),
+                kind = DeskClockGapKind.STOPWATCH,
+            )
+        } else {
+            // Event null sau swipe-hide — owner-gap khong chay; visual-dismiss restore.
+            applyStopwatchVisualDismissForeground(foregroundPackage)
+        }
+        for (key in timerOwnerGapKeys.toList()) {
+            val timer =
+                _timerEvents.value.firstOrNull {
+                    isTimerKeyForNotification(it.notificationKey, key)
+                }
+            if (timer == null) {
+                clearTimerOwnerGap(key)
+                continue
+            }
+            val inOwner =
+                !foregroundPackage.isNullOrEmpty() &&
+                    foregroundPackage in islandEventOwnerPackages(timer)
+            applyDeskClockOwnerGapEffect(
+                deskClockOwnerGapRetention.onOwnerForegroundChanged(key, inOwner),
+                kind = DeskClockGapKind.TIMER,
+            )
+        }
+    }
+
+    private fun stopwatchVisualDismissOwnerPackages(): Set<String> {
+        val pkg = stopwatchDismissedPackage
+        return if (!pkg.isNullOrEmpty()) {
+            CLOCK_PACKAGES + pkg
+        } else {
+            CLOCK_PACKAGES
+        }
+    }
+
+    private fun applyStopwatchVisualDismissForeground(foregroundPackage: String?) {
+        when (
+            deskClockStopwatchVisualDismissOnForegroundChanged(
+                dismissedKey = stopwatchDismissedKey,
+                awaitOwnerRevisit = stopwatchAwaitOwnerRevisit,
+                ownerRevisitArmed = stopwatchOwnerRevisitArmed,
+                foregroundPackage = foregroundPackage,
+                ownerPackages = stopwatchVisualDismissOwnerPackages(),
+            )
+        ) {
+            DeskClockStopwatchVisualDismissFgEffect.NONE -> Unit
+            DeskClockStopwatchVisualDismissFgEffect.ARM_OWNER_REVISIT -> {
+                stopwatchOwnerRevisitArmed = true
+            }
+            DeskClockStopwatchVisualDismissFgEffect.RESTORE_AFTER_LEAVE -> {
+                val key = stopwatchDismissedKey
+                clearStopwatchVisualDismissGate()
+                if (key != null) {
+                    rebindStopwatchFromActiveNotification(key)
+                }
+            }
+        }
+    }
+
+    private fun clearStopwatchVisualDismissGate() {
+        stopwatchVisualDismissGate = null
+        stopwatchDismissedPackage = null
+    }
+
+    /** Rebind stopwatch tu SBN ongoing sau deliberate owner revisit / new-run gate clear. */
+    private fun rebindStopwatchFromActiveNotification(key: String) {
+        val sbn = getSbn(key) ?: return
+        val extras = sbn.notification?.extras ?: return
+        val actionLabels =
+            sbn.notification?.actions?.map { it.title?.toString()?.lowercase() ?: "" }
+                ?: emptyList()
+        val actionIntents =
+            sbn.notification?.actions?.map { actionIntentString(it) ?: "" } ?: emptyList()
+        handleStopwatch(sbn, extras, actionLabels, actionIntents)
+    }
+
+    private fun currentForegroundPackage(): String? =
+        try {
+            foregroundPackageProvider?.invoke()
+        } catch (_: RuntimeException) {
+            null
+        }
+
+    private fun handleNotificationRemoved(sbn: StatusBarNotification, reason: Int) {
+        if (!listening) return
+        activeSbns.remove(sbn.key)
+        _activeNotifications.update { it - sbn.key }
+        seenSignatures.remove(sbn.key)
+        seenIconRevisions.remove(sbn.key)
+
+        val fg = currentForegroundPackage()
+
+        if (_timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbn.key) }) {
+            handleTimerNotificationRemoved(sbn, reason, fg)
+        }
+        if (sbn.key == stopwatchNotificationKey || sbn.key == stopwatchOwnerGapKey) {
+            handleStopwatchNotificationRemoved(sbn, reason, fg)
+        }
+
+        // Media / non-clock: giu hanh vi cu — clear ngay (khong owner-gap Clock).
+        dismissedPromotedKeys.remove(sbn.key)
+        dismissedSportsKeys.remove(sbn.key)
+
+        if (sbn.key == recorderNotifKey) {
+            recorderNotifKey = null
+            val currentState = recording?.state
+            if (currentState == RecordingState.SAVED) {
+                clearAudioRecording()
+            } else if (currentState != null) {
+                recorderGraceJob?.cancel()
+                recorderGraceJob =
+                    applicationScope.launch {
+                        delay(RECORDER_REMOVAL_GRACE_MS)
+                        if (recorderNotifKey == null &&
+                            recording?.state != RecordingState.SAVED
+                        ) {
+                            clearAudioRecording()
+                        }
+                    }
+            }
+        }
+
+        if (sbn.key == alarmNotificationKey) {
+            alarmNotificationKey = null
+            _alarmEvent.value = null
+        }
+
+        _callEvents.value = _callEvents.value.filter { it.sbn.key != sbn.key }
+
+        _promotedOngoingEvents.value =
+            _promotedOngoingEvents.value.filter { it.sbn.key != sbn.key }
+
+        _sportsEvents.value = _sportsEvents.value.filter { it.key != sbn.key }
+
+        if (_nowPlayingEvent.value?.key == sbn.key) {
+            dismissedNowPlayingTitle = null
+            _nowPlayingEvent.value = null
+        }
+
+        synchronized(notificationStateLock) {
+            activeNotificationTokens.removeKey(sbn.key)
+            _notificationEvents.value =
+                _notificationEvents.value.filter { it.sbn.key != sbn.key }
+        }
+
+        notificationRemovedFlow.tryEmit(sbn.key)
+    }
+
+    private fun handleStopwatchNotificationRemoved(
+        sbn: StatusBarNotification,
+        reason: Int,
+        foregroundPackage: String?,
+    ) {
+        val existing = _stopwatchEvent.value
+        val owners = existing?.let { islandEventOwnerPackages(it) }.orEmpty()
+        val ownerAssoc =
+            !foregroundPackage.isNullOrEmpty() && foregroundPackage in owners
+        val decision = deskClockNotifRemovalDecision(reason, ownerAssoc)
+        val tb =
+            existing?.let {
+                if (it.isRunning) it.startElapsedRealtimeMs else it.pausedElapsedMs
+            } ?: 0L
+        statusBarAppPillLogClockNotif(
+            cause = "remove",
+            reason = reason,
+            decision =
+                if (decision == DeskClockNotifRemovalDecision.KEEP_OWNER_GAP) "keep"
+                else "drop",
+            ownerAssoc = ownerAssoc,
+            eventKind = "stopwatch",
+            eventToken = deskClockEventToken(sbn.key),
+            timebaseAnchor = tb,
+        )
+        // DROP thang KEEP tren duplicate Scrim+collection; KEEP trung khong reset deadline.
+        val effect =
+            deskClockOwnerGapRetention.applyRemovalDecision(
+                key = sbn.key,
+                decision = decision,
+                ownerInForeground = ownerAssoc,
+            )
+        when (decision) {
+            DeskClockNotifRemovalDecision.KEEP_OWNER_GAP -> {
+                // Retain run data, but require a repost before presenting it again.
+                stopwatchOwnerGapKey = sbn.key
+                // Key van tro toi event retained (post tre cung key rebind).
+                stopwatchNotificationKey = sbn.key
+                val current = _stopwatchEvent.value
+                if (current != null && !current.awaitingOwnerRepost) {
+                    _stopwatchEvent.value = current.copy(awaitingOwnerRepost = true)
+                }
+                applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.STOPWATCH)
+            }
+            DeskClockNotifRemovalDecision.DROP_ENDED -> {
+                // Chi drop neu key van so huu event hien tai (stale old-key khong xoa moi).
+                val currentKey =
+                    _stopwatchEvent.value?.notificationKey ?: stopwatchOwnerGapKey
+                if (currentKey == null || currentKey == sbn.key) {
+                    dropStopwatchEvent(cause = "removal")
+                } else {
+                    deskClockOwnerGapRetention.clearKey(sbn.key)
+                }
+            }
+        }
+    }
+
+    private fun handleTimerNotificationRemoved(
+        sbn: StatusBarNotification,
+        reason: Int,
+        foregroundPackage: String?,
+    ) {
+        val matched =
+            _timerEvents.value.filter { isTimerKeyForNotification(it.notificationKey, sbn.key) }
+        if (matched.isEmpty()) return
+        val owners = matched.flatMap { islandEventOwnerPackages(it) }.toSet()
+        val ownerAssoc =
+            !foregroundPackage.isNullOrEmpty() && foregroundPackage in owners
+        val decision = deskClockNotifRemovalDecision(reason, ownerAssoc)
+        val tb = matched.firstOrNull()?.endElapsedRealtimeMs ?: 0L
+        statusBarAppPillLogClockNotif(
+            cause = "remove",
+            reason = reason,
+            decision =
+                if (decision == DeskClockNotifRemovalDecision.KEEP_OWNER_GAP) "keep"
+                else "drop",
+            ownerAssoc = ownerAssoc,
+            eventKind = "timer",
+            eventToken = deskClockEventToken(sbn.key),
+            timebaseAnchor = tb,
+        )
+        val effect =
+            deskClockOwnerGapRetention.applyRemovalDecision(
+                key = sbn.key,
+                decision = decision,
+                ownerInForeground = ownerAssoc,
+            )
+        when (decision) {
+            DeskClockNotifRemovalDecision.KEEP_OWNER_GAP -> {
+                timerOwnerGapKeys.add(sbn.key)
+                // Chi danh dau cac timer thuoc notification da mat; giu nguyen timer tu notif khac.
+                val currentTimers = _timerEvents.value
+                var updatedAny = false
+                val nextTimers =
+                    currentTimers.map { timer ->
+                        if (isTimerKeyForNotification(timer.notificationKey, sbn.key) &&
+                            !timer.awaitingOwnerRepost
+                        ) {
+                            updatedAny = true
+                            timer.copy(awaitingOwnerRepost = true)
+                        } else {
+                            timer
+                        }
+                    }
+                if (updatedAny) {
+                    _timerEvents.value = nextTimers
+                }
+                applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.TIMER)
+            }
+            DeskClockNotifRemovalDecision.DROP_ENDED -> {
+                clearTimerOwnerGap(sbn.key)
+                removeTimersForNotificationKey(sbn.key)
+            }
+        }
+    }
+
+    private enum class DeskClockGapKind {
+        STOPWATCH,
+        TIMER,
+    }
+
+    private fun applyDeskClockOwnerGapEffect(
+        effect: DeskClockOwnerGapEffect,
+        kind: DeskClockGapKind,
+    ) {
+        when (effect) {
+            is DeskClockOwnerGapEffect.None -> Unit
+            is DeskClockOwnerGapEffect.Drop -> {
+                when (kind) {
+                    DeskClockGapKind.STOPWATCH -> dropStopwatchEvent(cause = effect.cause)
+                    DeskClockGapKind.TIMER -> {
+                        clearTimerOwnerGap(effect.key)
+                        removeTimersForNotificationKey(effect.key)
+                        statusBarAppPillLogClockNotif(
+                            cause = "drop:${effect.cause}",
+                            reason = DESK_CLOCK_REASON_UNKNOWN,
+                            decision = "drop",
+                            ownerAssoc = false,
+                            eventKind = "timer",
+                            eventToken = deskClockEventToken(effect.key),
+                            timebaseAnchor = 0L,
+                        )
+                    }
+                }
+            }
+            is DeskClockOwnerGapEffect.ArmTimer -> armDeskClockOwnerGapJob(effect, kind)
+        }
+    }
+
+    private fun armDeskClockOwnerGapJob(
+        arm: DeskClockOwnerGapEffect.ArmTimer,
+        kind: DeskClockGapKind,
+    ) {
+        when (kind) {
+            DeskClockGapKind.STOPWATCH -> {
+                cancelStopwatchGapJobs()
+                stopwatchOwnerGapKey = arm.key
+                stopwatchGapJob =
+                    applicationScope.launch {
+                        delay(arm.delayMs)
+                        val drop =
+                            deskClockOwnerGapRetention.onArmedTimeout(
+                                key = arm.key,
+                                generation = arm.generation,
+                                armSequence = arm.armSequence,
+                                dueDeadlineElapsedMs = arm.dueDeadlineElapsedMs,
+                            )
+                        if (drop is DeskClockOwnerGapEffect.Drop) {
+                            dropStopwatchEvent(cause = arm.cause)
+                        }
+                    }
+            }
+            DeskClockGapKind.TIMER -> {
+                timerGapJobs.remove(arm.key)?.cancel()
+                timerOwnerGapKeys.add(arm.key)
+                timerGapJobs[arm.key] =
+                    applicationScope.launch {
+                        delay(arm.delayMs)
+                        val drop =
+                            deskClockOwnerGapRetention.onArmedTimeout(
+                                key = arm.key,
+                                generation = arm.generation,
+                                armSequence = arm.armSequence,
+                                dueDeadlineElapsedMs = arm.dueDeadlineElapsedMs,
+                            )
+                        if (drop is DeskClockOwnerGapEffect.Drop) {
+                            clearTimerOwnerGap(arm.key)
+                            removeTimersForNotificationKey(arm.key)
+                            statusBarAppPillLogClockNotif(
+                                cause = "drop:${arm.cause}",
+                                reason = DESK_CLOCK_REASON_UNKNOWN,
+                                decision = "drop",
+                                ownerAssoc = false,
+                                eventKind = "timer",
+                                eventToken = deskClockEventToken(arm.key),
+                                timebaseAnchor = 0L,
+                            )
+                        }
+                    }
+            }
+        }
+    }
+
+    /** Co retention/event dang track cung notification key. */
+    private fun hasTrackedDeskClockSameKeyGap(sbnKey: String): Boolean {
+        if (deskClockOwnerGapRetention.hasGap(sbnKey)) return true
+        if (stopwatchOwnerGapKey == sbnKey) return true
+        if (_stopwatchEvent.value?.notificationKey == sbnKey) return true
+        if (sbnKey in timerOwnerGapKeys) return true
+        return _timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+    }
+
+    /** Kind dang retained cho key — STOPWATCH/TIMER/NONE. */
+    private fun trackedDeskClockKindForKey(sbnKey: String): DeskClockNotifKind {
+        val sw =
+            stopwatchOwnerGapKey == sbnKey ||
+                _stopwatchEvent.value?.notificationKey == sbnKey
+        val tm =
+            sbnKey in timerOwnerGapKeys ||
+                _timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+        return when {
+            sw && !tm -> DeskClockNotifKind.STOPWATCH
+            tm && !sw -> DeskClockNotifKind.TIMER
+            sw && tm -> DeskClockNotifKind.STOPWATCH // hiem — uu tien SW roi cross-type drop
+            else -> DeskClockNotifKind.NONE
+        }
+    }
+
+    /** Cross-type: drop kind cu + clear retention truoc handle kind moi. */
+    private fun dropTrackedDeskClockKindBeforeCrossType(
+        sbnKey: String,
+        prevKind: DeskClockNotifKind,
+    ) {
+        deskClockOwnerGapRetention.reconcileNonMatchingSameKeyPost(sbnKey)
+        when (prevKind) {
+            DeskClockNotifKind.STOPWATCH -> dropStopwatchEvent(cause = "cross_type_switch")
+            DeskClockNotifKind.TIMER -> {
+                clearTimerOwnerGap(sbnKey)
+                removeTimersForNotificationKey(sbnKey)
+                statusBarAppPillLogClockNotif(
+                    cause = "drop:cross_type_switch",
+                    reason = DESK_CLOCK_REASON_UNKNOWN,
+                    decision = "drop",
+                    ownerAssoc = false,
+                    eventKind = "timer",
+                    eventToken = deskClockEventToken(sbnKey),
+                    timebaseAnchor = 0L,
+                )
+            }
+            DeskClockNotifKind.NONE -> {
+                // Gap record khong gan kind — chi clear retention.
+                deskClockOwnerGapRetention.clearKey(sbnKey)
+            }
+        }
+    }
+
+    private fun reconcileDeskClockNonMatchingPost(sbnKey: String) {
+        val wasStopwatchGap =
+            stopwatchOwnerGapKey == sbnKey ||
+                _stopwatchEvent.value?.notificationKey == sbnKey
+        val wasTimerGap =
+            sbnKey in timerOwnerGapKeys ||
+                _timerEvents.value.any { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+        if (!wasStopwatchGap &&
+            !wasTimerGap &&
+            !deskClockOwnerGapRetention.hasGap(sbnKey)
+        ) {
+            return
+        }
+        val effect = deskClockOwnerGapRetention.reconcileNonMatchingSameKeyPost(sbnKey)
+        if (effect !is DeskClockOwnerGapEffect.Drop) {
+            // Van can drop UI neu chi co event ma retention da mat.
+            if (wasStopwatchGap) dropStopwatchEvent(cause = "nonmatching_replace")
+            if (wasTimerGap) {
+                clearTimerOwnerGap(sbnKey)
+                removeTimersForNotificationKey(sbnKey)
+            }
+            return
+        }
+        if (wasStopwatchGap) {
+            applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.STOPWATCH)
+        }
+        if (wasTimerGap) {
+            applyDeskClockOwnerGapEffect(effect, DeskClockGapKind.TIMER)
+        }
+        // Retention gap ma chua gan SW/TM flag — effect Drop da xoa record.
+    }
+
+    private fun dropStopwatchEvent(cause: String) {
+        cancelStopwatchGapJobs()
+        val gapKey = stopwatchOwnerGapKey
+        if (gapKey != null) deskClockOwnerGapRetention.clearKey(gapKey)
+        stopwatchOwnerGapKey = null
+        stopwatchNotificationKey = null
+        clearStopwatchVisualDismissGate()
+        if (_stopwatchEvent.value != null) {
+            statusBarAppPillLogClockNotif(
+                cause = "drop:$cause",
+                reason = DESK_CLOCK_REASON_UNKNOWN,
+                decision = "drop",
+                ownerAssoc = false,
+                eventKind = "stopwatch",
+                eventToken = deskClockEventToken(_stopwatchEvent.value?.notificationKey),
+                timebaseAnchor = _stopwatchEvent.value?.startElapsedRealtimeMs ?: 0L,
+            )
+        }
+        _stopwatchEvent.value = null
+    }
+
+    private fun dropAllDeskClockOwnerGaps(cause: String) {
+        deskClockOwnerGapRetention.clearAll()
+        if (stopwatchOwnerGapKey != null || _stopwatchEvent.value != null) {
+            dropStopwatchEvent(cause = cause)
+        }
+        for (key in timerOwnerGapKeys.toList()) {
+            clearTimerOwnerGap(key)
+            removeTimersForNotificationKey(key)
+        }
+        timerOwnerGapKeys.clear()
+    }
+
+    private fun cancelStopwatchGapJobs() {
+        stopwatchGapJob?.cancel()
+        stopwatchGapJob = null
+    }
+
+    private fun clearTimerOwnerGap(notificationKey: String) {
+        timerOwnerGapKeys.remove(notificationKey)
+        timerGapJobs.remove(notificationKey)?.cancel()
+        deskClockOwnerGapRetention.clearKey(notificationKey)
+    }
+
+    private fun markStopwatchGapClearedOnPost(sbnKey: String, timebaseAnchor: Long) {
+        val oldGap = stopwatchOwnerGapKey
+        if (oldGap != null || deskClockOwnerGapRetention.hasGap(sbnKey)) {
+            statusBarAppPillLogClockNotif(
+                cause = "post",
+                reason = DESK_CLOCK_REASON_UNKNOWN,
+                decision = "rebind",
+                ownerAssoc =
+                    currentForegroundPackage()?.let { fg ->
+                        _stopwatchEvent.value?.let { fg in islandEventOwnerPackages(it) }
+                    } == true,
+                eventKind = "stopwatch",
+                eventToken = deskClockEventToken(sbnKey),
+                timebaseAnchor = timebaseAnchor,
+            )
+        }
+        // Valid matching rebind: clear old + new key; stale timer gen cu khong drop.
+        if (oldGap != null) deskClockOwnerGapRetention.clearOnValidatedMatchingPost(oldGap)
+        if (oldGap != sbnKey) deskClockOwnerGapRetention.clearOnValidatedMatchingPost(sbnKey)
+        cancelStopwatchGapJobs()
+        stopwatchOwnerGapKey = null
+    }
+
+    private fun markTimerGapClearedOnPost(sbnKey: String, timebaseAnchor: Long) {
+        if (sbnKey in timerOwnerGapKeys || deskClockOwnerGapRetention.hasGap(sbnKey)) {
+            statusBarAppPillLogClockNotif(
+                cause = "post",
+                reason = DESK_CLOCK_REASON_UNKNOWN,
+                decision = "rebind",
+                ownerAssoc =
+                    currentForegroundPackage()?.let { fg ->
+                        _timerEvents.value
+                            .firstOrNull { isTimerKeyForNotification(it.notificationKey, sbnKey) }
+                            ?.let { fg in islandEventOwnerPackages(it) }
+                    } == true,
+                eventKind = "timer",
+                eventToken = deskClockEventToken(sbnKey),
+                timebaseAnchor = timebaseAnchor,
+            )
+        }
+        deskClockOwnerGapRetention.clearOnValidatedMatchingPost(sbnKey)
+        clearTimerOwnerGap(sbnKey)
+    }
 
     private val listenOwners = mutableSetOf<Any>()
 
@@ -680,27 +1385,65 @@ constructor(
         if (listening) return
         listening = true
         ScrimUtils.get().addListener(scrimListener)
+        iconInvalidationJob?.cancel()
+        iconInvalidationJob =
+            applicationScope.launch {
+                smallIconLoader.invalidationTick.collect {
+                    refreshHeldNotificationIcons()
+                }
+            }
+        applicationScope.launch(Dispatchers.Main) {
+            try {
+                val collection = notifCollectionLazy.get()
+                collection.addCollectionListener(notifCollectionListener)
+                collection.allNotifs.forEach { entry ->
+                    entry.sbn?.let { scrimListener.onNotificationPosted(it, isEntrySilent(entry)) }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Loi khi dang ky collection listener hoac replay thong bao", e)
+            }
+        }
     }
 
     private fun stopListeningLocked() {
         if (!listening) return
         listening = false
         ScrimUtils.get().removeListener(scrimListener)
+        iconInvalidationJob?.cancel()
+        iconInvalidationJob = null
+        applicationScope.launch(Dispatchers.Main) {
+            try {
+                notifCollectionLazy.get().removeCollectionListener(notifCollectionListener)
+            } catch (e: Exception) {
+                Log.w(TAG, "Loi khi huy collection listener", e)
+            }
+        }
         seenSignatures.clear()
-        activeNotificationKeys.clear()
-        timerJob?.cancel()
-        timerJob = null
-        timerNotificationKey = null
-        resetTimerState()
+        seenIconRevisions.clear()
+        activeSbns.clear()
+        _activeNotifications.value = emptyMap()
+        timerJobs.values.forEach { it.cancel() }
+        timerJobs.clear()
+        timerOriginalDurations.clear()
+        timerGapJobs.values.forEach { it.cancel() }
+        timerGapJobs.clear()
+        timerOwnerGapKeys.clear()
+        deskClockOwnerGapRetention.clearAll()
+        _timerEvents.value = emptyList()
+        cancelStopwatchGapJobs()
+        stopwatchOwnerGapKey = null
         stopwatchNotificationKey = null
-        stopwatchDismissedKey = null
+        clearStopwatchVisualDismissGate()
         _stopwatchEvent.value = null
         dismissedPromotedKeys.clear()
         dismissedSportsKeys.clear()
         dismissedNowPlayingTitle = null
         _alarmEvent.value = null
         _callEvents.value = emptyList()
-        _notificationEvents.value = emptyList()
+        synchronized(notificationStateLock) {
+            activeNotificationTokens.clear()
+            _notificationEvents.value = emptyList()
+        }
         _promotedOngoingEvents.value = emptyList()
         _sportsEvents.value = emptyList()
         _nowPlayingEvent.value = null
@@ -721,20 +1464,180 @@ constructor(
     }
 
     fun dismissNotification(event: IslandEvent.Notification) {
-        synchronized(notificationLock) {
-            activeNotificationKeys.remove(event.sbn.key)
-            _notificationEvents.value = _notificationEvents.value.filter { it.id != event.id }
+        synchronized(notificationStateLock) {
+            activeNotificationTokens.removeKey(event.sbn.key)
+            _notificationEvents.value = NotificationStateReducer.dismiss(
+                list = _notificationEvents.value,
+                id = event.id,
+                idSelector = { it.id },
+            )
         }
     }
 
-    fun coalesceNotification(event: IslandEvent.Notification) {
-        if (!listening) return
-        synchronized(notificationLock) {
-            if (event.sbn.key !in activeNotificationKeys) return
-            val current = _notificationEvents.value.toMutableList()
-            current.removeAll { it.id == event.id }
-            current.add(0, event)
-            _notificationEvents.value = current
+    /** Kiem tra phien ban lan dang thong bao con hieu luc (chong event den muon). */
+    fun isNotificationPostCurrent(event: IslandEvent.Notification): Boolean {
+        return synchronized(notificationStateLock) {
+            listening && activeNotificationTokens.isCurrent(event.sbn.key, event.postToken)
+        }
+    }
+
+    fun coalesceNotification(event: IslandEvent.Notification): Boolean {
+        return synchronized(notificationStateLock) {
+            if (!listening || !activeNotificationTokens.isCurrent(event.sbn.key, event.postToken)) {
+                return false
+            }
+            _notificationEvents.value = NotificationStateReducer.coalesce(
+                list = _notificationEvents.value,
+                event = event,
+                idSelector = { it.id },
+            )
+            true
+        }
+    }
+
+    /**
+     * Cap nhat smallIcon tai cho tren event dang giu + emit refresh payload nho.
+     * Khong dung notificationFlow (tranh re-alert), khong reorder list,
+     * khong tao dummy event neu notification da bi dismiss.
+     */
+    private fun updateNotificationIconOnly(
+        key: String,
+        icon: Drawable?,
+        iconRevision: Long,
+    ) {
+        synchronized(notificationStateLock) {
+            val current = _notificationEvents.value
+            val next = NotificationStateReducer.refreshListInPlace(
+                list = current,
+                key = key,
+                keySelector = { it.sbn.key },
+                updater = { existing ->
+                    existing.copy(
+                        appIcon = icon,
+                        iconRevision = iconRevision,
+                        createdAt = existing.createdAt,
+                    )
+                },
+            )
+            if (next !== current) {
+                _notificationEvents.value = next
+            }
+        }
+        emitIconRefreshOnly(key, icon, iconRevision)
+    }
+
+    private fun emitIconRefreshOnly(key: String, icon: Drawable?, revision: Long) {
+        notificationIconRefreshFlow.tryEmit(NotificationIconRefresh(key, icon, revision))
+    }
+
+    /**
+     * Cap icon tu snapshot authoritative neu doi; null key / miss snapshot / cung revision → keep.
+     * [onChanged] chi goi khi thuc su doi (vd. emit refresh cho alert list).
+     */
+    private inline fun <T> refreshHeldIcon(
+        key: String?,
+        currentIcon: Drawable?,
+        currentRevision: Long,
+        keep: T,
+        noinline onChanged: ((Drawable?, Long) -> Unit)? = null,
+        copy: (Drawable?, Long) -> T,
+    ): T {
+        if (key.isNullOrEmpty()) return keep
+        val snapshot = smallIconLoader.resolveCurrentSnapshot(key) ?: return keep
+        val (d, rev) = snapshot
+        if (d === currentIcon && rev == currentRevision) return keep
+        onChanged?.invoke(d, rev)
+        return copy(d, rev)
+    }
+
+    /** Refresh icon moi event notification-backed dang giu tu authoritative snapshot (config / collection). */
+    private fun refreshHeldNotificationIcons() {
+        synchronized(notificationStateLock) {
+            _notificationEvents.value =
+                _notificationEvents.value.map { event ->
+                    refreshHeldIcon(
+                        key = event.sbn.key,
+                        currentIcon = event.appIcon,
+                        currentRevision = event.iconRevision,
+                        keep = event,
+                        onChanged = { d, rev -> emitIconRefreshOnly(event.sbn.key, d, rev) },
+                    ) { d, rev ->
+                        event.copy(appIcon = d, iconRevision = rev, createdAt = event.createdAt)
+                    }
+                }
+        }
+        _promotedOngoingEvents.value =
+            _promotedOngoingEvents.value.map { event ->
+                refreshHeldIcon(
+                    key = event.sbn.key,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        _callEvents.value =
+            _callEvents.value.map { event ->
+                refreshHeldIcon(
+                    key = event.sbn.key,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        _sportsEvents.value =
+            _sportsEvents.value.map { event ->
+                val sbn = event.sbn ?: return@map event
+                refreshHeldIcon(
+                    key = sbn.key,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        _nowPlayingEvent.value =
+            _nowPlayingEvent.value?.let { event ->
+                val sbn = event.sbn ?: return@let event
+                refreshHeldIcon(
+                    key = sbn.key,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        _timerEvents.value =
+            _timerEvents.value.map { event ->
+                val sbnKey = event.sbn?.key ?: event.notificationKey.substringBefore('#')
+                refreshHeldIcon(
+                    key = sbnKey,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        _stopwatchEvent.value =
+            _stopwatchEvent.value?.let { event ->
+                val sbnKey =
+                    event.sbn?.key
+                        ?: event.notificationKey.takeIf { it.isNotEmpty() }
+                        ?: return@let event
+                refreshHeldIcon(
+                    key = sbnKey,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        _alarmEvent.value =
+            _alarmEvent.value?.let { event ->
+                refreshHeldIcon(
+                    key = alarmNotificationKey,
+                    currentIcon = event.appIcon,
+                    currentRevision = event.iconRevision,
+                    keep = event,
+                ) { d, rev -> event.copy(appIcon = d, iconRevision = rev) }
+            }
+        seenIconRevisions.keys.toList().forEach { key ->
+            seenIconRevisions[key] = smallIconLoader.revisionByKey(key)
         }
     }
 
@@ -749,20 +1652,93 @@ constructor(
         _audioRecordingEvent.value = if (recordingDismissed) null else event
     }
 
-    fun clearTimer() {
-        timerDismissedKey = timerNotificationKey
-        _timerEvent.value = null
+    fun clearTimer(notificationKey: String? = null) {
+        if (notificationKey.isNullOrEmpty()) {
+            timerJobs.values.forEach { it.cancel() }
+            timerJobs.clear()
+            timerOriginalDurations.clear()
+            timerGapJobs.values.forEach { it.cancel() }
+            timerGapJobs.clear()
+            val gapKeys = timerOwnerGapKeys.toList()
+            timerOwnerGapKeys.clear()
+            gapKeys.forEach { deskClockOwnerGapRetention.clearKey(it) }
+            _timerEvents.value = emptyList()
+        } else {
+            clearTimerOwnerGap(notificationKey)
+            removeTimersForNotificationKey(notificationKey)
+        }
     }
 
-    private fun resetTimerState() {
-        timerDismissedKey = null
-        lastTimer = null
-        timerOriginalDurationMs = 0L
-        _timerEvent.value = null
+    private fun isTimerKeyForNotification(timerKey: String, notificationKey: String): Boolean =
+        timerKey == notificationKey || timerKey.startsWith("$notificationKey#")
+
+    private fun cancelTimerJobsForNotificationKey(
+        notificationKey: String,
+        clearDurations: Boolean = true,
+    ) {
+        timerJobs.keys
+            .filter { isTimerKeyForNotification(it, notificationKey) }
+            .forEach { k ->
+                timerJobs.remove(k)?.cancel()
+                if (clearDurations) timerOriginalDurations.remove(k)
+            }
+    }
+
+    private fun removeTimersForNotificationKey(
+        notificationKey: String,
+        clearDurations: Boolean = true,
+    ) {
+        cancelTimerJobsForNotificationKey(notificationKey, clearDurations)
+        _timerEvents.value =
+            _timerEvents.value.filter { !isTimerKeyForNotification(it.notificationKey, notificationKey) }
+    }
+
+    private fun removeTimer(notificationKey: String) {
+        timerJobs.remove(notificationKey)?.cancel()
+        timerOriginalDurations.remove(notificationKey)
+        _timerEvents.value = _timerEvents.value.filter { it.notificationKey != notificationKey }
     }
 
     fun clearStopwatch() {
-        stopwatchDismissedKey = stopwatchNotificationKey
+        // Visual swipe-hide pill — KHONG stop stopwatch that / KHONG owner-gap.
+        // Stateful gate: rejected posts cap nhat latest (pause/resume).
+        val existing = _stopwatchEvent.value
+        val key =
+            existing?.notificationKey?.takeIf { it.isNotEmpty() }
+                ?: stopwatchNotificationKey
+                ?: stopwatchOwnerGapKey
+        stopwatchVisualDismissGate =
+            if (key != null && existing != null) {
+                deskClockStopwatchVisualDismissGateOf(
+                    deskClockStopwatchRunIdentity(
+                        notificationKey = key,
+                        isRunning = existing.isRunning,
+                        startElapsedRealtimeMs = existing.startElapsedRealtimeMs,
+                        pausedElapsedMs = existing.pausedElapsedMs,
+                        displayedElapsedMs = existing.displayedElapsedMs(),
+                    ),
+                )
+            } else if (key != null) {
+                deskClockStopwatchVisualDismissGateOf(
+                    deskClockStopwatchRunIdentity(
+                        notificationKey = key,
+                        isRunning = false,
+                        startElapsedRealtimeMs = 0L,
+                        pausedElapsedMs = 0L,
+                        displayedElapsedMs = 0L,
+                    ),
+                )
+            } else {
+                null
+            }
+        stopwatchDismissedPackage =
+            existing?.packageName?.takeIf { it.isNotEmpty() }
+        cancelStopwatchGapJobs()
+        stopwatchOwnerGapKey?.let { deskClockOwnerGapRetention.clearKey(it) }
+        stopwatchOwnerGapKey = null
+        if (key != null) {
+            stopwatchNotificationKey = key
+        }
         _stopwatchEvent.value = null
     }
 
@@ -774,88 +1750,787 @@ constructor(
         _callEvents.value = _callEvents.value.filter { it.sbn.key != key }
     }
 
+    /** Doc title/text an toan — Clock dung SpannableString, getString() tra null + log Bundle. */
+    private fun extrasCharSequence(extras: Bundle, key: String): String? =
+        extras.getCharSequence(key)?.toString()?.takeIf { it.isNotBlank() }
+
     private fun handleTimer(
         sbn: StatusBarNotification,
         extras: Bundle,
         actionLabels: List<String> = emptyList(),
         actionIntents: List<String> = emptyList(),
     ) {
-        val label = extras.getText("android.title") ?: context.getString(R.string.ax_dynamic_bar_timer)
-        val icon =
-            try {
-                context.packageManager.getApplicationIcon(sbn.packageName)
-            } catch (_: Exception) {
-                null
+        val defaultLabel =
+            extrasCharSequence(extras, Notification.EXTRA_TITLE)
+                ?: context.getString(R.string.ax_dynamic_bar_timer)
+        val (icon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
+        val notifPaused = detectTimerPausedFromActions(actionLabels, actionIntents)
+        val rawActions = extractNotificationActions(sbn)
+        // Cache PI PAUSE/START truoc khi loc (multi mat action tung timer).
+        cacheDeskClockTogglePendingIntents(rawActions)
+        // Bo action nhom ("Dat lai ca hai…") — moi the chi 1 timer, khong hien nut cho ca nhom.
+        val actions = rawActions.filterNot { isSharedMultiTimerAction(it.label) }
+        val key = sbn.key
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val metrics =
+            parseChronometerMetricsFromExtras(extras, nowWall, nowElapsed).filter { it.countDown }
+        // Giu endTime/duration cu truoc khi cap nhat (tranh nhap nhay bo nho).
+        val existing =
+            _timerEvents.value.find { isTimerKeyForNotification(it.notificationKey, key) }
+
+        cancelTimerJobsForNotificationKey(key, clearDurations = false)
+
+        val contentIntent = sbn.notification?.contentIntent
+        val packageName = sbn.packageName.orEmpty()
+        val currentList = _timerEvents.value
+        val firstIdx = currentList.indexOfFirst { isTimerKeyForNotification(it.notificationKey, key) }
+        val remaining = currentList.filter { !isTimerKeyForNotification(it.notificationKey, key) }
+        val extractedIds = extractDeskClockTimerIds(sbn)
+        val idCache = deskClockTimerIdsByNotif.getOrPut(key) { linkedSetOf() }
+        extractedIds.forEach { idCache.add(it) }
+        rememberDeskClockTimerIds(extractedIds)
+        currentList
+            .filter { isTimerKeyForNotification(it.notificationKey, key) }
+            .map { it.deskClockTimerId }
+            .filter { it >= 0 }
+            .forEach { idCache.add(it) }
+        // Nap rem_* tu prefs cho fingerprint (khong do known_ids vao pool idCache).
+        loadPersistedDeskClockRemainings()
+        val criticalIndex =
+            extras.getInt("android.metrics.criticalIndex", 0).let { raw ->
+                if (metrics.isEmpty()) 0 else raw.coerceIn(0, metrics.lastIndex)
             }
 
-        val hasPauseIntent = actionIntents.any { it == DeskClockActions.PAUSE_TIMER }
-        val hasStartIntent = actionIntents.any { it == DeskClockActions.START_TIMER }
-        val isPaused = when {
-            hasStartIntent -> true
-            hasPauseIntent -> false
-            else -> {
-                val hasPauseLabel = actionLabels.any { it.contains("pause") }
-                val hasResumeLabel = actionLabels.any {
-                    it.contains("resume") || it.contains("play") ||
-                        (it.contains("start") && !it.contains("stop"))
+        if (metrics.isNotEmpty()) {
+            val useSplitKeys = metrics.size > 1
+            // Multi: groupKey "g:4" khong phai TIMER_ID — chi lay id tu URI/extra.
+            val idsForResolve =
+                if (metrics.size > 1) {
+                    extractedIds.filter { it >= 0 }.distinct()
+                } else {
+                    extractedIds
                 }
-                hasResumeLabel || (actionLabels.isNotEmpty() && !hasPauseLabel)
+            val existingForKey =
+                currentList.filter { isTimerKeyForNotification(it.notificationKey, key) }
+            // Seed remaining tu event hien co (truoc khi remap).
+            existingForKey.forEach { ev ->
+                val id = ev.deskClockTimerId
+                if (id < 0) return@forEach
+                val rem = eventRemainingMs(ev, nowWall)
+                if (rem > 0L) deskClockLastRemainingById[id] = rem
             }
-        }
-
-        var endTimeMs = sbn.notification.`when`
-        if (endTimeMs <= System.currentTimeMillis()) {
-            val chronoBase = extractChronometerBase(sbn)
-            if (chronoBase > 0L) {
-                val remaining = chronoBase - SystemClock.elapsedRealtime()
-                endTimeMs = if (remaining > 0L) System.currentTimeMillis() + remaining else 0L
-            } else {
-                endTimeMs = 0L
-            }
-        }
-
-        if (isPaused && endTimeMs > System.currentTimeMillis()) {
-            val existing = lastTimer
-            if (existing != null && existing.endTimeMs > 0L) {
-                endTimeMs = existing.endTimeMs
-            }
-        }
-
-        val actions = extractNotificationActions(sbn)
-        val isNewTimer = timerNotificationKey != sbn.key
-        if (isNewTimer && endTimeMs > 0L) {
-            timerOriginalDurationMs = (endTimeMs - System.currentTimeMillis()).coerceAtLeast(1000L)
-        }
-        val event =
-            IslandEvent.Timer(
-                label = label,
-                endTimeMs = endTimeMs,
-                originalDurationMs = timerOriginalDurationMs,
-                appIcon = icon,
-                isPaused = isPaused,
-                actions = actions,
-                contentIntent = sbn.notification?.contentIntent,
+            val assignedIds =
+                assignDeskClockTimerIds(
+                    metrics = metrics,
+                    criticalIndex = criticalIndex,
+                    extractedIds = idsForResolve,
+                    cachedIds = idCache.toList(),
+                    existingForKey = existingForKey,
+                    notifKey = key,
+                    useSplitKeys = useSplitKeys,
+                    nowWall = nowWall,
+                    nowElapsed = nowElapsed,
+                )
+            assignedIds.filter { it >= 0 }.forEach { idCache.add(it) }
+            rememberDeskClockTimerIds(assignedIds)
+            pruneDeskClockRemainings(assignedIds)
+            val newEvents =
+                metrics.mapIndexed { index, metric ->
+                    val timerKey = if (useSplitKeys) "$key#$index" else key
+                    val deskClockTimerId = assignedIds.getOrElse(index) { -1 }
+                    val rem = metricRemainingMs(metric, nowWall, nowElapsed)
+                    if (deskClockTimerId >= 0 && rem > 0L) {
+                        deskClockLastRemainingById[deskClockTimerId] = rem
+                        persistDeskClockRemaining(deskClockTimerId, rem)
+                    }
+                    upsertTimerEvent(
+                        timerKey = timerKey,
+                        label = metric.label.ifEmpty { defaultLabel },
+                        endTimeMs = metric.wallAnchorMs,
+                        isPaused = metric.isPaused || notifPaused,
+                        pausedRemainingMs = metric.frozenDurationMs,
+                        endElapsedRealtimeMs =
+                            if (metric.isPaused || notifPaused) 0L else metric.elapsedAnchorMs,
+                        appIcon = icon,
+                        actions = actions,
+                        contentIntent = contentIntent,
+                        packageName = packageName,
+                        sbn = sbn,
+                        deskClockTimerId = deskClockTimerId,
+                        pausePendingIntent = deskClockPausePiById[deskClockTimerId],
+                        startPendingIntent = deskClockStartPiById[deskClockTimerId],
+                        iconRevision = iconRevision,
+                    )
+                }
+            val insertAt = if (firstIdx >= 0) firstIdx.coerceAtMost(remaining.size) else 0
+            _timerEvents.value = remaining.take(insertAt) + newEvents + remaining.drop(insertAt)
+            markTimerGapClearedOnPost(
+                sbnKey = key,
+                timebaseAnchor = newEvents.firstOrNull()?.endElapsedRealtimeMs ?: 0L,
             )
-        timerNotificationKey = sbn.key
-        lastTimer = event
-        val isFiring = sbn.notification?.channelId?.contains("firing", ignoreCase = true) == true
-        if (isFiring) timerDismissedKey = null
-        if (sbn.key != timerDismissedKey) {
-            _timerEvent.value = event
-            onTimerEvent?.invoke(event)
+            newEvents.forEach {
+                Log.i(
+                    TAG,
+                    "handleTimer metrics label=${it.label} endTimeMs=${it.endTimeMs} " +
+                        "paused=${it.isPaused} timerId=${it.deskClockTimerId}",
+                )
+                onTimerEvent?.invoke(it)
+            }
+            return
         }
 
-        timerJob?.cancel()
-        if (endTimeMs > 0L && !isPaused) {
-            val remainingMs = endTimeMs - System.currentTimeMillis()
-            timerJob =
-                applicationScope.launch {
-                    delay((remainingMs + 3_000L).coerceAtLeast(3_000L))
-                    // Expired: the dismissal ends with this run of the timer.
-                    timerDismissedKey = null
-                    lastTimer = null
-                    _timerEvent.value = null
+        // Fallback: notification khong co android.metrics (DeskClock cu / app khac)
+        var endTimeMs = resolveTimerEndTimeMs(sbn, extras)
+        if (endTimeMs <= 0L && existing != null && existing.endTimeMs > nowWall) {
+            endTimeMs = existing.endTimeMs
+        }
+        val fallbackId =
+            extractedIds.firstOrNull()
+                ?: existing?.deskClockTimerId?.takeIf { it >= 0 }
+                ?: -1
+        if (fallbackId >= 0) idCache.add(fallbackId)
+        val event =
+            upsertTimerEvent(
+                timerKey = key,
+                label = defaultLabel,
+                endTimeMs = endTimeMs,
+                isPaused = notifPaused,
+                appIcon = icon,
+                actions = actions,
+                contentIntent = contentIntent,
+                packageName = packageName,
+                sbn = sbn,
+                deskClockTimerId = fallbackId,
+                pausePendingIntent = deskClockPausePiById[fallbackId],
+                startPendingIntent = deskClockStartPiById[fallbackId],
+                iconRevision = iconRevision,
+            )
+        val insertAt = if (firstIdx >= 0) firstIdx.coerceAtMost(remaining.size) else 0
+        _timerEvents.value = remaining.take(insertAt) + listOf(event) + remaining.drop(insertAt)
+        markTimerGapClearedOnPost(
+            sbnKey = key,
+            timebaseAnchor = event.endElapsedRealtimeMs,
+        )
+        Log.i(
+            TAG,
+            "handleTimer fallback label=${event.label} endTimeMs=${event.endTimeMs} paused=${event.isPaused}",
+        )
+        onTimerEvent?.invoke(event)
+    }
+
+    private fun detectTimerPausedFromActions(
+        actionLabels: List<String>,
+        actionIntents: List<String>,
+    ): Boolean {
+        val hasPauseIntent = actionIntents.any { DeskClockActions.matches(it, "PAUSE_TIMER") }
+        val hasStartIntent = actionIntents.any { DeskClockActions.matches(it, "START_TIMER") }
+        val hasAddMinuteIntent = actionIntents.any { DeskClockActions.matches(it, "ADD_MINUTE_TIMER") }
+        return when {
+            hasStartIntent -> true
+            hasPauseIntent || hasAddMinuteIntent -> false
+            actionLabels.any {
+                it.contains("+1") || it.contains("add") || it.contains("+ 1")
+            } -> false
+            else ->
+                actionLabels.any {
+                    it.contains("resume") ||
+                        (it.contains("play") && !it.contains("display")) ||
+                        it.contains("tiếp") ||
+                        it.contains("tiep") ||
+                        (it.contains("start") &&
+                            !it.contains("stop") &&
+                            !it.contains("reset") &&
+                            !it.contains("đặt") &&
+                            !it.contains("dat"))
                 }
+        }
+    }
+
+    private fun upsertTimerEvent(
+        timerKey: String,
+        label: String,
+        endTimeMs: Long,
+        isPaused: Boolean,
+        pausedRemainingMs: Long = 0L,
+        endElapsedRealtimeMs: Long = 0L,
+        appIcon: Drawable?,
+        actions: List<IslandEvent.NotificationAction>,
+        contentIntent: android.app.PendingIntent? = null,
+        packageName: String = "",
+        sbn: StatusBarNotification? = null,
+        deskClockTimerId: Int = -1,
+        pausePendingIntent: android.app.PendingIntent? = null,
+        startPendingIntent: android.app.PendingIntent? = null,
+        iconRevision: Long = 0L,
+    ): IslandEvent.Timer {
+        val existing = _timerEvents.value.find { it.notificationKey == timerKey }
+        val nowMs = System.currentTimeMillis()
+        val nowEr = SystemClock.elapsedRealtime()
+        val originalDurationMs =
+            when {
+                existing != null && existing.originalDurationMs > 0L -> existing.originalDurationMs
+                timerOriginalDurations[timerKey] != null -> timerOriginalDurations[timerKey]!!
+                endTimeMs > 0L ->
+                    (endTimeMs - nowMs).coerceAtLeast(1000L).also {
+                        timerOriginalDurations[timerKey] = it
+                    }
+                else -> timerOriginalDurations[timerKey] ?: 0L
+            }
+        if (originalDurationMs > 0L) {
+            timerOriginalDurations[timerKey] = originalDurationMs
+        }
+
+        // Dong bang remaining khi paused — tranh UI tru wall-clock khi doi pill / recomposition.
+        val frozenRemaining =
+            when {
+                !isPaused -> 0L
+                pausedRemainingMs > 0L -> pausedRemainingMs
+                existing?.isPaused == true && existing.pausedRemainingMs > 0L ->
+                    existing.pausedRemainingMs
+                endElapsedRealtimeMs > 0L -> (endElapsedRealtimeMs - nowEr).coerceAtLeast(0L)
+                endTimeMs > 0L -> (endTimeMs - nowMs).coerceAtLeast(0L)
+                else -> 0L
+            }
+        val endEr = if (isPaused) 0L else endElapsedRealtimeMs
+
+        timerJobs.remove(timerKey)?.cancel()
+        if (!isPaused) {
+            val remainingMs =
+                when {
+                    endEr > 0L -> endEr - nowEr
+                    endTimeMs > 0L -> endTimeMs - nowMs
+                    else -> 0L
+                }
+            if (remainingMs > 0L) {
+                timerJobs[timerKey] =
+                    applicationScope.launch {
+                        delay((remainingMs + 3_000L).coerceAtLeast(3_000L))
+                        removeTimer(timerKey)
+                    }
+            }
+        }
+
+        val resolvedId =
+            when {
+                deskClockTimerId >= 0 -> deskClockTimerId
+                existing?.deskClockTimerId != null && existing.deskClockTimerId >= 0 ->
+                    existing.deskClockTimerId
+                else -> -1
+            }
+        val pausePi =
+            pausePendingIntent
+                ?: (if (resolvedId >= 0) deskClockPausePiById[resolvedId] else null)
+                ?: existing?.pausePendingIntent
+        val startPi =
+            startPendingIntent
+                ?: (if (resolvedId >= 0) deskClockStartPiById[resolvedId] else null)
+                ?: existing?.startPendingIntent
+        return IslandEvent.Timer(
+            label = label,
+            endTimeMs = endTimeMs,
+            originalDurationMs = originalDurationMs,
+            appIcon = appIcon,
+            isPaused = isPaused,
+            pausedRemainingMs = frozenRemaining,
+            endElapsedRealtimeMs = endEr,
+            actions = actions,
+            notificationKey = timerKey,
+            contentIntent = contentIntent,
+            packageName = packageName,
+            sbn = sbn,
+            deskClockTimerId = resolvedId,
+            pausePendingIntent = pausePi,
+            startPendingIntent = startPi,
+            awaitingOwnerRepost = false,
+            iconRevision = iconRevision,
+        )
+    }
+
+    /** Luu PI PAUSE/START + TIMER_ID tu action notif (truoc khi loc action nhom). */
+    private fun cacheDeskClockTogglePendingIntents(
+        rawActions: List<IslandEvent.NotificationAction>,
+    ) {
+        for (na in rawActions) {
+            val pi = na.action.actionIntent ?: continue
+            val intent =
+                try {
+                    pi.intent
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+            val id =
+                try {
+                    intent.getIntExtra(EXTRA_TIMER_ID, -1)
+                } catch (_: Exception) {
+                    -1
+                }
+            if (id < 0) continue
+            rememberDeskClockTimerIds(listOf(id))
+            val act = intent.action.orEmpty()
+            when {
+                DeskClockActions.matches(act, "PAUSE_TIMER") -> deskClockPausePiById[id] = pi
+                DeskClockActions.matches(act, "START_TIMER") -> deskClockStartPiById[id] = pi
+            }
+        }
+    }
+
+    /**
+     * PI Clock tao (tu notif 1-timer) — dung khi the multi khong con action Pause/Play.
+     * Khong xoa khi notif doi sang multi; chi mat khi SystemUI chet.
+     */
+    fun getDeskClockTogglePendingIntent(timerId: Int, pause: Boolean): android.app.PendingIntent? {
+        if (timerId < 0) return null
+        return if (pause) deskClockPausePiById[timerId] else deskClockStartPiById[timerId]
+    }
+
+    /**
+     * Lay TIMER_ID / TIMER_IDS tu contentIntent (URI clock-app://…/timer/N), action, groupKey.
+     * Multi-timer Clock chi gui RESET_UNEXPIRED — can id de tong hop PAUSE/START.
+     */
+    private fun extractDeskClockTimerIds(sbn: StatusBarNotification): List<Int> {
+        val ids = linkedSetOf<Int>()
+        fun absorb(intent: Intent?) {
+            if (intent == null) return
+            try {
+                intent.getIntArrayExtra(EXTRA_TIMER_IDS)?.forEach { if (it >= 0) ids.add(it) }
+            } catch (_: Exception) {}
+            try {
+                val one = intent.getIntExtra(EXTRA_TIMER_ID, -1)
+                if (one >= 0) ids.add(one)
+            } catch (_: Exception) {}
+            try {
+                val uri = intent.data?.toString().orEmpty()
+                TIMER_URI_ID_PATTERN.findAll(uri).forEach { m ->
+                    m.groupValues.getOrNull(1)?.toIntOrNull()?.takeIf { it >= 0 }?.let { ids.add(it) }
+                }
+            } catch (_: Exception) {}
+        }
+        try {
+            absorb(sbn.notification?.contentIntent?.intent)
+        } catch (_: Exception) {}
+        try {
+            absorb(sbn.notification?.deleteIntent?.intent)
+        } catch (_: Exception) {}
+        sbn.notification?.actions?.forEach { action ->
+            try {
+                absorb(action.actionIntent?.intent)
+            } catch (_: Exception) {}
+        }
+        // Chi dung group/g:N khi 1 metric — multi Clock dung group "4" chung, khong phai TIMER_ID.
+        val metricCount =
+            try {
+                sbn.notification
+                    ?.extras
+                    ?.getParcelableArrayList<Bundle>("android.metrics")
+                    ?.size
+                    ?: 0
+            } catch (_: Exception) {
+                0
+            }
+        if (metricCount <= 1) {
+            val group = sbn.notification?.group.orEmpty()
+            group.toIntOrNull()?.takeIf { it >= 0 }?.let { ids.add(it) }
+            listOf(group, sbn.groupKey.orEmpty()).forEach { g ->
+                TIMER_GROUP_ID_PATTERN.findAll(g).forEach { m ->
+                    m.groupValues
+                        .getOrNull(1)
+                        ?.toIntOrNull()
+                        ?.takeIf { it >= 0 }
+                        ?.let { ids.add(it) }
+                }
+            }
+        }
+        return ids.toList()
+    }
+
+    private fun eventRemainingMs(ev: IslandEvent.Timer, nowWall: Long): Long {
+        if (ev.isPaused) return ev.pausedRemainingMs.coerceAtLeast(0L)
+        if (ev.endElapsedRealtimeMs > 0L) {
+            return (ev.endElapsedRealtimeMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+        if (ev.endTimeMs > 0L) return (ev.endTimeMs - nowWall).coerceAtLeast(0L)
+        return 0L
+    }
+
+    private fun loadPersistedDeskClockIds(): List<Int> {
+        val raw = deskClockPrefs.getString(PREFS_KNOWN_IDS, "").orEmpty()
+        if (raw.isEmpty()) return emptyList()
+        return raw.split(',').mapNotNull { it.trim().toIntOrNull()?.takeIf { id -> id >= 0 } }
+    }
+
+    /** Chi nap rem_* — dung cho fingerprint; khong dua id lich su vao pool gan. */
+    private fun loadPersistedDeskClockRemainings() {
+        val all = deskClockPrefs.all ?: return
+        for ((key, value) in all) {
+            if (!key.startsWith(PREFS_REMAINING_PREFIX)) continue
+            val id = key.removePrefix(PREFS_REMAINING_PREFIX).toIntOrNull() ?: continue
+            val rem = (value as? Long) ?: continue
+            if (id >= 0 && rem > 0L) deskClockLastRemainingById.putIfAbsent(id, rem)
+        }
+    }
+
+    private fun rememberDeskClockTimerIds(ids: Iterable<Int>) {
+        val valid = ids.filter { it >= 0 }.distinct()
+        if (valid.isEmpty()) return
+        // Giu biet id da thay (debug / fingerprint nap rem) — pool gan khong dung list nay.
+        val merged = (loadPersistedDeskClockIds() + valid).distinct()
+        deskClockPrefs.edit().putString(PREFS_KNOWN_IDS, merged.joinToString(",")).apply()
+        for (id in valid) {
+            if (deskClockLastRemainingById.containsKey(id)) continue
+            val rem = deskClockPrefs.getLong(PREFS_REMAINING_PREFIX + id, -1L)
+            if (rem > 0L) deskClockLastRemainingById[id] = rem
+        }
+    }
+
+    private fun persistDeskClockRemaining(timerId: Int, remainingMs: Long) {
+        if (timerId < 0 || remainingMs <= 0L) return
+        deskClockPrefs.edit().putLong(PREFS_REMAINING_PREFIX + timerId, remainingMs).apply()
+    }
+
+    /** Sau gan xong: xoa rem_* khong con dung (tranh id timer cu khop nham). */
+    private fun pruneDeskClockRemainings(activeIds: Collection<Int>) {
+        val keep = activeIds.filter { it >= 0 }.toSet()
+        val edit = deskClockPrefs.edit()
+        var changed = false
+        for (id in deskClockLastRemainingById.keys.toList()) {
+            if (id in keep) continue
+            deskClockLastRemainingById.remove(id)
+            edit.remove(PREFS_REMAINING_PREFIX + id)
+            changed = true
+        }
+        if (keep.isNotEmpty()) {
+            edit.putString(PREFS_KNOWN_IDS, keep.sorted().joinToString(","))
+            changed = true
+        }
+        if (changed) edit.apply()
+    }
+
+    /**
+     * Gan TIMER_ID duy nhat cho tung metric.
+     * Khop theo remaining ms (khong so endTime vs pausedDuration) — tranh Resume chi 1
+     * timer khi metrics doi thu tu / ca hai cung label "Da tam dung".
+     * Khong sticky theo slot #index khi multi (thu tu metric khong on dinh).
+     */
+    private fun assignDeskClockTimerIds(
+        metrics: List<ParsedChronometerMetric>,
+        criticalIndex: Int,
+        extractedIds: List<Int>,
+        cachedIds: List<Int>,
+        existingForKey: List<IslandEvent.Timer>,
+        notifKey: String,
+        useSplitKeys: Boolean,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): List<Int> {
+        val n = metrics.size
+        if (n == 0) return emptyList()
+        val out = MutableList(n) { -1 }
+        val taken = linkedSetOf<Int>()
+
+        fun claim(index: Int, id: Int): Boolean {
+            if (id < 0 || id in taken || out[index] >= 0) return false
+            out[index] = id
+            taken.add(id)
+            return true
+        }
+
+        fun remainingClose(a: Long, b: Long): Boolean {
+            if (a <= 0L || b <= 0L) return false
+            return kotlin.math.abs(a - b) <= TIMER_REMAINING_MATCH_MS
+        }
+
+        // 1) Khop remaining vs event hien co (on dinh qua pause/resume + doi label).
+        for (index in 0 until n) {
+            val rem = metricRemainingMs(metrics[index], nowWall, nowElapsed)
+            if (rem <= 0L) continue
+            val match =
+                existingForKey.firstOrNull { ev ->
+                    val eid = ev.deskClockTimerId
+                    if (eid < 0 || eid in taken) return@firstOrNull false
+                    remainingClose(eventRemainingMs(ev, nowWall), rem)
+                }
+            if (match != null) claim(index, match.deskClockTimerId)
+        }
+
+        // 2) Khop remaining vs ban do id→remaining (kem prefs sau restart).
+        for (index in 0 until n) {
+            if (out[index] >= 0) continue
+            val rem = metricRemainingMs(metrics[index], nowWall, nowElapsed)
+            if (rem <= 0L) continue
+            val matchId =
+                deskClockLastRemainingById.entries
+                    .firstOrNull { (id, last) -> id !in taken && remainingClose(last, rem) }
+                    ?.key
+            if (matchId != null) claim(index, matchId)
+        }
+
+        // 3) URI critical + pool id cua notif/event hien tai — KHONG do known_ids lich su
+        // (id timer da xoa bi gan nham → Resume sai 1 cai).
+        val pool =
+            (extractedIds.asSequence() +
+                    cachedIds.asSequence() +
+                    existingForKey.asSequence().map { it.deskClockTimerId } +
+                    deskClockTimerIdsByNotif[notifKey].orEmpty().asSequence())
+                .filter { it >= 0 }
+                .distinct()
+                .toList()
+        val criticalId = extractedIds.firstOrNull() ?: -1
+        if (criticalId >= 0) claim(criticalIndex.coerceIn(0, n - 1), criticalId)
+        for (index in 0 until n) {
+            if (out[index] >= 0) continue
+            val next = pool.firstOrNull { it !in taken } ?: -1
+            claim(index, next)
+        }
+
+        // 4) Fallback cu (1 timer / thieu cache notif) — van khong dung prefs rong.
+        for (index in 0 until n) {
+            if (out[index] >= 0) continue
+            val resolved =
+                resolveDeskClockTimerId(
+                    index = index,
+                    criticalIndex = criticalIndex,
+                    metricsSize = n,
+                    extractedIds = extractedIds,
+                    cachedIds = cachedIds,
+                )
+            claim(index, resolved)
+        }
+
+        // 5) Sticky slot chi khi 1 metric (multi: thu tu doi theo critical — nguy hiem).
+        if (!useSplitKeys) {
+            for (index in 0 until n) {
+                if (out[index] >= 0) continue
+                val prev =
+                    existingForKey
+                        .firstOrNull { it.notificationKey == notifKey }
+                        ?.deskClockTimerId
+                        ?.takeIf { it >= 0 }
+                        ?: continue
+                claim(index, prev)
+            }
+        }
+        return out
+    }
+
+    /**
+     * Gan id cho tung metric: critical → URI/id dau; con lai → cache (id da thay khi 1 timer).
+     * Neu TIMER_IDS du so metric → map theo chi so.
+     */
+    private fun resolveDeskClockTimerId(
+        index: Int,
+        criticalIndex: Int,
+        metricsSize: Int,
+        extractedIds: List<Int>,
+        cachedIds: List<Int>,
+    ): Int {
+        if (extractedIds.size >= metricsSize && metricsSize > 0) {
+            return extractedIds.getOrElse(index) { -1 }
+        }
+        val criticalId = extractedIds.firstOrNull() ?: -1
+        if (index == criticalIndex && criticalId >= 0) return criticalId
+        if (metricsSize <= 1) return criticalId
+        val packageWide =
+            deskClockTimerIdsByNotif.values.asSequence().flatten().filter { it >= 0 }.distinct()
+        val others =
+            (cachedIds.asSequence() + packageWide)
+                .filter { it >= 0 && it != criticalId }
+                .distinct()
+                .toList()
+        val otherSlots = (0 until metricsSize).filter { it != criticalIndex }
+        val slot = otherSlots.indexOf(index)
+        if (slot >= 0) return others.getOrElse(slot) { -1 }
+        return -1
+    }
+
+    /**
+     * Lay moc ket thuc timer (wall-clock ms).
+     * Thu lan luot: Metric.TimeDifference, notification.when (+ chronometer),
+     * Chronometer RemoteViews, parse mm:ss tu text.
+     */
+    private fun resolveTimerEndTimeMs(sbn: StatusBarNotification, extras: Bundle): Long {
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+
+        endTimeFromTimerMetric(extras, nowWall, nowElapsed)?.let { return it }
+
+        val showChrono = extras.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
+        val countDown = extras.getBoolean(Notification.EXTRA_CHRONOMETER_COUNT_DOWN, false)
+        val whenMs = sbn.notification.`when`
+        if (whenMs > 0L) {
+            wallClockEndFromWhen(whenMs, showChrono, countDown, nowWall, nowElapsed)?.let {
+                return it
+            }
+        }
+
+        val chronoBase = extractChronometerBase(sbn)
+        if (chronoBase > 0L) {
+            val remaining = chronoBase - nowElapsed
+            if (remaining > 0L) return nowWall + remaining
+        }
+
+        parseTimerRemainingMs(sbn, extras)?.let { remaining ->
+            if (remaining > 0L) return nowWall + remaining
+        }
+
+        return 0L
+    }
+
+    /** Fallback single endtime — tai su dung parse multi-metric countdown. */
+    private fun endTimeFromTimerMetric(
+        extras: Bundle,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): Long? =
+        parseChronometerMetricsFromExtras(extras, nowWall, nowElapsed)
+            .firstOrNull { it.countDown }
+            ?.wallAnchorMs
+
+    /**
+     * Chuyen notification.when thanh wall-clock end.
+     * AOSP: when = wall-clock end. Mot so app luu sai theo elapsedRealtime.
+     */
+    private fun wallClockEndFromWhen(
+        whenMs: Long,
+        showChrono: Boolean,
+        countDown: Boolean,
+        nowWall: Long,
+        nowElapsed: Long,
+    ): Long? {
+        val looksLikeWallClock = whenMs > 1_000_000_000_000L // ~2001-09-09
+        if (looksLikeWallClock) {
+            if (countDown || showChrono) {
+                // Cho phep tre vai giay (lam tron DeskClock + SECOND_IN_MILLIS)
+                if (whenMs > nowWall - 5_000L) return whenMs.coerceAtLeast(nowWall)
+            }
+            if (whenMs > nowWall) return whenMs
+            return null
+        }
+
+        // when mang hinh elapsedRealtime (sai hop dong nhung gap thuc te)
+        if (showChrono || countDown) {
+            val remaining = whenMs - nowElapsed
+            if (remaining > 0L) return nowWall + remaining
+        }
+        return null
+    }
+
+    /** Parse con lai mm:ss / h:mm:ss tu shortCriticalText / sortKey / text / title. */
+    private fun parseTimerRemainingMs(sbn: StatusBarNotification, extras: Bundle): Long? {
+        val shortCritical =
+            try {
+                sbn.notification?.shortCriticalText?.toString()
+            } catch (_: Exception) {
+                extras.getCharSequence(Notification.EXTRA_SHORT_CRITICAL_TEXT)?.toString()
+                    ?: extras.getCharSequence("android.shortCriticalText")?.toString()
+            }
+        // MetricStyle embedding remaining trong sortKey (⏳0:01:46) khi extras metrics thieu
+        val sortKey = sbn.notification?.sortKey
+        val candidates =
+            listOfNotNull(
+                shortCritical,
+                sortKey,
+                extrasCharSequence(extras, Notification.EXTRA_TEXT),
+                extrasCharSequence(extras, Notification.EXTRA_TITLE),
+                extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString(),
+                extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString(),
+            )
+        for (text in candidates) {
+            parseElapsedTimeToMs(text)?.let { return it }
+            parseSortKeyRemainingMs(text)?.let { return it }
+        }
+        return null
+    }
+
+    private fun parseElapsedTimeToMs(text: String): Long? {
+        val match = TIMER_REMAINING_PATTERN.find(text) ?: return null
+        val a = match.groupValues[1].toLongOrNull() ?: return null
+        val b = match.groupValues[2].toLongOrNull() ?: return null
+        val c = match.groupValues[3].toLongOrNull()
+        val secs = if (c != null) a * 3600 + b * 60 + c else a * 60 + b
+        if (secs <= 0L) return null
+        return secs * 1000L
+    }
+
+    /**
+     * Doc danh sach vong stopwatch tu EXTRA_TEXT_LINES / BigText / EXTRA_TEXT.
+     * Giu laps cu neu notif lan nay khong gui lai lines (tranh mat khi refresh).
+     */
+    private fun parseStopwatchLapsMs(extras: Bundle, previous: List<Long>): List<Long> {
+        val lines = mutableListOf<String>()
+        extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach {
+            val s = it?.toString()?.trim().orEmpty()
+            if (s.isNotEmpty()) lines += s
+        }
+        extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.lines()?.forEach {
+            val s = it.trim()
+            if (s.isNotEmpty()) lines += s
+        }
+        extrasCharSequence(extras, Notification.EXTRA_TEXT)?.lines()?.forEach {
+            val s = it.trim()
+            if (s.isNotEmpty()) lines += s
+        }
+        if (lines.isEmpty()) return previous
+        val parsed =
+            lines.mapNotNull { line ->
+                // Bo qua dong chi la nhan "Lap"/"Vong" khong so.
+                parseElapsedTimeToMs(line)
+                    ?: STOPWATCH_LAP_PATTERN.find(line)?.let { m ->
+                        val a = m.groupValues[1].toLongOrNull() ?: return@let null
+                        val b = m.groupValues[2].toLongOrNull() ?: return@let null
+                        val c = m.groupValues[3].toLongOrNull()
+                        val frac = m.groupValues[4]
+                        val secs = if (c != null) a * 3600 + b * 60 + c else a * 60 + b
+                        val fracMs =
+                            if (frac.isNotEmpty()) {
+                                frac.padEnd(3, '0').take(3).toLongOrNull() ?: 0L
+                            } else {
+                                0L
+                            }
+                        ((secs * 1000L) + fracMs).takeIf { it > 0L }
+                    }
+            }
+                .distinct()
+                .sorted()
+        return if (parsed.isNotEmpty()) parsed else previous
+    }
+
+    /** Parse remaining tu MetricStyle sortKey (uu tien chuoi sau emoji dong ho). */
+    private fun parseSortKeyRemainingMs(text: String): Long? {
+        if (!text.contains("⏳") && !text.contains("⏱") && !text.contains("🕐")) {
+            // Van thu pattern neu chuoi chi la H:MM:SS / M:SS
+            if (!text.any { it.isDigit() }) return null
+        }
+        val match = SORTKEY_REMAINING_PATTERN.find(text) ?: return null
+        val a = match.groupValues[1].toLongOrNull() ?: return null
+        val b = match.groupValues[2].toLongOrNull() ?: return null
+        val c = match.groupValues[3].toLongOrNull()
+        val secs = if (c != null) a * 3600 + b * 60 + c else a * 60 + b
+        if (secs <= 0L) return null
+        return secs * 1000L
+    }
+
+    /** Nhan dien stopwatch dang chay / tam dung tu label action (EN + VI). */
+    private fun detectStopwatchRunningFromLabels(actionLabels: List<String>): Boolean? {
+        val running =
+            actionLabels.any { label ->
+                label.contains("pause") ||
+                    label.contains("tạm") ||
+                    label.contains("tam dung") ||
+                    label.contains("lap") ||
+                    label.contains("vòng") ||
+                    label.contains("vong")
+            }
+        val paused =
+            actionLabels.any { label ->
+                label.contains("resume") ||
+                    label.contains("tiếp") ||
+                    label.contains("tiep")
+            }
+        return when {
+            running -> true
+            paused -> false
+            else -> null
         }
     }
 
@@ -865,42 +2540,160 @@ constructor(
         actionLabels: List<String> = emptyList(),
         actionIntents: List<String> = emptyList(),
     ) {
-        val label = extras.getText("android.title") ?: ""
-        val icon =
-            try {
-                context.packageManager.getApplicationIcon(sbn.packageName)
-            } catch (_: Exception) {
-                null
+        val label = extrasCharSequence(extras, Notification.EXTRA_TITLE) ?: ""
+        val (icon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
+
+        val hasPauseIntent = actionIntents.any { DeskClockActions.matches(it, "PAUSE_STOPWATCH") }
+        val hasStartIntent = actionIntents.any { DeskClockActions.matches(it, "START_STOPWATCH") }
+        val hasLapIntent = actionIntents.any { DeskClockActions.matches(it, "LAP_STOPWATCH") }
+        val labelRunning = detectStopwatchRunningFromLabels(actionLabels)
+        var isRunning =
+            when {
+                hasPauseIntent || hasLapIntent -> true
+                hasStartIntent -> false
+                labelRunning != null -> labelRunning
+                else -> true // ongoing stopwatch notif: mac dinh dang chay khi khong ro action
             }
 
-        val hasPauseIntent = actionIntents.any { it == DeskClockActions.PAUSE_STOPWATCH }
-        val hasStartIntent = actionIntents.any { it == DeskClockActions.START_STOPWATCH }
-        val hasLapIntent = actionIntents.any { it == DeskClockActions.LAP_STOPWATCH }
-        val isRunning = when {
-            hasPauseIntent || hasLapIntent -> true
-            hasStartIntent -> false
-            else -> actionLabels.any { it.contains("pause") || it.contains("lap") }
+        val nowWall = System.currentTimeMillis()
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val existing = _stopwatchEvent.value
+        var startTimeMs = existing?.startTimeMs ?: nowWall
+        var startElapsedRealtimeMs = 0L
+        var pausedElapsedMs = 0L
+        var resolvedStart = false
+
+        // Uu tien android.metrics (countDown=false): when bi Clock refresh ≈ now khi dong app.
+        // Metric thang action labels — tranh action START/PAUSE nham → dong bang sai khi
+        // Clock van chay (pill lech / tut hau so voi app).
+        val stopwatchMetric =
+            parseChronometerMetricsFromExtras(extras, nowWall, nowElapsed).firstOrNull {
+                !it.countDown
+            }
+        if (stopwatchMetric != null) {
+            if (stopwatchMetric.isPaused) {
+                isRunning = false
+                pausedElapsedMs = stopwatchMetric.frozenDurationMs
+                startElapsedRealtimeMs = 0L
+                startTimeMs =
+                    if (stopwatchMetric.wallAnchorMs > 0L) stopwatchMetric.wallAnchorMs
+                    else nowWall - pausedElapsedMs.coerceAtLeast(0L)
+            } else {
+                isRunning = true
+                pausedElapsedMs = 0L
+                startElapsedRealtimeMs = stopwatchMetric.elapsedAnchorMs
+                startTimeMs =
+                    if (stopwatchMetric.wallAnchorMs > 0L) {
+                        stopwatchMetric.wallAnchorMs
+                    } else if (startElapsedRealtimeMs != 0L) {
+                        nowWall - (nowElapsed - startElapsedRealtimeMs).coerceAtLeast(0L)
+                    } else {
+                        existing?.startTimeMs ?: nowWall
+                    }
+            }
+            resolvedStart = true
         }
 
-        var startTimeMs = System.currentTimeMillis()
-        val chronoBase = extractChronometerBase(sbn)
-        if (chronoBase > 0L) {
-            val elapsed = SystemClock.elapsedRealtime() - chronoBase
-            if (elapsed > 0L) startTimeMs = System.currentTimeMillis() - elapsed
+        if (!resolvedStart) {
+            val whenMs = sbn.notification.`when`
+            val showChrono = extras.getBoolean(Notification.EXTRA_SHOW_CHRONOMETER, false)
+            if (whenMs > 1_000_000_000_000L) {
+                // Wall-clock start — DeskClock cu / app khong metrics
+                startTimeMs = whenMs
+                startElapsedRealtimeMs = 0L
+                resolvedStart = true
+            } else if (showChrono && whenMs > 0L) {
+                // whenMs = chronometer base (elapsedRealtime)
+                val elapsed = nowElapsed - whenMs
+                if (elapsed >= 0L) {
+                    startTimeMs = nowWall - elapsed
+                    startElapsedRealtimeMs = whenMs
+                    resolvedStart = true
+                }
+            }
+        }
+        if (!resolvedStart) {
+            val chronoBase = extractChronometerBase(sbn)
+            if (chronoBase != 0L) {
+                // RemoteViews Chronometer.base = elapsedRealtime (co the am)
+                val elapsed = (nowElapsed - chronoBase).coerceAtLeast(0L)
+                startTimeMs = nowWall - elapsed
+                startElapsedRealtimeMs = chronoBase
+                resolvedStart = true
+            }
+        }
+
+        // Dong bang elapsed khi paused (giu cu neu notif khong gui lai pausedDuration)
+        if (!isRunning) {
+            pausedElapsedMs =
+                when {
+                    pausedElapsedMs > 0L -> pausedElapsedMs
+                    existing != null && !existing.isRunning && existing.pausedElapsedMs > 0L ->
+                        existing.pausedElapsedMs
+                    startElapsedRealtimeMs != 0L ->
+                        (nowElapsed - startElapsedRealtimeMs).coerceAtLeast(0L)
+                    startTimeMs > 0L -> (nowWall - startTimeMs).coerceAtLeast(0L)
+                    else -> 0L
+                }
+            startElapsedRealtimeMs = 0L
         }
 
         val actions = extractNotificationActions(sbn)
+        val laps = parseStopwatchLapsMs(extras, existing?.laps.orEmpty())
         val event =
             IslandEvent.Stopwatch(
                 label = label,
                 startTimeMs = startTimeMs,
+                startElapsedRealtimeMs = if (isRunning) startElapsedRealtimeMs else 0L,
                 isRunning = isRunning,
+                pausedElapsedMs = if (isRunning) 0L else pausedElapsedMs,
+                laps = laps,
                 appIcon = icon,
                 actions = actions,
                 contentIntent = sbn.notification?.contentIntent,
+                packageName = sbn.packageName.orEmpty(),
+                notificationKey = sbn.key,
+                sbn = sbn,
+                awaitingOwnerRepost = false,
+                iconRevision = iconRevision,
             )
         stopwatchNotificationKey = sbn.key
-        if (sbn.key != stopwatchDismissedKey) _stopwatchEvent.value = event
+        val postIdentity =
+            deskClockStopwatchRunIdentity(
+                notificationKey = sbn.key,
+                isRunning = event.isRunning,
+                startElapsedRealtimeMs = event.startElapsedRealtimeMs,
+                pausedElapsedMs = event.pausedElapsedMs,
+                displayedElapsedMs = event.displayedElapsedMs(),
+            )
+        val apply =
+            deskClockStopwatchApplyPostToVisualDismissGate(
+                gate = stopwatchVisualDismissGate,
+                post = postIdentity,
+            )
+        stopwatchVisualDismissGate = apply.nextGate
+        if (apply.allowEvent &&
+            (apply.relation == DeskClockStopwatchRunRelation.ALLOW_NEW_RUN ||
+                apply.relation == DeskClockStopwatchRunRelation.ALLOW_DIFFERENT_KEY)
+        ) {
+            stopwatchDismissedPackage = null
+        }
+        if (apply.allowEvent) {
+            _stopwatchEvent.value = event
+            // Cung key/replacement sau owner-gap: rebind, khong restart timebase (existing).
+            markStopwatchGapClearedOnPost(
+                sbnKey = sbn.key,
+                timebaseAnchor =
+                    if (event.isRunning) event.startElapsedRealtimeMs else event.pausedElapsedMs,
+            )
+            Log.i(
+                TAG,
+                "handleStopwatch label=${event.label} isRunning=${event.isRunning} " +
+                    "startTimeMs=${event.startTimeMs} startER=${event.startElapsedRealtimeMs} " +
+                    "pausedElapsed=${event.pausedElapsedMs} " +
+                    "displayed=${event.displayedElapsedMs()} fromMetrics=${stopwatchMetric != null}",
+            )
+        }
     }
 
     private fun extractChronometerBase(sbn: StatusBarNotification): Long {
@@ -940,21 +2733,39 @@ constructor(
             } ?: emptyList()
     }
 
+    /**
+     * Action ap dung ca nhom timer (Clock: "Dat lai ca hai…", "Reset both…").
+     * Khong dua vao the expand 1-timer.
+     */
+    private fun isSharedMultiTimerAction(label: CharSequence?): Boolean {
+        val t = label?.toString()?.lowercase().orEmpty()
+        if (t.isEmpty()) return false
+        if (t.contains("cả hai") || t.contains("ca hai")) return true
+        if (t.contains("both")) return true
+        if (t.contains("all timers") || t.contains("tất cả") || t.contains("tat ca")) return true
+        // "hai/nhieu dong ho" trong cung nhan nut reset/pause nhom.
+        if ((t.contains("hai ") || t.contains("nhiều") || t.contains("nhieu")) &&
+            (t.contains("đồng hồ") || t.contains("dong ho") || t.contains("timer"))
+        ) {
+            return true
+        }
+        return false
+    }
+
     private fun handleAlarm(sbn: StatusBarNotification, extras: Bundle) {
-        val label = extras.getText("android.title") ?: context.getString(R.string.ax_dynamic_bar_alarm)
+        val label =
+            extrasCharSequence(extras, Notification.EXTRA_TITLE)
+                ?: context.getString(R.string.ax_dynamic_bar_alarm)
         val isRinging = sbn.notification.category == Notification.CATEGORY_ALARM
-        val icon =
-            try {
-                context.packageManager.getApplicationIcon(sbn.packageName)
-            } catch (_: Exception) {
-                null
-            }
+        val (icon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
         val event =
             IslandEvent.Alarm(
                 label = label,
                 triggerTimeMs = sbn.notification.`when`,
                 isRinging = isRinging,
                 appIcon = icon,
+                iconRevision = iconRevision,
+                packageName = sbn.packageName.orEmpty(),
                 contentIntent = sbn.notification?.contentIntent,
             )
         alarmNotificationKey = sbn.key
@@ -981,9 +2792,15 @@ constructor(
             }
 
         val allActions = sbn.notification?.actions ?: emptyArray()
+        val postedActions = allActions.filter {
+            it.remoteInputs.isNullOrEmpty() && it.actionIntent != null && it.title != null
+        }
+        val callActions = callStyleActions(extras).map { fallback ->
+            postedActions.firstOrNull { it.actionIntent == fallback.actionIntent } ?: fallback
+        }
         val actions =
-            (callStyleActions(extras) + allActions)
-                .filter { a -> a.remoteInputs.isNullOrEmpty() && a.actionIntent != null }
+            (callActions + postedActions)
+                .distinctBy { it.actionIntent }
                 .take(3)
                 .mapNotNull { a ->
                     a.title?.let { IslandEvent.NotificationAction(label = it, action = a) }
@@ -998,12 +2815,7 @@ constructor(
                 "Phone:incoming"
             else "Phone:active"
 
-        val icon =
-            try {
-                context.packageManager.getApplicationIcon(sbn.packageName)
-            } catch (_: Exception) {
-                null
-            }
+        val (icon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
 
         val callWhen = sbn.notification?.`when` ?: 0L
         val connected =
@@ -1029,6 +2841,7 @@ constructor(
                 actions = actions,
                 connected = connected,
                 controls = callControls(extras, allActions),
+                iconRevision = iconRevision,
             )
 
         val current = _callEvents.value.toMutableList()
@@ -1059,7 +2872,7 @@ constructor(
         )
     }
 
-    /** CallStyle keeps its answer, decline and hang up buttons in extras, not in its actions. */
+    /** Fallbacks for call controls missing from the posted actions. */
     private fun callStyleActions(extras: Bundle): List<Notification.Action> =
         listOf(
                 Notification.EXTRA_DECLINE_INTENT to
@@ -1120,19 +2933,28 @@ constructor(
     }
 
     private object DeskClockActions {
-        private const val PREFIX = "com.android.deskclock.action."
-        const val START_TIMER = PREFIX + "START_TIMER"
-        const val PAUSE_TIMER = PREFIX + "PAUSE_TIMER"
-        const val RESET_TIMER = PREFIX + "RESET_TIMER"
-        const val ADD_MINUTE_TIMER = PREFIX + "ADD_MINUTE_TIMER"
-        const val SHOW_TIMER = PREFIX + "SHOW_TIMER"
-        const val START_STOPWATCH = PREFIX + "START_STOPWATCH"
-        const val PAUSE_STOPWATCH = PREFIX + "PAUSE_STOPWATCH"
-        const val RESET_STOPWATCH = PREFIX + "RESET_STOPWATCH"
-        const val LAP_STOPWATCH = PREFIX + "LAP_STOPWATCH"
-        const val SHOW_STOPWATCH = PREFIX + "SHOW_STOPWATCH"
-        const val ALARM_SNOOZE = "com.android.deskclock.ALARM_SNOOZE"
-        const val ALARM_DISMISS = "com.android.deskclock.ALARM_DISMISS"
+        private val PREFIXES =
+            listOf(
+                "com.android.deskclock.action.",
+                "com.google.android.deskclock.action.",
+            )
+
+        fun matches(action: String, name: String): Boolean =
+            PREFIXES.any { action == it + name } || action.endsWith(".action.$name")
+
+        fun isTimerAction(action: String): Boolean =
+            matches(action, "START_TIMER") ||
+                matches(action, "PAUSE_TIMER") ||
+                matches(action, "RESET_TIMER") ||
+                matches(action, "ADD_MINUTE_TIMER") ||
+                matches(action, "SHOW_TIMER")
+
+        fun isStopwatchAction(action: String): Boolean =
+            matches(action, "START_STOPWATCH") ||
+                matches(action, "PAUSE_STOPWATCH") ||
+                matches(action, "RESET_STOPWATCH") ||
+                matches(action, "LAP_STOPWATCH") ||
+                matches(action, "SHOW_STOPWATCH")
     }
 
     private fun String.matchesMaterial(set: MaterialIconSet): Boolean =
@@ -1157,7 +2979,7 @@ constructor(
         val title = extras.getText("android.title") ?: ""
         val text = extras.getText("android.text") ?: ""
         val appName = resolveAppName(pkg)
-        val icon = loadNotificationIcon(sbn, pkg)
+        val (icon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
 
         val actions = extractNotificationActions(sbn)
 
@@ -1180,6 +3002,7 @@ constructor(
                 actions = actions,
                 progress = progress,
                 isIndeterminate = indeterminate,
+                iconRevision = iconRevision,
             )
 
         val current = _promotedOngoingEvents.value.toMutableList()
@@ -1206,19 +3029,17 @@ constructor(
         _sportsEvents.value = _sportsEvents.value.filter { e -> matching.none { it.key == e.key } }
     }
 
-    /** Hides the current song until a different one is recognized. */
+    /** An bai hat hien tai den khi nhan dien bai khac. */
     fun clearNowPlaying() {
-        dismissedNowPlayingTitle = _nowPlayingEvent.value?.sbn?.notification?.extras
-            ?.getCharSequence("android.title")?.toString()
+        dismissedNowPlayingTitle =
+            _nowPlayingEvent.value?.sbn?.notification?.extras?.getCharSequence("android.title")
+                ?.toString()
         _nowPlayingEvent.value = null
     }
 
     private fun handleNowPlaying(sbn: StatusBarNotification, extras: Bundle) {
         val title = extras.getCharSequence("android.title")?.toString() ?: return
-        if (title == dismissedNowPlayingTitle) {
-            _nowPlayingEvent.value = null
-            return
-        }
+        if (title == dismissedNowPlayingTitle) return
         dismissedNowPlayingTitle = null
         val byMatch = Regex("""(.+?)\s+by\s+(.+)""", RegexOption.IGNORE_CASE).find(title)
         val dashParts = if (byMatch == null) title.split(" - ", " – ", limit = 2) else null
@@ -1243,7 +3064,7 @@ constructor(
         val notifActions = allActions.mapNotNull { a ->
             a.title?.let { IslandEvent.NotificationAction(label = it, action = a) }
         }
-        val appIcon = loadNotificationIcon(sbn, sbn.packageName)
+        val (appIcon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
         // Prefer existing art on same-song re-post so we don't flash back to the note.
         val previous = _nowPlayingEvent.value
         val sameSong = previous != null
@@ -1265,6 +3086,8 @@ constructor(
             appIcon = appIcon,
             albumArt = albumArt,
             actions = notifActions,
+            iconRevision = iconRevision,
+            contentIntent = sbn.notification?.contentIntent,
         )
 
         if (albumArt == null && songTitle.isNotBlank()) {
@@ -1423,7 +3246,7 @@ constructor(
         val commentary = extras.getCharSequence("android.bigText")?.toString()
             ?: extras.getText("android.subText") ?: ""
 
-        val appIcon = loadNotificationIcon(sbn, sbn.packageName)
+        val (appIcon, iconRevision) = smallIconLoader.ingestPostedSbn(sbn)
 
         val event = IslandEvent.Sports(
             team1Name = team1Name,
@@ -1437,6 +3260,7 @@ constructor(
             key = sbn.key,
             sbn = sbn,
             appIcon = appIcon,
+            iconRevision = iconRevision,
         )
 
         if (sbn.key in dismissedSportsKeys) return true
@@ -1466,19 +3290,6 @@ constructor(
         }
 
         return null
-    }
-
-    private fun loadNotificationIcon(sbn: StatusBarNotification, pkg: String): Drawable? {
-        return try {
-            sbn.notification?.smallIcon?.loadDrawable(context)
-        } catch (_: Exception) {
-            null
-        }
-            ?: try {
-                context.packageManager.getApplicationIcon(pkg)
-            } catch (_: Exception) {
-                null
-            }
     }
 
     private fun contentSignature(sbn: StatusBarNotification, extras: Bundle): Long {

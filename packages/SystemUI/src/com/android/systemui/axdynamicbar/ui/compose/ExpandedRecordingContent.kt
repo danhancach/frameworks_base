@@ -92,6 +92,17 @@ internal fun AudioRecordingExpanded(
 
     ExpandedCardLayout(
         accentColor = style.accent,
+        onContentClick =
+            if (event.contentIntent != null || event.packageName.isNotEmpty()) {
+                {
+                    openEventContentAndCollapse(
+                        context,
+                        event.contentIntent,
+                        interactor,
+                        event.packageName,
+                    )
+                }
+            } else null,
         icon = {
             when (event.state) {
                 RecordingState.RECORDING ->

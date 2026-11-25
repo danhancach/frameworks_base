@@ -54,6 +54,7 @@ constructor(
     groupCountCoordinator: GroupCountCoordinator,
     groupWhenCoordinator: GroupWhenCoordinator,
     mediaCoordinator: MediaCoordinator,
+    axDynamicBarChronometerCoordinator: AxDynamicBarChronometerCoordinator,
     preparationCoordinator: PreparationCoordinator,
     remoteInputCoordinator: RemoteInputCoordinator,
     rowAlertTimeCoordinator: RowAlertTimeCoordinator,
@@ -95,6 +96,7 @@ constructor(
         mCoordinators.add(groupCountCoordinator)
         mCoordinators.add(groupWhenCoordinator)
         mCoordinators.add(mediaCoordinator)
+        mCoordinators.add(axDynamicBarChronometerCoordinator)
         mCoordinators.add(rowAlertTimeCoordinator)
         mCoordinators.add(rowAppearanceCoordinator)
         mCoordinators.add(stackCoordinator)

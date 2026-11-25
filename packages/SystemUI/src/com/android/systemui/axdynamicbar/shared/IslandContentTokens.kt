@@ -12,13 +12,28 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import kotlin.math.min
 import com.android.axion.blur.AxBlurSurfaceDefaults
+import com.android.axion.blur.AxBlurSurfacePaintKind
 import com.android.axion.blur.axBlurBackground
+import com.android.systemui.blur.AxSystemFrost
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.Indication
+import androidx.compose.foundation.IndicationNodeFactory
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.InteractionSource
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -33,6 +48,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Flag
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.MoreTime
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -46,18 +62,37 @@ import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
+import androidx.compose.material3.MotionScheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.Alignment
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.node.DelegatableNode
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.PlatformTextStyle
@@ -80,6 +115,8 @@ internal val SpaceXl = 14.dp
 internal val SpaceXxl = 16.dp
 internal val SpaceSection = 20.dp
 internal val SpacePanel = 24.dp
+/** Samsung cardSwipeStartDp -- release ngang stack SB (strict > 126dp). */
+internal val StackExpandedCardSwipeStartDp = 126.dp
 internal val SpacePanelLarge = 28.dp
 
 internal val RadiusXs = 8.dp
@@ -156,6 +193,138 @@ internal const val AlphaGlass = 0.72f
  */
 internal val LocalBlurAlpha = compositionLocalOf { 1f }
 
+/**
+ * STATUS BAR morph: shared glass owner present (morph host).
+ * Tach LocalKeyguardYieldGlassToMorph — khong dam keyguard/AOD.
+ * islandCardSurface: yield=true → TOP selected FG-only; under giu blur.
+ * Task-041: expanded stack yield=false (moi card giu islandBlur local);
+ * chi pill↔expanded morph moi yield shared shell.
+ */
+internal val LocalStatusBarYieldGlassToMorph = staticCompositionLocalOf { false }
+
+/**
+ * Open transfer (task-043/045): top card dang await destination surface.
+ * true → AxBlurSurface destination listener (native HOAC fallback ve that);
+ * false sau Complete. KHONG content-only / alpha0; KHONG fake native khi fallback.
+ */
+internal val LocalStatusBarOpenGlassAwaitDestinationDraw = staticCompositionLocalOf { false }
+
+/** Session gen active cho destination draw report (0 = khong await). */
+internal val LocalStatusBarOpenGlassDestinationSessionGen = staticCompositionLocalOf { 0 }
+
+/**
+ * Callback sau surface local ve that (NativeBackdrop | FallbackSurfaceRendered, α>0).
+ * layout W/H = local size (khong window transformed). KHONG GPU/SF ACK.
+ */
+internal data class StatusBarOpenGlassDestinationDrawReport(
+    val sessionGen: Int,
+    val ownerKey: String,
+    val contextToken: Int,
+    val layoutWidthPx: Float = 0f,
+    val layoutHeightPx: Float = 0f,
+    val nativeBackdropDrawn: Boolean = false,
+    val blurSurfaceAlpha: Float = 0f,
+    val paintKind: StackOpenGlassDestinationPaintKind =
+        if (nativeBackdropDrawn) {
+            StackOpenGlassDestinationPaintKind.NativeBackdrop
+        } else {
+            StackOpenGlassDestinationPaintKind.NoSurface
+        },
+    val fallbackSurfaceRendered: Boolean = false,
+)
+
+internal val LocalStatusBarOpenGlassDestinationDrawReporter =
+    staticCompositionLocalOf<((StatusBarOpenGlassDestinationDrawReport) -> Unit)?> { null }
+
+/**
+ * true = the selected top (isTop && !isLeaving) — chi the nay report painted bounds.
+ * Under-card KHONG overwrite morph target.
+ */
+internal val LocalStatusBarPaintedCardIsTop = staticCompositionLocalOf { false }
+
+/**
+ * event:id owner cua layer dang report painted — reject stale sai owner (task-037).
+ * Rong = legacy (host tu bind contentOwnerKey).
+ */
+internal val LocalStatusBarPaintedCardOwnerKey = staticCompositionLocalOf { "" }
+
+/**
+ * Painted top-card bounds (layout W/H + window LRTB) — freeze morph target.
+ * null = khong do (fallback side-pad).
+ * [ownerKey]/[contextToken] atomic voi LRTB (task-037).
+ */
+internal data class StatusBarPaintedCardReportPx(
+    val layoutWPx: Int,
+    val layoutHPx: Int,
+    val windowLeftPx: Float,
+    val windowTopPx: Float,
+    val windowRightPx: Float,
+    val windowBottomPx: Float,
+    val ownerKey: String = "",
+    val contextToken: Int = 0,
+) {
+    val layoutWidth: Int
+        get() = layoutWPx.coerceAtLeast(0)
+    val layoutHeight: Int
+        get() = layoutHPx.coerceAtLeast(0)
+    val windowWidthPx: Float
+        get() = (windowRightPx - windowLeftPx).coerceAtLeast(0f)
+    val windowHeightPx: Float
+        get() = (windowBottomPx - windowTopPx).coerceAtLeast(0f)
+}
+
+internal val LocalStatusBarPaintedCardBoundsReporter =
+    staticCompositionLocalOf<((StatusBarPaintedCardReportPx) -> Unit)?> { null }
+
+/**
+ * SSOT dragY stack (Expanded at-rest) — StackedExpandedPanels bao cao len morph host.
+ * Shared glass dich cung frame; KHONG translate pointerInput ancestor.
+ */
+internal val LocalStatusBarStackDragYReporter =
+    staticCompositionLocalOf<((dragYPx: Float) -> Unit)?> { null }
+
+/** Bao cao settle/commit anim — morph host freeze painted LRTB. */
+internal val LocalStatusBarStackDragSettlingReporter =
+    staticCompositionLocalOf<((settling: Boolean) -> Unit)?> { null }
+
+/**
+ * Bao cao [StackExpandedDragPhase] — glass ownership theo phase (khong |dragY| eps).
+ *
+ * Ownership SSOT: StackedExpandedPanels publish DONG BO tai gesture lifecycle
+ * (onStackDragStart Held / release Cancel|CommitSettle / settle-end Idle) cung
+ * frame voi dragY — KHONG lay SideEffect lam sole source.
+ * Morph host: yield/plate alpha = composition doc state; graphicsLayer phase =
+ * draw-time. Khong claim sync chi vi ten Live; khong doi phase theo |dragY|.
+ */
+internal val LocalStatusBarStackDragPhaseReporter =
+    staticCompositionLocalOf<((phase: StackExpandedDragPhase) -> Unit)?> { null }
+
+/**
+ * Measure-context token (envelopeW + densityDpi + fontScale) — producer bind
+ * trong onPlaced sau layout current (task-033). 0 = chua co constraints.
+ */
+internal val LocalStatusBarCardNaturalMeasureContextToken =
+    staticCompositionLocalOf { 0 }
+
+/**
+ * Bao cao natural W/H + contextToken theo event.id (layer onPlaced full —
+ * underPeekClip chi draw). Morph host cache theo identity+context; lock TOP
+ * dung natural the nay, KHONG max stack envelope.
+ * (task-031/033: tach card natural vs host envelope vs painted vs touch).
+ */
+internal val LocalStatusBarStackCardNaturalSizeReporter =
+    staticCompositionLocalOf<
+        ((eventId: String, widthPx: Int, heightPx: Int, contextToken: Int) -> Unit)?
+    > { null }
+
+/**
+ * Legacy size-only reporter — map sang bounds (LRTB=0) neu call-site cu.
+ * UU TIEN [LocalStatusBarPaintedCardBoundsReporter].
+ */
+@Deprecated("Dung LocalStatusBarPaintedCardBoundsReporter (full LRTB)")
+internal val LocalStatusBarPaintedCardSizeReporter =
+    staticCompositionLocalOf<((widthPx: Int, heightPx: Int) -> Unit)?> { null }
+
 /** Rim width for the small glass pills; the 1 dp card rim would read as an outline at chip size. */
 internal val ChipHighlightWidth = 0.5.dp
 
@@ -176,16 +345,203 @@ internal fun Modifier.islandBlur(
     tint: Color? = null,
     alpha: Float = LocalBlurAlpha.current,
     highlightWidth: Dp = AxBlurSurfaceDefaults.HighlightWidth,
-): Modifier =
-    axBlurBackground(
+    includeViewBackdrop: Boolean = true,
+    /** Ban kinh Y elliptical; mac dinh = [cornerRadius] (scalar). */
+    cornerRadiusY: Dp = cornerRadius,
+    /** Open-glass legacy: fire sau native backdrop (khong alpha_zero). */
+    onNativeBackdropDrawn: ((widthPx: Int, heightPx: Int, surfaceAlpha: Float) -> Unit)? =
+        null,
+    /**
+     * Open-glass production: native HOAC fallback ve that (α>0).
+     * Mac dinh null — surface thuong khong callback moi frame.
+     */
+    onDestinationSurfaceDrawn:
+        ((
+            widthPx: Int,
+            heightPx: Int,
+            surfaceAlpha: Float,
+            kind: AxBlurSurfacePaintKind,
+        ) -> Unit)? =
+            null,
+): Modifier {
+    // Tint mac dinh = AxSystemFrost (cung PrimaryCard / affordance / notif).
+    val resolvedTint = tint ?: Color(AxSystemFrost.tintColor(LocalContext.current))
+    return axBlurBackground(
         enabled = true,
         fallbackColor = fallbackColor,
-        tintColor = tint ?: AxBlurSurfaceDefaults.tintColor(),
+        tintColor = resolvedTint,
         cornerRadius = cornerRadius,
+        cornerRadiusY = cornerRadiusY,
         alpha = alpha,
         highlight = AxBlurSurfaceDefaults.highlightBrush(),
         highlightWidth = highlightWidth,
+        includeViewBackdrop = includeViewBackdrop,
+        onNativeBackdropDrawn = onNativeBackdropDrawn,
+        onDestinationSurfaceDrawn = onDestinationSurfaceDrawn,
     )
+}
+
+/**
+ * true = Dynamic Bar tren lockscreen: tat ripple / indication Compose.
+ * Chi provider tu AxDynamicBarKeyguardChip — khong anh huong StatusBar island.
+ */
+internal val LocalKeyguardSuppressRipple = staticCompositionLocalOf { false }
+
+/** Indication rong cho Surface/LocalIndication tren lockscreen (khong ve pressed). */
+internal object KeyguardNoRippleIndication : IndicationNodeFactory {
+    override fun create(interactionSource: InteractionSource): DelegatableNode =
+        object : Modifier.Node() {}
+
+    override fun hashCode(): Int = System.identityHashCode(this)
+
+    override fun equals(other: Any?): Boolean = other === this
+}
+
+/** Ripple clickable; null khi [LocalKeyguardSuppressRipple]. */
+@Composable
+internal fun islandClickIndication(color: Color? = null): Indication? {
+    if (LocalKeyguardSuppressRipple.current) return null
+    return if (color != null) ripple(color = color) else ripple()
+}
+
+/**
+ * Be mat the expand: clip ShapeCard + blur (tru morph host da co glass) + ripple click tuy chon.
+ * Morph + khong onClick: khong clip them (host morph da bo goc).
+ * Dung chung Media / Chronometer / PromotedOngoing / PrimaryCard — tranh clip+clickable lap.
+ */
+@Composable
+internal fun Modifier.islandCardSurface(
+    morphHostFrame: Boolean,
+    onClick: (() -> Unit)? = null,
+): Modifier {
+    // Yield shared (morph): TOP FG-only. Expanded stack yield=false → moi card
+    // giu clip+islandBlur theo key(event.id) (archive stable-tree).
+    // OpenWaiting (045): yield=false + local blur α>0 (native|fallback) truoc drop shared.
+    val yieldSbGlass = LocalStatusBarYieldGlassToMorph.current
+    val reportPaintedTop = LocalStatusBarPaintedCardIsTop.current
+    val paintedOwnerKey = LocalStatusBarPaintedCardOwnerKey.current
+    val paintedContextToken = LocalStatusBarCardNaturalMeasureContextToken.current
+    val awaitOpenDestDraw = LocalStatusBarOpenGlassAwaitDestinationDraw.current
+    val openDestSessionGen = LocalStatusBarOpenGlassDestinationSessionGen.current
+    val openDestDrawReporter = LocalStatusBarOpenGlassDestinationDrawReporter.current
+    val hostOwnsGlass = morphHostFrame || (yieldSbGlass && reportPaintedTop)
+    // Surface ACK: native backdrop HOAC fallback ve that — khong content-only / alpha0.
+    // Chi top dang await; listener null o surface thuong → khong callback moi frame.
+    val reportOpenDestSurface =
+        awaitOpenDestDraw &&
+            reportPaintedTop &&
+            !hostOwnsGlass &&
+            openDestSessionGen > 0 &&
+            openDestDrawReporter != null
+    // Listener moi attach (Waiting sessionGen>0) — invalidate de redraw blur ACK
+    // neu surface da ve frame truoc khi reporter ton tai.
+    val openGlassHostView = LocalView.current
+    val wasAwaitOpenDest = remember { mutableStateOf(false) }
+    SideEffect {
+        if (reportOpenDestSurface && !wasAwaitOpenDest.value) {
+            openGlassHostView.invalidate()
+        }
+        wasAwaitOpenDest.value = reportOpenDestSurface
+    }
+    val destinationSurfaceListener:
+        ((
+            widthPx: Int,
+            heightPx: Int,
+            surfaceAlpha: Float,
+            kind: AxBlurSurfacePaintKind,
+        ) -> Unit)? =
+        if (reportOpenDestSurface) {
+            val reporter = openDestDrawReporter
+            val sessionGen = openDestSessionGen
+            val ownerKey = paintedOwnerKey
+            val ctxToken = paintedContextToken
+            { widthPx, heightPx, surfaceAlpha, kind ->
+                val paintKind =
+                    when (kind) {
+                        AxBlurSurfacePaintKind.NativeBackdrop ->
+                            StackOpenGlassDestinationPaintKind.NativeBackdrop
+                        AxBlurSurfacePaintKind.FallbackSurfaceRendered ->
+                            StackOpenGlassDestinationPaintKind.FallbackSurfaceRendered
+                    }
+                reporter?.invoke(
+                    StatusBarOpenGlassDestinationDrawReport(
+                        sessionGen = sessionGen,
+                        ownerKey = ownerKey,
+                        contextToken = ctxToken,
+                        layoutWidthPx = widthPx.toFloat(),
+                        layoutHeightPx = heightPx.toFloat(),
+                        nativeBackdropDrawn =
+                            paintKind == StackOpenGlassDestinationPaintKind.NativeBackdrop,
+                        blurSurfaceAlpha = surfaceAlpha,
+                        paintKind = paintKind,
+                        fallbackSurfaceRendered =
+                            paintKind ==
+                                StackOpenGlassDestinationPaintKind.FallbackSurfaceRendered,
+                    ),
+                )
+            }
+        } else {
+            null
+        }
+    val surface =
+        when {
+            hostOwnsGlass && onClick == null -> Modifier
+            hostOwnsGlass -> Modifier.clip(ShapeCard)
+            else ->
+                Modifier.clip(ShapeCard).islandBlur(
+                    cornerRadius = RadiusCard,
+                    fallbackColor = CardBg,
+                    onDestinationSurfaceDrawn = destinationSurfaceListener,
+                )
+        }
+    // Chi selected top report — under-card khong overwrite LRTB/W/H.
+    val paintedBoundsReporter = LocalStatusBarPaintedCardBoundsReporter.current
+    @Suppress("DEPRECATION")
+    val paintedSizeLegacy = LocalStatusBarPaintedCardSizeReporter.current
+    return this
+        .then(surface)
+        .then(
+            if (reportPaintedTop && paintedBoundsReporter != null) {
+                Modifier.onGloballyPositioned { coords ->
+                    val w = coords.size.width
+                    val h = coords.size.height
+                    if (w <= 0 || h <= 0) return@onGloballyPositioned
+                    val b = coords.boundsInWindow()
+                    paintedBoundsReporter(
+                        StatusBarPaintedCardReportPx(
+                            layoutWPx = w,
+                            layoutHPx = h,
+                            windowLeftPx = b.left,
+                            windowTopPx = b.top,
+                            windowRightPx = b.right,
+                            windowBottomPx = b.bottom,
+                            ownerKey = paintedOwnerKey,
+                            contextToken = paintedContextToken,
+                        ),
+                    )
+                }
+            } else if (reportPaintedTop && paintedSizeLegacy != null) {
+                Modifier.onSizeChanged { sz ->
+                    if (sz.width > 0 && sz.height > 0) {
+                        paintedSizeLegacy(sz.width, sz.height)
+                    }
+                }
+            } else {
+                Modifier
+            },
+        )
+        .then(
+            if (onClick != null) {
+                Modifier.clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = islandClickIndication(),
+                    onClick = onClick,
+                )
+            } else {
+                Modifier
+            },
+        )
+}
 
 /**
  * Emphasis tone for an island event.
@@ -267,6 +623,104 @@ internal val BatteryChargingColor: Color
 internal val BatteryPowerSaveColor: Color
     @Composable get() = MaterialTheme.colorScheme.tertiary
 
+/**
+ * Soft = seed sang cho nen icon / thanh muc tren kinh one-glass.
+ * content/secondary bam OnCard* de doc duoc tren glass sang/toi.
+ */
+internal data class BatteryColors(
+    val isDark: Boolean,
+    val content: Color,
+    val secondary: Color,
+    val charging: Color,
+    val powerSave: Color,
+    val lowBattery: Color,
+    val temperatureWarning: Color,
+    val temperatureCritical: Color,
+    val chargingSoft: Color,
+    val powerSaveSoft: Color,
+    val lowBatterySoft: Color,
+    val cardBackground: Color,
+    val cardBorder: Color,
+    val trackBackground: Color,
+) {
+    val iconBgAlpha: Float get() = if (isDark) 0.14f else 0.10f
+    val iconBorderAlpha: Float get() = if (isDark) 0.24f else 0.18f
+    val fillAlphaStart: Float get() = if (isDark) 0.18f else 0.12f
+    val fillAlphaEnd: Float get() = if (isDark) 0.36f else 0.24f
+
+    fun accent(isCharging: Boolean, isPowerSave: Boolean, level: Int): Color =
+        when {
+            isCharging -> charging
+            isPowerSave -> powerSave
+            level <= 20 -> lowBattery
+            else -> charging
+        }
+
+    fun softAccent(isCharging: Boolean, isPowerSave: Boolean, level: Int): Color =
+        when {
+            isCharging -> chargingSoft
+            isPowerSave -> powerSaveSoft
+            level <= 20 -> lowBatterySoft
+            else -> chargingSoft
+        }
+
+    fun temperatureColor(tempC: Float?): Color =
+        when {
+            tempC == null -> content
+            tempC >= 45f -> temperatureCritical
+            tempC >= 38f -> temperatureWarning
+            else -> content
+        }
+}
+
+@Composable
+internal fun rememberKeyguardBatteryColors(): BatteryColors {
+    val dark = isSystemInDarkTheme()
+    val content = OnCardText
+    val secondary = OnCardSecondary
+    val chargingSoft = BatteryChargingColor
+    val powerSaveSoft = BatteryPowerSaveColor
+    val lowSoft = MaterialTheme.colorScheme.error
+    return remember(dark, content, secondary, chargingSoft, powerSaveSoft, lowSoft) {
+        if (dark) {
+            BatteryColors(
+                isDark = true,
+                content = content,
+                secondary = secondary,
+                charging = chargingSoft,
+                powerSave = Color(0xFFFF9F0A),
+                lowBattery = Color(0xFFFF453A),
+                temperatureWarning = Color(0xFFFF9F0A),
+                temperatureCritical = Color(0xFFFF453A),
+                chargingSoft = chargingSoft,
+                powerSaveSoft = powerSaveSoft,
+                lowBatterySoft = lowSoft,
+                // Metric tile tren one-glass — alpha nhe, khong boc blur card thu hai
+                cardBackground = content.copy(alpha = 0.07f),
+                cardBorder = content.copy(alpha = 0.10f),
+                trackBackground = content.copy(alpha = 0.12f),
+            )
+        } else {
+            BatteryColors(
+                isDark = false,
+                content = content,
+                secondary = secondary,
+                charging = Color(0xFF1B5E20),
+                powerSave = Color(0xFF8A4500),
+                lowBattery = Color(0xFF991B1B),
+                temperatureWarning = Color(0xFF8A4500),
+                temperatureCritical = Color(0xFF991B1B),
+                chargingSoft = chargingSoft,
+                powerSaveSoft = powerSaveSoft,
+                lowBatterySoft = lowSoft,
+                cardBackground = Color.Black.copy(alpha = 0.045f),
+                cardBorder = Color.Black.copy(alpha = 0.08f),
+                trackBackground = Color.Black.copy(alpha = 0.07f),
+            )
+        }
+    }
+}
+
 internal val CardBorderBrush: Brush
     @Composable
     get() =
@@ -327,14 +781,14 @@ internal fun rememberMediaColors(event: IslandEvent.Media): IslandColorScheme =
     rememberIslandColors(event)
 
 /*
- * Height carries urgency, corner radius carries kind. The status bar is only ~24–32 dp tall, so
- * the tiers stay inside it: a passive chip is the smallest, a live one the tallest that still fits.
+ * Height carries urgency, corner radius carries kind. Status-bar pill: tat ca tier 20.dp
+ * (LiveCorner = nua chieu cao). Keyguard ChipHeight rieng — khong dung token nay.
  */
-internal val ChipTierPassiveHeight = 22.dp
-internal val ChipTierActiveHeight = 24.dp
-internal val ChipTierLiveHeight = 28.dp
+internal val ChipTierPassiveHeight = 20.dp
+internal val ChipTierActiveHeight = 20.dp
+internal val ChipTierLiveHeight = 20.dp
 
-/** Less than half of [ChipTierLiveHeight], so a live chip reads as a squircle, not a pill. */
+/** Nua [ChipTierLiveHeight] — pill tron deu khi moi tier cung 20.dp. */
 internal val ChipTierLiveCorner = 10.dp
 
 internal val ChipTier.chipHeight: Dp
@@ -418,17 +872,84 @@ internal fun CircleButton(
     onClick: () -> Unit,
     content: @Composable () -> Unit,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
-        onClick = onClick,
-        modifier = Modifier.pressScale(interaction).size(size),
-        shape = CircleShape,
-        color = color,
-        interactionSource = interaction,
+    Box(
+        modifier =
+            Modifier.size(size)
+                .clip(CircleShape)
+                .background(color)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = islandClickIndication(),
+                    onClick = onClick,
+                ),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(size)) { content() }
+        content()
     }
 }
+
+/** true khi host morph keyguard (Layout + shared glass) so huu khung va backdrop. */
+internal val LocalKeyguardMorphHostFrame = staticCompositionLocalOf { false }
+
+/**
+ * Lop hit native trong suot cho control trong Keyguard morph host
+ * (Compose clickable bi backdrop/AxComposeView cancel giong MediaTransport).
+ */
+@Composable
+internal fun MorphNativeHitOverlay(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val currentOnClick by rememberUpdatedState(onClick)
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            android.view.View(ctx).apply {
+                isClickable = true
+                isFocusable = true
+                background = null
+                foreground = null
+            }
+        },
+        update = { view ->
+            view.setOnClickListener { currentOnClick() }
+        },
+    )
+}
+
+/** Boc hit tuong thich ca host thuong (clickable) lan Keyguard morph host (AndroidView). */
+@Composable
+internal fun MorphClickableBox(
+    onClick: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+    indication: Indication? = LocalIndication.current,
+    contentAlignment: Alignment = Alignment.TopStart,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    val morphHostFrame = LocalKeyguardMorphHostFrame.current
+    val clickMod =
+        if (onClick != null && !morphHostFrame) {
+            Modifier.clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = indication,
+                onClick = onClick,
+            )
+        } else {
+            Modifier
+        }
+    Box(
+        modifier = modifier.then(clickMod),
+        contentAlignment = contentAlignment,
+    ) {
+        content()
+        if (morphHostFrame && onClick != null) {
+            MorphNativeHitOverlay(onClick = onClick, modifier = Modifier.matchParentSize())
+        }
+    }
+}
+
+/** Stack panel tu xu ly tap noi dung -- tat onContentClick tren ExpandedCardLayout. */
+internal val LocalStackOwnsContentClick = compositionLocalOf { false }
 
 /**
  * The expanded tile shell: a compact header row — icon badge, title column, optional trailing
@@ -444,27 +965,45 @@ internal fun ExpandedCardLayout(
     title: @Composable ColumnScope.() -> Unit,
     trailing: @Composable (() -> Unit)? = null,
     actions: @Composable (ColumnScope.() -> Unit)? = null,
+    /** Tap header/card content (khong gom nut action). Null = khong mo app. */
+    onContentClick: (() -> Unit)? = null,
 ) {
+    // Filter LazyColumn: dung onContentClick. Stack: StackPanelCard xu ly.
+    val contentClick =
+        if (LocalStackOwnsContentClick.current) null else onContentClick
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(SpaceSm)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(SpaceMd),
         ) {
-            Box(
-                modifier =
-                    if (iconBackground) {
-                        Modifier.size(iconSize)
-                            .background(accentColor.copy(alpha = AlphaIconBg), ShapeCompact)
-                    } else {
-                        Modifier.size(iconSize)
-                    },
-                contentAlignment = Alignment.Center,
-            ) { icon() }
-            Column(
+            // Boc left content bang Box de hit overlay chi nam tren icon+title, khong che nut trailing.
+            MorphClickableBox(
+                onClick = contentClick,
+                indication = null,
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(SpaceXxs),
-            ) { title() }
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(SpaceMd),
+                ) {
+                    Box(
+                        modifier =
+                            if (iconBackground) {
+                                Modifier.size(iconSize)
+                                    .background(accentColor.copy(alpha = AlphaIconBg), ShapeCompact)
+                            } else {
+                                Modifier.size(iconSize)
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) { icon() }
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(SpaceXxs),
+                    ) { title() }
+                }
+            }
             trailing?.invoke()
         }
         actions?.invoke(this)
@@ -483,15 +1022,15 @@ internal fun ActionChip(
 ) {
     val height = if (compact) SizeActionIcon else SizeActionHeight
     val horizontal = if (compact) SpaceLg else SpacePanel
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
+    MorphClickableBox(
         onClick = onClick,
-        shape = ShapeChip,
-        color = bg,
-        modifier = modifier
-            .pressScale(interaction)
-            .border(1.2.dp, color.copy(alpha = 0.12f), ShapeChip),
-        interactionSource = interaction,
+        indication = islandClickIndication(color),
+        modifier =
+            modifier
+                .clip(ShapeChip)
+                .background(bg)
+                .border(1.2.dp, color.copy(alpha = 0.12f), ShapeChip),
+        contentAlignment = Alignment.Center,
     ) {
         Row(
             modifier = Modifier.height(height).padding(horizontal = horizontal),
@@ -523,17 +1062,13 @@ internal fun ActionIconButton(
     size: Dp = SizeActionIcon,
     onClick: () -> Unit,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
+    MorphClickableBox(
         onClick = onClick,
-        shape = CircleShape,
-        color = bg,
-        modifier = modifier.pressScale(interaction).size(size),
-        interactionSource = interaction,
+        indication = islandClickIndication(tint),
+        modifier = modifier.size(size).clip(CircleShape).background(bg),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(size)) {
-            Icon(icon, contentDescription, tint = tint, modifier = Modifier.size(SizeIconSm))
-        }
+        Icon(icon, contentDescription, tint = tint, modifier = Modifier.size(SizeIconSm))
     }
 }
 
@@ -641,15 +1176,15 @@ internal fun ExpressivePillButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
-    val interaction = remember { MutableInteractionSource() }
-    Surface(
+    MorphClickableBox(
         onClick = onClick,
-        shape = RoundedCornerShape(percent = 50),
-        color = backgroundColor,
-        modifier = modifier
-            .pressScale(interaction)
-            .border(1.2.dp, contentColor.copy(alpha = 0.12f), RoundedCornerShape(percent = 50)),
-        interactionSource = interaction,
+        indication = islandClickIndication(contentColor),
+        modifier =
+            modifier
+                .clip(RoundedCornerShape(percent = 50))
+                .background(backgroundColor)
+                .border(1.2.dp, contentColor.copy(alpha = 0.12f), RoundedCornerShape(percent = 50)),
+        contentAlignment = Alignment.Center,
     ) {
         Row(
             modifier = Modifier.height(SizeActionHeight).padding(horizontal = SpacePanel),
@@ -669,6 +1204,52 @@ internal data class MediaProgress(val progress: Float, val positionMs: Long)
 @Composable
 internal fun rememberMediaProgress(event: IslandEvent.Media): MediaProgress {
     return MediaProgress(event.progress, event.position)
+}
+
+/**
+ * Cho doi toi lan doi chu so ke tiep — [Chronometer.scheduleTick]:
+ * count-up: period - (elapsed % period) + 3ms; countdown: (remaining % period) (+ period neu 0) + 3ms.
+ * Moc = gia tri elapsed/remaining cua dong ho, khong phai bien giay uptime.
+ */
+internal fun chronometerTickDelayMs(
+    valueMs: Long,
+    periodMs: Long = 1000L,
+    isCountdown: Boolean = false,
+): Long {
+    val period = periodMs.coerceAtLeast(1L)
+    val delayMillis =
+        if (isCountdown) {
+            var d = valueMs % period
+            if (d <= 0L) d += period
+            d
+        } else {
+            period - (valueMs.coerceAtLeast(0L) % period)
+        }
+    return delayMillis + 3L
+}
+
+/**
+ * Chronometer hien thi: SSOT = [compute], khong phu thuoc remember de giu gia tri paused.
+ * Paused/ticking=false → moi composition goi compute() truc tiep.
+ * Dang chay → tick theo moc elapsed/remaining (Chronometer.scheduleTick), khong elapsedRealtime % 1000.
+ */
+@Composable
+internal fun rememberDisplayedChronometerMs(
+    identityKey: Any?,
+    ticking: Boolean,
+    tickMs: Long = 1000L,
+    isCountdown: Boolean = false,
+    compute: () -> Long,
+): Long {
+    if (!ticking) return compute()
+    var ms by remember(identityKey) { mutableLongStateOf(compute()) }
+    LaunchedEffect(identityKey, tickMs, isCountdown) {
+        while (true) {
+            ms = compute()
+            delay(chronometerTickDelayMs(ms, tickMs, isCountdown))
+        }
+    }
+    return ms
 }
 
 internal fun formatElapsedTime(ms: Long): String {
@@ -699,6 +1280,28 @@ internal fun formatStopwatch(ms: Long): String {
     else "%d:%02d.%d".format(mins, secs, tenths)
 }
 
+/**
+ * Compact StatusBar chronometer: MM:SS khi <1h, HH:MM:SS khi >=1h.
+ * Giong formatCountdownLong; ten rieng de API compact/ARR ro rang.
+ */
+internal fun formatCountdownCompact(ms: Long): String = formatCountdownLong(ms)
+
+/**
+ * Compact StatusBar stopwatch: MM:SS khi <1h, HH:MM:SS khi >=1h; khong tenths (tick 1Hz).
+ * Lam tron giay giong [Chronometer] count-up: Math.round((now - base) / 1000f).
+ * Khong floor (ms/1000) — 29.7s phai hien 30, khong 29.
+ * Canvas width theo format (Mm/Hh) - tick trong cung format khong remeasure.
+ */
+internal fun formatStopwatchCompact(ms: Long): String {
+    val totalSecs =
+        kotlin.math.round(ms.coerceAtLeast(0L) / 1000.0).toLong().coerceAtLeast(0L)
+    val hrs = (totalSecs / 3600).coerceAtMost(99)
+    val mins = (totalSecs % 3600) / 60
+    val secs = totalSecs % 60
+    return if (hrs > 0) "%02d:%02d:%02d".format(hrs, mins, secs)
+    else "%02d:%02d".format(mins, secs)
+}
+
 internal fun formatTimeAgo(timestampMs: Long, res: android.content.res.Resources): String {
     val diff = System.currentTimeMillis() - timestampMs
     if (diff < 0) return ""
@@ -721,7 +1324,51 @@ internal fun Drawable.toScaledBitmap(sizeDp: Dp): ImageBitmap {
     return remember(this, px) { toBitmap(px, px).asImageBitmap() }
 }
 
-/** Center-crop to a square, then scale. Use for album art, including small icon slots. */
+/**
+ * Renderer chung cho notification.smallIcon tren pill: giu ti le goc, Fit trong slot, tint.
+ * Khong dung cho avatar / album / team artwork.
+ */
+@Composable
+internal fun SmallIconImage(
+    drawable: Drawable?,
+    size: Dp,
+    tint: Color,
+    modifier: Modifier = Modifier,
+    clipShape: androidx.compose.ui.graphics.Shape = ShapeXs,
+) {
+    if (drawable == null) {
+        Icon(
+            Icons.Filled.Notifications,
+            contentDescription = null,
+            tint = tint,
+            modifier = modifier.size(size),
+        )
+        return
+    }
+    Image(
+        bitmap = drawable.toAspectFitBitmap(size),
+        contentDescription = null,
+        modifier = modifier.size(size).clip(clipShape),
+        contentScale = ContentScale.Fit,
+        colorFilter = ColorFilter.tint(tint),
+    )
+}
+
+/** Bitmap fit trong hop sizeDp x sizeDp, giu aspect (khong ep vuong source). */
+@Composable
+internal fun Drawable.toAspectFitBitmap(sizeDp: Dp): ImageBitmap {
+    val maxPx = with(LocalDensity.current) { sizeDp.roundToPx() }.coerceAtLeast(1)
+    return remember(this, maxPx) {
+        val iw = intrinsicWidth.coerceAtLeast(1)
+        val ih = intrinsicHeight.coerceAtLeast(1)
+        val scale = minOf(maxPx.toFloat() / iw, maxPx.toFloat() / ih)
+        val tw = (iw * scale).toInt().coerceAtLeast(1)
+        val th = (ih * scale).toInt().coerceAtLeast(1)
+        toBitmap(tw, th).asImageBitmap()
+    }
+}
+
+/** Center-crop vuong roi scale — album art / slot icon canh vuong. */
 @Composable
 internal fun Drawable.toSquareScaledBitmap(sizeDp: Dp): ImageBitmap {
     val px = with(LocalDensity.current) { sizeDp.roundToPx() }
@@ -760,10 +1407,57 @@ internal fun chipProgressFor(event: IslandEvent, includeMediaProgress: Boolean =
         else -> null
     }
 
+/**
+ * Cung quy tac [AxDynamicBarChip] useCircleStyle — chipStyle==1 + loai alert/timer/…
+ * Morph shell phai derive tu day (khong chi event accent).
+ */
+internal fun statusBarChipUsesCircleStyle(
+    chipStyle: Int,
+    event: IslandEvent,
+    isAlert: Boolean = false,
+): Boolean =
+    chipStyle == 1 &&
+        !isAlert &&
+        event !is IslandEvent.AudioRecording &&
+        event !is IslandEvent.Timer &&
+        event !is IslandEvent.Stopwatch &&
+        !(event is IslandEvent.Sports && event.team2Name.isNotEmpty())
+
+/**
+ * Key doi bai chung cho cover + tieu de — khong dung Drawable identity
+ * (UMO rebind moi lan play/pause tao Drawable moi → nhay cover).
+ */
+internal fun mediaTrackSwitchKey(event: IslandEvent.Media): String =
+    "${event.mediaKey}|${event.track}|${event.artist}|${event.packageName}"
+
+/** Fade + scale nhe — dung chung cover va tieu de khi chuyen bai. */
+internal fun mediaTrackSwitchTransition(motionScheme: MotionScheme): ContentTransform =
+    (fadeIn(motionScheme.defaultEffectsSpec()) +
+        scaleIn(initialScale = 0.88f, animationSpec = motionScheme.defaultSpatialSpec())) togetherWith
+        (fadeOut(motionScheme.fastEffectsSpec()) +
+            scaleOut(targetScale = 0.88f, animationSpec = motionScheme.fastSpatialSpec()))
+
 internal fun iconKeyFor(event: IslandEvent): Any =
     when (event) {
-        is IslandEvent.Media -> event.albumArt?.hashCode() ?: "media_default"
-        is IslandEvent.Notification -> event.appIcon?.hashCode() ?: "notif_default"
+        is IslandEvent.Media -> mediaTrackSwitchKey(event)
+        is IslandEvent.Notification ->
+            "notif_${event.sbn.key}_${event.iconRevision}"
+        is IslandEvent.AospChip ->
+            "aosp_${event.active.key}_${event.iconRevision}"
+        is IslandEvent.PromotedOngoing ->
+            "promoted_${event.sbn.key}_${event.iconRevision}"
+        is IslandEvent.Call ->
+            "call_${event.sbn.key}_${event.iconRevision}"
+        is IslandEvent.NowPlaying ->
+            "np_${event.key}_${event.iconRevision}"
+        is IslandEvent.Sports ->
+            "sports_${event.key}_${event.iconRevision}"
+        is IslandEvent.Timer ->
+            "${event.id}_${event.iconRevision}"
+        is IslandEvent.Stopwatch ->
+            "${event.id}_${event.iconRevision}"
+        is IslandEvent.Alarm ->
+            "${event.id}_${event.iconRevision}"
         is IslandEvent.AppSwitch -> {
             val app = event.previousApp ?: event.recentApps.firstOrNull()
             app?.appIcon?.hashCode() ?: "app_default"
@@ -773,8 +1467,10 @@ internal fun iconKeyFor(event: IslandEvent): Any =
 
 internal fun textKeyFor(event: IslandEvent): Any =
     when (event) {
-        is IslandEvent.Media -> "${event.track}|${event.artist}"
-        is IslandEvent.Timer,
+        is IslandEvent.Media -> mediaTrackSwitchKey(event)
+        // Timer: key rieng de doi timer khong dung AnimatedContent tick chung
+        is IslandEvent.Timer ->
+            event.notificationKey.ifEmpty { "timer" } + "|tick"
         is IslandEvent.Stopwatch,
         is IslandEvent.AudioRecording -> "tick_text"
         else -> event.id
@@ -818,27 +1514,133 @@ internal fun PendingIntent.sendWithBal(context: Context, fillIntent: Intent? = n
     send(context, 0, fillIntent, null, null, null, options.toBundle())
 }
 
-internal fun PendingIntent?.trySendWithBal(context: Context): Boolean {
-    if (this == null) return false
-    return try {
-        sendWithBal(context)
-        true
-    } catch (_: PendingIntent.CanceledException) {
-        false
-    }
+/**
+ * Mo app tu contentIntent notification; fallback launch package (vd. Clock).
+ * Pattern giong NotificationExpanded / openMediaApp.
+ */
+internal fun openEventContent(
+    context: Context,
+    contentIntent: PendingIntent?,
+    packageName: String = "",
+) {
+    try {
+        if (contentIntent != null) {
+            contentIntent.sendWithBal(context)
+            return
+        }
+        val pkg = packageName.takeIf { it.isNotEmpty() } ?: return
+        val intent = context.packageManager.getLaunchIntentForPackage(pkg) ?: return
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    } catch (_: Exception) {}
 }
 
-internal val IslandEvent.contentIntent: PendingIntent?
-    get() =
-        when (this) {
-            is IslandEvent.PromotedOngoing -> sbn.notification?.contentIntent
-            is IslandEvent.Sports -> contentIntent ?: sbn?.notification?.contentIntent
-            is IslandEvent.NowPlaying -> contentIntent ?: sbn?.notification?.contentIntent
-            is IslandEvent.Call -> sbn.notification?.contentIntent
-            is IslandEvent.Notification -> sbn.notification?.contentIntent
-            is IslandEvent.AudioRecording -> contentIntent
-            is IslandEvent.Timer -> contentIntent
-            is IslandEvent.Stopwatch -> contentIntent
-            is IslandEvent.Alarm -> contentIntent
-            else -> null
+/** Mo contentIntent (hoac launch package) roi fade-out the mo rong — khong morph ve pill. */
+internal fun openEventContentAndCollapse(
+    context: Context,
+    contentIntent: PendingIntent?,
+    interactor: IslandActions,
+    packageName: String = "",
+) {
+    openEventContent(context, contentIntent, packageName)
+    val targetPkg = resolveEventLaunchPackage(packageName, contentIntent)
+    interactor.collapseIslandForAppLaunch(targetPkg)
+}
+
+internal fun resolveEventLaunchPackage(
+    packageName: String?,
+    contentIntent: PendingIntent?,
+): String? =
+    packageName?.takeIf { it.isNotEmpty() }
+        ?: runCatching { contentIntent?.creatorPackage }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+internal fun canOpenIslandEventApp(event: IslandEvent): Boolean =
+    when (event) {
+        is IslandEvent.Timer,
+        is IslandEvent.Stopwatch,
+        is IslandEvent.Media,
+        is IslandEvent.Notification,
+        is IslandEvent.PromotedOngoing,
+        is IslandEvent.Call -> true
+        is IslandEvent.NowPlaying ->
+            event.contentIntent != null ||
+                event.sbn?.notification?.contentIntent != null ||
+                !event.sbn?.packageName.isNullOrEmpty()
+        is IslandEvent.Sports ->
+            event.sbn?.notification?.contentIntent != null ||
+                !event.sbn?.packageName.isNullOrEmpty()
+        is IslandEvent.AudioRecording ->
+            event.contentIntent != null || event.packageName.isNotEmpty()
+        is IslandEvent.Alarm ->
+            event.contentIntent != null || event.packageName.isNotEmpty()
+        else -> false
+    }
+
+/** Mo app chu cua event va fade-out the mo rong (hoac skip neu event khong co app dich). */
+internal fun openIslandEventAndCollapse(
+    context: Context,
+    event: IslandEvent,
+    interactor: IslandActions,
+) {
+    val launchingPackage: String? =
+        when (event) {
+            is IslandEvent.Timer -> {
+                val pkg = event.packageName.ifEmpty { event.sbn?.packageName.orEmpty() }
+                val pi = event.contentIntent ?: event.sbn?.notification?.contentIntent
+                openEventContent(context, pi, pkg)
+                resolveEventLaunchPackage(pkg, pi)
+            }
+            is IslandEvent.Stopwatch -> {
+                val pkg = event.packageName.ifEmpty { event.sbn?.packageName.orEmpty() }
+                val pi = event.contentIntent ?: event.sbn?.notification?.contentIntent
+                openEventContent(context, pi, pkg)
+                resolveEventLaunchPackage(pkg, pi)
+            }
+            is IslandEvent.AudioRecording -> {
+                if (event.contentIntent == null && event.packageName.isEmpty()) return
+                openEventContent(context, event.contentIntent, event.packageName)
+                resolveEventLaunchPackage(event.packageName, event.contentIntent)
+            }
+            is IslandEvent.Alarm -> {
+                if (event.contentIntent == null && event.packageName.isEmpty()) return
+                openEventContent(context, event.contentIntent, event.packageName)
+                resolveEventLaunchPackage(event.packageName, event.contentIntent)
+            }
+            is IslandEvent.Call -> {
+                val pi = event.sbn.notification?.contentIntent
+                val pkg = event.sbn.packageName.orEmpty()
+                openEventContent(context, pi, pkg)
+                resolveEventLaunchPackage(pkg, pi)
+            }
+            is IslandEvent.NowPlaying -> {
+                val pi = event.contentIntent ?: event.sbn?.notification?.contentIntent
+                val pkg = event.sbn?.packageName.orEmpty()
+                if (pi == null && pkg.isEmpty()) return
+                openEventContent(context, pi, pkg)
+                resolveEventLaunchPackage(pkg, pi)
+            }
+            is IslandEvent.Media -> {
+                interactor.openMediaApp(event.mediaKey)
+                event.packageName.takeIf { it.isNotEmpty() }
+            }
+            is IslandEvent.Notification -> {
+                interactor.launchNotificationDismissingKeyguard(event)
+                event.sbn.packageName.takeIf { it.isNotEmpty() }
+            }
+            is IslandEvent.PromotedOngoing -> {
+                val pi = event.sbn.notification?.contentIntent
+                val pkg = event.sbn.packageName.orEmpty()
+                openEventContent(context, pi, pkg)
+                resolveEventLaunchPackage(pkg, pi)
+            }
+            is IslandEvent.Sports -> {
+                val pi = event.contentIntent ?: event.sbn?.notification?.contentIntent
+                val pkg = event.sbn?.packageName.orEmpty()
+                if (pi == null && pkg.isEmpty()) return
+                openEventContent(context, pi, pkg)
+                resolveEventLaunchPackage(pkg, pi)
+            }
+            else -> return
         }
+    interactor.collapseIslandForAppLaunch(launchingPackage)
+}

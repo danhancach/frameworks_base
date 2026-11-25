@@ -98,9 +98,16 @@ constructor(
                         axDynamicBarChipViewModel.isLowUdfps.collectAsStateWithLifecycle()
                     if (!isLowUdfps) {
                         PlatformTheme {
+                            // wrapContent + unbounded: pill 260dp; Popup expand neo tu day
+                            // (khong kep fillMaxSize trong slot lower-region).
                             AxDynamicBarKeyguardChip(
                                 viewModel = axDynamicBarChipViewModel,
-                                modifier = Modifier.widthIn(max = 260.dp),
+                                modifier = Modifier
+                                    .widthIn(max = 260.dp)
+                                    .wrapContentHeight(
+                                        align = Alignment.CenterVertically,
+                                        unbounded = true,
+                                    ),
                             )
                         }
                     }
@@ -164,7 +171,8 @@ constructor(
                                 }
                             }
                     }
-                    .wrapContentHeight(Alignment.Bottom, unbounded = true)
+                    // CenterVertically: thang hang voi pill AxDB (media/chrono 58dp) trong Row.
+                    .wrapContentHeight(Alignment.CenterVertically, unbounded = true)
                     .size(
                         height = dimensionResource(R.dimen.keyguard_affordance_fixed_height),
                         width = dimensionResource(R.dimen.keyguard_affordance_fixed_width),

@@ -44,6 +44,7 @@ import com.android.systemui.dagger.qualifiers.Background
 import com.android.systemui.media.NotificationMediaManager
 import com.android.systemui.media.controls.data.model.MediaSortKeyModel
 import com.android.systemui.media.controls.shared.model.MediaData
+import com.android.systemui.media.controls.util.LockscreenMediaHelper
 import com.android.systemui.media.controls.util.MediaControllerFactory
 import com.android.systemui.media.remedia.data.model.MediaControllerDataModel
 import com.android.systemui.media.remedia.data.model.MediaDataModel
@@ -127,6 +128,7 @@ constructor(
     private val systemClock: SystemClock,
     private val secureSettings: SecureSettings,
     private val mediaControllerFactory: MediaControllerFactory,
+    private val lockscreenMediaHelper: LockscreenMediaHelper? = null,
 ) :
     MediaRepository,
     MediaPipelineRepository(
@@ -134,6 +136,7 @@ constructor(
         applicationScope,
         backgroundDispatcher,
         secureSettings,
+        lockscreenMediaHelper,
     ) {
 
     override val currentMedia: SnapshotStateList<MediaDataModel> = mutableStateListOf()
